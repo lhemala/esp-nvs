@@ -1,0 +1,16 @@
+key,type,encoding,value
+namespace_one,namespace,,
+example_u8,data,u8,100
+example_i8,data,i8,-100
+example_u16,data,u16,65000
+example_i16,data,i16,-32000
+example_u32,data,u32,4294960000
+example_i32,data,i32,-2147480000
+example_s_short,data,string,short string
+example_s_long,data,string,long string spanning multiple entries whereas each entry is 32 bytes in total
+example_b_short,data,hex2bin,00112233445566778899AABBCCDDFF00AA
+example_b_long,file,binary,multi_page_blob.bin
+
+namespace_two,namespace,,
+example_u8,data,u8,123
+only_in_two,data,u8,1

@@ -1,0 +1,34 @@
+[package]
+name = "esp-nvs"
+version = "1.0.0-rc.0"
+edition = "2024"
+authors = ["Lars Hemala"]
+repository = "https://github.com/lhemala/esp-nvs/"
+license = "MIT OR Apache-2.0"
+description  = "ESP-IDF compatible, bare metal, non-volatile storage (NVS) library"
+keywords = ["esp", "embedded", "nvs", "storage", "no-std"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+[features]
+debug-logs = []
+defmt = ["dep:defmt"]
+esp32 = ["dep:esp-storage", "esp-storage/esp32", "dep:esp-hal", "esp-hal/esp32"]
+esp32s2 = ["dep:esp-storage", "esp-storage/esp32s2", "dep:esp-hal", "esp-hal/esp32s2"]
+esp32s3 = ["dep:esp-storage", "esp-storage/esp32s3", "dep:esp-hal", "esp-hal/esp32s3"]
+esp32c2 = ["dep:esp-storage", "esp-storage/esp32c2", "dep:esp-hal", "esp-hal/esp32c2"]
+esp32c3 = ["dep:esp-storage", "esp-storage/esp32c3", "dep:esp-hal", "esp-hal/esp32c3"]
+esp32c6 = ["dep:esp-storage", "esp-storage/esp32c6", "dep:esp-hal", "esp-hal/esp32c6"]
+esp32h2 = ["dep:esp-storage", "esp-storage/esp32h2", "dep:esp-hal", "esp-hal/esp32h2"]
+
+[dependencies]
+strum = { version = "0.27.1", default-features = false, features = ["derive"] }
+embedded-storage = "0.3.1"
+defmt = { version = "1.0.1", optional = true }
+esp-storage = { version = "0.8.1", optional = true }
+esp-hal = { version = "1.0.0-rc.0", optional = true }
+
+[dev-dependencies]
+libz-sys = "1.1.22"
+
+[profile.dev.package.esp-storage]
+opt-level = 3
