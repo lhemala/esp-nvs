@@ -1915,7 +1915,7 @@ where
                                 if data_crc != unsafe { item.data.sized.crc } {
                                     page.set_entry_state_range(
                                         self.hal,
-                                        item_index..item.span,
+                                        item_index..item_index + item.span,
                                         EntryMapState::Erased,
                                     )?;
                                     page.erased_entry_count += item.span;
@@ -1923,7 +1923,7 @@ where
                                 }
                                 page.set_entry_state_range(
                                     self.hal,
-                                    item_index..item.span,
+                                    item_index..item_index + item.span,
                                     EntryMapState::Written,
                                 )?;
                                 page.used_entry_count += item.span;
