@@ -1,10 +1,10 @@
 fix:
     cargo fmt
-    cargo clippy --fix --allow-dirty --allow-staged --release
+    cargo clippy --fix --allow-dirty --allow-staged --release --features=defmt
     cargo fmt
 
 lint:
-    cargo clippy --release -- -D warnings
+    cargo clippy --release --features=defmt -- -D warnings
     cargo fmt --check
 
 test:
