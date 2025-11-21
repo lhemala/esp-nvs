@@ -787,10 +787,13 @@ mod overwrite {
         let mut flash = common::Flash::new(6);
 
         let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
         let blob = (u8::MIN..u8::MAX)
             .cycle()
             .take(4096 * 2)
             .collect::<Vec<_>>();
+
+        println!("write initial value");
         nvs.set(
             &Key::from_str("ns1"),
             &Key::from_str("blob"),
@@ -861,6 +864,7 @@ mod overwrite {
             }
         );
 
+        println!("overwrite first time");
         let blob = (u8::MIN..u8::MAX)
             .rev()
             .cycle()
@@ -935,6 +939,30 @@ mod overwrite {
                 },
             }
         );
+
+        for i in 0..10 {
+            println!("overwrite another time: {i}");
+
+            let blob = if i % 2 == 0 {
+                (u8::MIN..u8::MAX)
+                    .cycle()
+                    .take(4096 * 2)
+                    .collect::<Vec<_>>()
+            } else {
+                (u8::MIN..u8::MAX)
+                    .rev()
+                    .cycle()
+                    .take(4096 * 2)
+                    .collect::<Vec<_>>()
+            };
+
+            nvs.set(
+                &Key::from_str("ns1"),
+                &Key::from_str("blob"),
+                blob.as_slice(),
+            )
+            .unwrap();
+        }
 
         // TODO smaller override bigger
 

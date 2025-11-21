@@ -907,8 +907,9 @@ where
 
         let mut to_be_compared = data;
         let chunks = blob_index_data.chunk_count;
+        let chunk_start = blob_index_data.chunk_start;
 
-        for chunk_index in (0..chunks).rev() {
+        for chunk_index in (chunk_start..chunk_start + chunks).rev() {
             let (_page_index, item_index, item) =
                 self.load_item(namespace_index, ChunkIndex::BlobData(chunk_index), key)?;
 
