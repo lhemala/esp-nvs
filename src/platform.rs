@@ -112,11 +112,6 @@ mod chip {
             esp_hal::rom::crc::crc32_le(init, data)
         }
     }
-    impl Crc for &mut EspFlash<'_> {
-        fn crc32(init: u32, data: &[u8]) -> u32 {
-            esp_hal::rom::crc::crc32_le(init, data)
-        }
-    }
 }
 
 #[cfg(any(
