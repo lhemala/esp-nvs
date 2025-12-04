@@ -684,7 +684,7 @@ struct Namespace {
     index: u8,
 }
 
-impl<T> Nvs<'_, T>
+impl<T> Nvs<T>
 where
     T: Platform,
 {
@@ -747,7 +747,7 @@ where
         }
 
         let page = &self.pages[page_index.0];
-        let data = page.load_referenced_data(self.hal, item_index.0, &item)?;
+        let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
 
         let crc = unsafe { item.data.sized.crc };
         if crc != T::crc32(u32::MAX, &data) {
@@ -811,7 +811,7 @@ where
             }
 
             let page = &self.pages[page_index.0];
-            let data = page.load_referenced_data(self.hal, item_index.0, &item)?;
+            let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
 
             let data_crc = unsafe { item.data.sized.crc };
             if data_crc != T::crc32(u32::MAX, &data) {
@@ -843,7 +843,7 @@ where
 
         let page = self.pages.get_mut(page_index.0).unwrap();
 
-        page.erase_item::<T>(self.hal, item_index.0, item.span)?;
+        page.erase_item::<T>(&mut self.hal, item_index.0, item.span)?;
 
         // If we deleted a BLOB_IDX we need to delete all associated BLOB_DATA entries
         if item.type_ == ItemType::BlobIndex {
@@ -923,7 +923,7 @@ where
             }
 
             let page = &self.pages[_page_index.0];
-            let chunk_data = page.load_referenced_data(self.hal, item_index.0, &item)?;
+            let chunk_data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
 
             if sized.crc != T::crc32(u32::MAX, &chunk_data) {
                 return Ok(false);
@@ -998,7 +998,7 @@ where
 
         // page might be full after creating a new namespace
         if page.is_full() {
-            page.mark_as_full(self.hal)?;
+            page.mark_as_full(&mut self.hal)?;
             page = self.get_active_page()?;
         }
 
@@ -1026,7 +1026,7 @@ where
         page = self.pages.pop().unwrap();
 
         page.write_item::<T>(
-            self.hal,
+            &mut self.hal,
             namespace_index,
             key,
             type_,
@@ -1043,7 +1043,7 @@ where
             // page_index might only change on defragmentation when load_active_page()
             // is called after we got it
             let old_page = self.pages.get_mut(page_index.0).unwrap();
-            old_page.erase_item(self.hal, item_index.0, 1)?;
+            old_page.erase_item(&mut self.hal, item_index.0, 1)?;
         }
 
         Ok(())
@@ -1080,7 +1080,7 @@ where
                     } else {
                         // Check if the data matches
                         let page = &self.pages[page_index.0];
-                        let data = page.load_referenced_data(self.hal, item_index.0, &item)?;
+                        let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
 
                         let crc = unsafe { item.data.sized.crc };
                         if crc == T::crc32(u32::MAX, &buf) && data == buf {
@@ -1101,7 +1101,7 @@ where
         let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
 
         match page.write_variable_sized_item::<T>(
-            self.hal,
+            &mut self.hal,
             namespace_index,
             key,
             ItemType::Sized,
@@ -1110,12 +1110,12 @@ where
         ) {
             Ok(_) => {}
             Err(Error::PageFull) => {
-                page.mark_as_full::<T>(self.hal)?;
+                page.mark_as_full::<T>(&mut self.hal)?;
                 self.pages.push(page);
 
                 page = self.get_active_page()?;
                 page.write_variable_sized_item::<T>(
-                    self.hal,
+                    &mut self.hal,
                     namespace_index,
                     key,
                     ItemType::Sized,
@@ -1198,14 +1198,14 @@ where
             // Calculate how much data we can fit
             let free_entries = page.get_free_entry_count();
             if free_entries <= 1 {
-                page.mark_as_full::<T>(self.hal)?;
+                page.mark_as_full::<T>(&mut self.hal)?;
                 self.pages.push(page);
                 continue;
             }
             let data_len = cmp::min((free_entries - 1) * size_of::<Item>(), data.len() - offset);
 
             match page.write_variable_sized_item::<T>(
-                self.hal,
+                &mut self.hal,
                 namespace_index,
                 key,
                 ItemType::BlobData,
@@ -1218,7 +1218,7 @@ where
                     self.pages.push(page);
                 }
                 Err(Error::PageFull) => {
-                    page.mark_as_full::<T>(self.hal)?;
+                    page.mark_as_full::<T>(&mut self.hal)?;
                     self.pages.push(page);
                     continue;
                 }
@@ -1236,7 +1236,7 @@ where
             },
         };
         page.write_item::<T>(
-            self.hal,
+            &mut self.hal,
             namespace_index,
             key,
             ItemType::BlobIndex,
@@ -1297,7 +1297,7 @@ where
         }
 
         let next_sequence = self.get_next_sequence();
-        page.initialize(self.hal, next_sequence)?;
+        page.initialize(&mut self.hal, next_sequence)?;
 
         Ok(page)
     }
@@ -1329,7 +1329,7 @@ where
                     .max_by_key(|(_, idx)| **idx)
                     .map_or(1, |(_, idx)| idx + 1);
 
-                page.write_namespace(self.hal, *namespace, namespace_index)?;
+                page.write_namespace(&mut self.hal, *namespace, namespace_index)?;
 
                 self.namespaces.insert(*namespace, namespace_index);
 
@@ -1366,7 +1366,7 @@ where
         for (page_index, page) in self.pages.iter().enumerate() {
             for cache_entry in &page.item_hash_list {
                 if cache_entry.hash == hash {
-                    let item: Item = page.load_item(self.hal, cache_entry.index)?;
+                    let item: Item = page.load_item(&mut self.hal, cache_entry.index)?;
 
                     if item.namespace_index != namespace_index
                         || item.key != *key
@@ -1526,7 +1526,8 @@ where
                     self.erase_page(page)?;
                     self.free_pages.pop().unwrap() // there is always a page after erasing
                 } else {
-                    page.initialize(self.hal, self.get_next_sequence())?;
+                    let next_sequence = self.get_next_sequence();
+                    page.initialize(&mut self.hal, next_sequence)?;
                     page
                 }
             }
@@ -1573,7 +1574,7 @@ where
             let mut items: Vec<_> = Vec::with_capacity(entries.len());
             for (page_idx, item_index, page_seq) in entries {
                 let page = &self.pages[page_idx.0];
-                let item = page.load_item(self.hal, item_index.0)?;
+                let item = page.load_item(&mut self.hal, item_index.0)?;
 
                 // Skip namespace entries (namespace_index == 0) and blob entries
                 // Namespace entries are special and should not be cleaned up
@@ -1612,7 +1613,7 @@ where
                     group.into_iter().take(keep_count)
                 {
                     let page = self.pages.get_mut(page_index).unwrap();
-                    page.erase_item::<T>(self.hal, item_index, span)?;
+                    page.erase_item::<T>(&mut self.hal, item_index, span)?;
                 }
             }
         }
@@ -1700,7 +1701,7 @@ where
 
         // Mark source page as FREEING
         let raw = (PageState::Freeing as u32).to_le_bytes();
-        write_aligned(self.hal, source.address as u32, &raw).map_err(|_| Error::FlashError)?;
+        write_aligned(&mut self.hal, source.address as u32, &raw).map_err(|_| Error::FlashError)?;
 
         // TODO: Check if the active page has still some space left, e.g. this might happen if we
         //  wanted to write a string that can't be split over multiple pages or a chunk of blob_data
@@ -1716,7 +1717,7 @@ where
                 )
                 .map_err(|_| Error::FlashError)?;
         }
-        target.initialize(self.hal, next_sequence)?;
+        target.initialize(&mut self.hal, next_sequence)?;
 
         self.copy_items(source, target)?;
 
@@ -1731,7 +1732,7 @@ where
         // of the source page, so we first get the last copied item so we can ignor it and everything
         // before in our copy loop
         let mut last_copied_entry = match target.item_hash_list.iter().max_by_key(|it| it.index) {
-            Some(hash_entry) => Some(target.load_item(self.hal, hash_entry.index)?),
+            Some(hash_entry) => Some(target.load_item(&mut self.hal, hash_entry.index)?),
             None => None,
         };
 
@@ -1742,7 +1743,7 @@ where
                 continue;
             }
 
-            let item = source.load_item(self.hal, item_index)?;
+            let item = source.load_item(&mut self.hal, item_index)?;
 
             // in case we were disrupted while copying, we want to ignore all entries that before we
             // reached the last copied one
@@ -1769,7 +1770,7 @@ where
                 | ItemType::I64
                 | ItemType::BlobIndex => {
                     target.write_item::<T>(
-                        self.hal,
+                        &mut self.hal,
                         item.namespace_index,
                         item.key,
                         item.type_,
@@ -1783,9 +1784,9 @@ where
                     )?;
                 }
                 ItemType::Sized | ItemType::BlobData => {
-                    let data = source.load_referenced_data(self.hal, item_index, &item)?;
+                    let data = source.load_referenced_data(&mut self.hal, item_index, &item)?;
                     target.write_variable_sized_item::<T>(
-                        self.hal,
+                        &mut self.hal,
                         item.namespace_index,
                         item.key,
                         item.type_,
@@ -1903,7 +1904,7 @@ where
                                 #[cfg(feature = "debug-logs")]
                                 println!("encountered valid but empty scalar item at {item_index}");
                                 page.set_entry_state(
-                                    self.hal,
+                                    &mut self.hal,
                                     item_index as _,
                                     EntryMapState::Written,
                                 )?;
@@ -1920,11 +1921,12 @@ where
                                 println!(
                                     "encountered valid but EMPTY variable sized item at {item_index}"
                                 );
-                                let data = page.load_referenced_data(self.hal, item_index, item)?;
+                                let data =
+                                    page.load_referenced_data(&mut self.hal, item_index, item)?;
                                 let data_crc = T::crc32(u32::MAX, &data);
                                 if data_crc != unsafe { item.data.sized.crc } {
                                     page.set_entry_state_range(
-                                        self.hal,
+                                        &mut self.hal,
                                         item_index..item_index + item.span,
                                         EntryMapState::Erased,
                                     )?;
@@ -1932,7 +1934,7 @@ where
                                     continue 'item_iter;
                                 }
                                 page.set_entry_state_range(
-                                    self.hal,
+                                    &mut self.hal,
                                     item_index..item_index + item.span,
                                     EntryMapState::Written,
                                 )?;
@@ -1955,7 +1957,7 @@ where
                             slice_with_nullbytes_to_str(&item.key.0)
                         );
                         page.set_entry_state_range(
-                            self.hal,
+                            &mut self.hal,
                             item_index..(item_index + item.span),
                             EntryMapState::Erased,
                         )?;
