@@ -6,6 +6,12 @@ pub trait Set<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: T) -> Result<(), Error>;
 }
 
+impl<T, S: Set<T>> Set<T> for &mut S {
+    fn set(&mut self, namespace: &Key, key: &Key, value: T) -> Result<(), Error> {
+        (*self).set(namespace, key, value)
+    }
+}
+
 impl<T: Platform> Set<bool> for Nvs<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: bool) -> Result<(), Error> {
         self.set_primitive(namespace, *key, raw::ItemType::U8, value as u64)

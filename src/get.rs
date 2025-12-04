@@ -11,6 +11,12 @@ pub trait Get<T> {
     fn get(&mut self, namespace: &Key, key: &Key) -> Result<T, Error>;
 }
 
+impl<T, G: Get<T>> Get<T> for &mut G {
+    fn get(&mut self, namespace: &Key, key: &Key) -> Result<T, Error> {
+        (*self).get(namespace, key)
+    }
+}
+
 impl<T: Platform> Get<bool> for Nvs<T> {
     fn get(&mut self, namespace: &Key, key: &Key) -> Result<bool, Error> {
         let value = self.get_primitive(namespace, key, raw::ItemType::U8)?;
