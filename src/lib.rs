@@ -76,14 +76,15 @@ impl AsRef<[u8]> for Key {
     }
 }
 
+pub use get::Get;
+pub use set::Set;
+
 extern crate alloc;
 
 use crate::error::Error;
-use crate::get::Get;
 use crate::internal::{ChunkIndex, ThinPage};
 use crate::platform::Platform;
 use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE};
-use crate::set::Set;
 use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec::Vec;
 
