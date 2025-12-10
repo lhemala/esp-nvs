@@ -14,7 +14,7 @@ pub trait Get<T> {
 impl<T: Platform> Get<bool> for Nvs<'_, T> {
     fn get(&mut self, namespace: &Key, key: &Key) -> Result<bool, Error> {
         let value = self.get_primitive(namespace, key, raw::ItemType::U8)?;
-        Ok(value != 0)
+        Ok(value as u8 != 0)
     }
 }
 

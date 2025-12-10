@@ -13,6 +13,22 @@ mod set {
 
         let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
 
+        nvs.set(&Key::from_str("hello world"), &Key::from_str("bool"), false)
+            .unwrap();
+        assert_eq!(
+            nvs.get::<bool>(&Key::from_str("hello world"), &Key::from_str("bool"))
+                .unwrap(),
+            false
+        );
+
+        nvs.set(&Key::from_str("hello world"), &Key::from_str("bool"), true)
+            .unwrap();
+        assert_eq!(
+            nvs.get::<bool>(&Key::from_str("hello world"), &Key::from_str("bool"))
+                .unwrap(),
+            true
+        );
+
         nvs.set(&Key::from_str("hello world"), &Key::from_str("u8"), 0xAAu8)
             .unwrap();
         assert_eq!(
