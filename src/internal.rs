@@ -226,6 +226,17 @@ impl ThinPage {
 
         Ok(item)
     }
+
+    pub(crate) fn iter_items<T: Platform>(
+        &self,
+        mut hal: T,
+    ) -> impl Iterator<Item = Result<Item, Error>> {
+        // KeyNotFound can not occur here since we are iterating over known items
+        // load_item would only fail with a FlashError.
+        self.item_hash_list
+            .iter()
+            .map(move |item_hash_entry| self.load_item(&mut hal, item_hash_entry.index))
+    }
 }
 
 impl ThinPage {

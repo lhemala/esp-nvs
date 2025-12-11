@@ -313,4 +313,64 @@ impl<T: Platform> Nvs<T> {
             entries_overall,
         })
     }
+
+    /// Returns an iterator over all known namespaces.
+    pub fn iter_namespaces(&self) -> impl Iterator<Item = &Key> {
+        self.namespaces.keys()
+    }
+
+    /// Returns a list of all keys in the given namespace.
+    ///
+    /// # Errors
+    ///
+    /// If a flash error occured or the namespace is malformed/not found
+    pub fn list_keys(&mut self, namespace: &Key) -> Result<Vec<Key>, Error> {
+        #[cfg(feature = "defmt")]
+        defmt::trace!("list_keys");
+
+        #[cfg(feature = "debug-logs")]
+        println!("internal: list_keys");
+
+        if namespace.0[MAX_KEY_LENGTH] != b'\0' {
+            return Err(Error::NamespaceMalformed);
+        }
+
+        let namespace_index = *self
+            .namespaces
+            .get(namespace)
+            .ok_or(Error::NamespaceNotFound)?;
+
+        let mut result = Vec::new();
+
+        for page in self.pages.iter() {
+            for key in page.iter_items(&mut self.hal) {
+                let key = key?;
+
+                if key.namespace_index == namespace_index {
+                    result.push(key.key);
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Retains only the keys in the given namespace for which the predicate returns true.
+    ///
+    /// # Errors
+    ///
+    /// If a flash error occured or the namespace is malformed/not found.
+    pub fn retain(
+        &mut self,
+        namespace: &Key,
+        mut predicate: impl FnMut(&Key) -> bool,
+    ) -> Result<(), Error> {
+        for key in self.list_keys(namespace)? {
+            if !predicate(&key) {
+                self.delete(namespace, &key)?;
+            }
+        }
+
+        Ok(())
+    }
 }
