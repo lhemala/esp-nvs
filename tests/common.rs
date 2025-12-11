@@ -193,6 +193,9 @@ impl NorFlash for Flash {
 
 impl esp_nvs::platform::Crc for Flash {
     fn crc32(init: u32, data: &[u8]) -> u32 {
-        unsafe { libz_sys::crc32(init as u64, data.as_ptr(), data.len() as u32) as u32 }
+        // Cast to c_ulong here, because on windows this is a u32, and on linux it is a u64
+        unsafe {
+            libz_sys::crc32(init as core::ffi::c_ulong, data.as_ptr(), data.len() as u32) as u32
+        }
     }
 }
