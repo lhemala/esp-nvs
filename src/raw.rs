@@ -385,7 +385,9 @@ pub(crate) fn write_aligned<T: Platform>(
         let pivot = T::align_write_floor(bytes.len());
         let header = &bytes[..pivot];
         let trailer = &bytes[pivot..];
-        hal.write(offset, header)?;
+        if !header.is_empty() {
+            hal.write(offset, header)?;
+        }
 
         // no need to write the trailer if remaining data is all ones - this the default state of the flash
         if bytes[pivot..].iter().any(|&e| e != 0xFF) {

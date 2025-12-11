@@ -120,6 +120,14 @@ mod set {
         let mut flash = common::Flash::new(2);
         let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
 
+        nvs.set(&Key::from_str("hello world"), &Key::from_str("char"), "X")
+            .unwrap();
+        assert_eq!(
+            nvs.get::<String>(&Key::from_str("hello world"), &Key::from_str("char"))
+                .unwrap(),
+            "X"
+        );
+
         nvs.set(
             &Key::from_str("hello world"),
             &Key::from_str("short str"),
