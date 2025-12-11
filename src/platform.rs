@@ -11,6 +11,12 @@ pub trait Crc {
     fn crc32(init: u32, data: &[u8]) -> u32;
 }
 
+impl<T: Crc> Crc for &mut T {
+    fn crc32(init: u32, data: &[u8]) -> u32 {
+        T::crc32(init, data)
+    }
+}
+
 pub trait AlignedOps: Platform {
     fn align_read(size: usize) -> usize {
         align_ceil(size, Self::READ_SIZE)
@@ -102,11 +108,6 @@ mod chip {
     }
 
     impl Crc for EspFlash<'_> {
-        fn crc32(init: u32, data: &[u8]) -> u32 {
-            esp_hal::rom::crc::crc32_le(init, data)
-        }
-    }
-    impl Crc for &mut EspFlash<'_> {
         fn crc32(init: u32, data: &[u8]) -> u32 {
             esp_hal::rom::crc::crc32_le(init, data)
         }

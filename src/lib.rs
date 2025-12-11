@@ -76,14 +76,15 @@ impl AsRef<[u8]> for Key {
     }
 }
 
+pub use get::Get;
+pub use set::Set;
+
 extern crate alloc;
 
 use crate::error::Error;
-use crate::get::Get;
 use crate::internal::{ChunkIndex, ThinPage};
 use crate::platform::Platform;
 use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE};
-use crate::set::Set;
 use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec::Vec;
 
@@ -113,11 +114,8 @@ pub struct EntryStatistics {
 
 /// The Nvs struct keeps information about all pages in memory. Increases in size with
 /// the numer of pages in the partition.
-pub struct Nvs<'a, T>
-where
-    T: Platform,
-{
-    pub(crate) hal: &'a mut T,
+pub struct Nvs<T: Platform> {
+    pub(crate) hal: T,
     pub(crate) base_address: usize,
     pub(crate) sectors: u16,
     pub(crate) faulted: bool,
@@ -128,10 +126,7 @@ where
     pub(crate) pages: Vec<ThinPage>,
 }
 
-impl<'a, T> Nvs<'a, T>
-where
-    T: Platform,
-{
+impl<T: Platform> Nvs<T> {
     /// Mimics the original C++ driver behavior and reads all sectors of the given partition to
     /// 1. Resolve all existing namespaces
     /// 2. Create a hashed key cache per page for quicker lookups
@@ -139,11 +134,7 @@ where
     /// 4. Cleanup of duplicated blobs or orphaned blob data
     ///
     /// Pages or entries with invalid CRC32 values are marked as corrupt and are erased when necessary
-    pub fn new(
-        partition_offset: usize,
-        partition_size: usize,
-        hal: &'a mut T,
-    ) -> Result<Nvs<'a, T>, Error> {
+    pub fn new(partition_offset: usize, partition_size: usize, hal: T) -> Result<Nvs<T>, Error> {
         if !partition_offset.is_multiple_of(FLASH_SECTOR_SIZE) {
             return Err(Error::InvalidPartitionOffset);
         }
@@ -157,7 +148,7 @@ where
             return Err(Error::InvalidPartitionSize);
         }
 
-        let mut nvs: Nvs<'a, T> = Self {
+        let mut nvs: Nvs<T> = Self {
             hal,
             base_address: partition_offset,
             sectors: sectors as u16,
@@ -184,7 +175,7 @@ where
     /// Both namespace and may have up to 15 characters.
     pub fn get<R>(&mut self, namespace: &Key, key: &Key) -> Result<R, Error>
     where
-        Nvs<'a, T>: Get<R>,
+        Nvs<T>: Get<R>,
     {
         match Get::get(self, namespace, key) {
             Ok(val) => Ok(val),
@@ -204,7 +195,7 @@ where
     ///  * &[u8]: May span multiple pages, max size ~500kB
     pub fn set<R>(&mut self, namespace: &Key, key: &Key, value: R) -> Result<(), Error>
     where
-        Nvs<'a, T>: Set<R>,
+        Nvs<T>: Set<R>,
     {
         if self.faulted {
             return Err(Error::FlashError);
