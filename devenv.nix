@@ -15,6 +15,7 @@
     pkgs.esp-idf-nvs-partition-gen
     pkgs.git
     pkgs.just
+    pkgs.actionlint
    ];
 
   languages.rust = {
