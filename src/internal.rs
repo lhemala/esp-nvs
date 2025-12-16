@@ -574,6 +574,20 @@ impl ThinPage {
 
         Ok(())
     }
+
+    /// Returns an iterator over all items in this page.
+    ///
+    /// # Errors
+    ///
+    /// This functions iterator may return a `FlashError` if there is
+    /// an error reading from flash.
+    pub(crate) fn items<'a, T: Platform>(&'a self, hal: &'a mut T) -> IterPageItems<'a, T> {
+        IterPageItems {
+            page: self,
+            hal,
+            iter: self.item_hash_list.iter(),
+        }
+    }
 }
 
 impl PartialEq<Self> for ThinPage {
@@ -622,6 +636,33 @@ impl Debug for ThinPage {
         let used_entry_count = self.used_entry_count;
         let entry_hash_list_len = self.item_hash_list.len();
         f.write_fmt(format_args!("erased_entry_count: {erased_entry_count}, used_entry_count: {used_entry_count}, entry_hash_list_len: {entry_hash_list_len}}}"))
+    }
+}
+
+pub(crate) struct IterPageItems<'a, T: Platform> {
+    page: &'a ThinPage,
+    hal: &'a mut T,
+    iter: core::slice::Iter<'a, ItemHashListEntry>,
+}
+
+impl<'a, T: Platform> IterPageItems<'a, T> {
+    pub(crate) fn switch_to_page(&mut self, new_page: &'a ThinPage) {
+        self.page = new_page;
+        self.iter = self.page.item_hash_list.iter();
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.page.item_hash_list.is_empty()
+    }
+}
+
+impl<'a, T: Platform> Iterator for IterPageItems<'a, T> {
+    type Item = Result<Item, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter
+            .next()
+            .map(|entry| self.page.load_item(self.hal, entry.index))
     }
 }
 
