@@ -651,8 +651,8 @@ impl<'a, T: Platform> IterPageItems<'a, T> {
         self.iter = self.page.item_hash_list.iter();
     }
 
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.page.item_hash_list.is_empty()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.iter.as_slice().is_empty()
     }
 }
 
@@ -660,9 +660,21 @@ impl<'a, T: Platform> Iterator for IterPageItems<'a, T> {
     type Item = Result<Item, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter
-            .next()
-            .map(|entry| self.page.load_item(self.hal, entry.index))
+        while let Some(entry) = self.iter.next() {
+            let item = match self.page.load_item(self.hal, entry.index) {
+                Ok(item) => item,
+                Err(err) => return Some(Err(err)),
+            };
+
+            // TODO: Is only returning with EntryMapState::Written correct?
+            if self.page.get_entry_state(entry.index) == EntryMapState::Written {
+                return Some(Ok(item));
+            }
+
+            return Some(Ok(item));
+        }
+
+        None
     }
 }
 

@@ -133,6 +133,82 @@ fn from_generated_partition() {
 }
 
 #[test]
+fn iter_namespaces() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.namespaces().collect::<Vec<_>>(),
+        vec![
+            &Key::from_array(b"namespace_one"),
+            &Key::from_array(b"namespace_two")
+        ]
+    );
+}
+
+#[test]
+fn iter_keys() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.keys().collect::<Vec<_>>(),
+        vec![
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_u8")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_i8")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_u16")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_i16")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_u32")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_i32")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_s_short")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_s_long")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_b_short")
+            )),
+            Ok((
+                Key::from_array(b"namespace_one"),
+                Key::from_array(b"example_b_long")
+            )),
+            Ok((
+                Key::from_array(b"namespace_two"),
+                Key::from_array(b"example_u8")
+            )),
+            Ok((
+                Key::from_array(b"namespace_two"),
+                Key::from_array(b"only_in_two")
+            ))
+        ]
+    );
+}
+
+#[test]
 fn corrupt_page() {
     let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
 

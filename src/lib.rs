@@ -84,7 +84,7 @@ extern crate alloc;
 use crate::error::Error;
 use crate::internal::{ChunkIndex, IterPageItems, ThinPage};
 use crate::platform::Platform;
-use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE, Item};
+use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE, Item, ItemType};
 use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec::Vec;
 
@@ -329,37 +329,64 @@ impl<T: Platform> Nvs<T> {
     }
 }
 
-struct IterKeys<'a, T: Platform> {
+struct IterLoadedItems<'a, T: Platform> {
     pages: &'a [ThinPage],
     current: Option<IterPageItems<'a, T>>,
-    namespaces: &'a BTreeMap<Key, u8>,
 }
 
-impl<'a, T: Platform> IterKeys<'a, T> {
-    fn new(mut pages: &'a [ThinPage], hal: &'a mut T, namespaces: &'a BTreeMap<Key, u8>) -> Self {
+// TODO: Skip broken pages?
+
+impl<'a, T: Platform> IterLoadedItems<'a, T> {
+    fn new(mut pages: &'a [ThinPage], hal: &'a mut T) -> Self {
         let first = pages.split_off_first();
 
         Self {
             pages,
             current: first.map(|page| page.items(hal)),
+        }
+    }
+}
+
+impl<'a, T: Platform> Iterator for IterLoadedItems<'a, T> {
+    type Item = Result<Item, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // self.current is only None if there are no pages at all
+        let current = self.current.as_mut()?;
+
+        // if the current page is exhausted, move to next page that has items (or until we run out of pages)
+        while current.is_empty() {
+            let next_page = self.pages.split_off_first()?;
+
+            current.switch_to_page(next_page);
+        }
+
+        current.next()
+    }
+}
+
+struct IterKeys<'a, T: Platform> {
+    items: IterLoadedItems<'a, T>,
+    namespaces: &'a BTreeMap<Key, u8>,
+}
+
+impl<'a, T: Platform> IterKeys<'a, T> {
+    fn new(pages: &'a [ThinPage], hal: &'a mut T, namespaces: &'a BTreeMap<Key, u8>) -> Self {
+        Self {
+            items: IterLoadedItems::new(pages, hal),
             namespaces,
         }
     }
 
-    fn map_item(&self, item: Result<Item, Error>) -> Result<(Key, Key), Error> {
-        match item {
-            Ok(item) => {
-                let (namespace_key, _) = self
-                    .namespaces
-                    .iter()
-                    .find(|(_, idx)| **idx == item.namespace_index)
-                    // a key should always have a namespace
-                    .unwrap();
+    fn item_to_keys(&self, item: Item) -> (Key, Key) {
+        let (namespace_key, _) = self
+            .namespaces
+            .iter()
+            .find(|(_, idx)| **idx == item.namespace_index)
+            // a key should always have a namespace
+            .unwrap();
 
-                Ok((*namespace_key, item.key))
-            }
-            Err(e) => Err(e),
-        }
+        (*namespace_key, item.key)
     }
 }
 
@@ -367,23 +394,20 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
     type Item = Result<(Key, Key), Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current = self.current.as_mut()?;
+        loop {
+            match self.items.next()? {
+                Ok(item) => {
+                    // TODO: The blobs are not handled correctly yet, when should they be skipped?
 
-        // exhaust current page first, self.current is only None if there are no pages at all
-        if let Some(item) = current.next() {
-            return Some(self.map_item(item));
+                    // Skip namespace entries (namespace_index == 0)
+                    if item.namespace_index == 0 || item.type_ == ItemType::BlobData {
+                        continue;
+                    }
+
+                    return Some(Ok(self.item_to_keys(item)));
+                }
+                Err(err) => return Some(Err(err)),
+            }
         }
-
-        // current page exhausted, move to next page that has items (or until we run out of pages)
-        while current.is_empty() {
-            let Some(page) = self.pages.split_off_first() else {
-                // if there are no more pages, we're done
-                break;
-            };
-
-            current.switch_to_page(page);
-        }
-
-        current.next().map(|item| self.map_item(item))
     }
 }
