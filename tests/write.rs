@@ -4,6 +4,7 @@ mod set {
     use crate::common;
     use esp_nvs::Key;
     use esp_nvs::error::Error;
+    use pretty_assertions::assert_eq;
 
     // TODO: test for writing namespace fails + cleanup
 
@@ -540,6 +541,7 @@ mod delete {
     use crate::common;
     use esp_nvs::error::Error;
     use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn primitive() {
@@ -723,6 +725,7 @@ mod overwrite {
     use crate::common;
     use esp_nvs::error::Error::{FlashError, KeyNotFound};
     use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn primitive_overwrites_primitive() {
@@ -1229,6 +1232,7 @@ mod defrag {
     use crate::common::Operation;
     use esp_nvs::error::Error::FlashError;
     use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn defragmentation() {

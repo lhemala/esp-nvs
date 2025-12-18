@@ -14,7 +14,7 @@ const MAX_KEY_LENGTH: usize = 15;
 const MAX_KEY_NUL_TERMINATED_LENGTH: usize = MAX_KEY_LENGTH + 1;
 
 /// A 16-byte key used for NVS storage (15 characters + null terminator)
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Key([u8; MAX_KEY_NUL_TERMINATED_LENGTH]);
 
@@ -70,6 +70,28 @@ impl Key {
     }
 }
 
+impl fmt::Debug for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // for debug representation, print as binary string
+        write!(f, "Key(b\"")?;
+
+        // skip the null terminator at the end, which is always null,
+        // and might be confusing in the output if you passed a 15-byte key,
+        // and it shows a \0 at the end.
+        for &byte in &self.0[..self.0.len() - 1] {
+            // escape_default would escape 0 as \x00, but \0 is more readable
+            if byte == 0 {
+                write!(f, "\\0")?;
+                continue;
+            }
+
+            write!(f, "{}", core::ascii::escape_default(byte))?;
+        }
+
+        write!(f, "\")")
+    }
+}
+
 impl AsRef<[u8]> for Key {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
@@ -87,6 +109,7 @@ use crate::platform::Platform;
 use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE};
 use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec::Vec;
+use core::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NvsStatistics {

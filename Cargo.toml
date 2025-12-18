@@ -30,6 +30,7 @@ thiserror = { version = "2.0.0", default-features = false }
 
 [dev-dependencies]
 libz-sys = "1.1.22"
+pretty_assertions = "1.4.1"
 
 [profile.dev.package.esp-storage]
 opt-level = 3

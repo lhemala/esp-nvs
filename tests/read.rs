@@ -1,5 +1,6 @@
 use esp_nvs::error::{Error, ItemType};
 use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+use pretty_assertions::assert_eq;
 
 mod common;
 
