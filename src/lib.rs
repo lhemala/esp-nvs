@@ -82,7 +82,7 @@ pub use set::Set;
 extern crate alloc;
 
 use crate::error::Error;
-use crate::internal::{ChunkIndex, IterPageItems, ThinPage};
+use crate::internal::{ChunkIndex, IterPageItems, ThinPage, VersionOffset};
 use crate::platform::Platform;
 use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE, Item, ItemType};
 use alloc::collections::{BTreeMap, BinaryHeap};
@@ -397,10 +397,18 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
         loop {
             match self.items.next()? {
                 Ok(item) => {
-                    // TODO: The blobs are not handled correctly yet, when should they be skipped?
+                    // Skip namespace entries (namespace_index == 0), and blobs (they are represented by their BlobData)
+                    if item.namespace_index == 0
+                        || item.type_ == ItemType::Blob
+                        || item.type_ == ItemType::BlobIndex
+                    {
+                        continue;
+                    }
 
-                    // Skip namespace entries (namespace_index == 0)
-                    if item.namespace_index == 0 || item.type_ == ItemType::BlobData {
+                    if item.type_ == ItemType::BlobData
+                        && item.chunk_index != VersionOffset::V0 as u8
+                        && item.chunk_index != VersionOffset::V1 as u8
+                    {
                         continue;
                     }
 
