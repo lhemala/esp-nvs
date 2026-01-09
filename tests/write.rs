@@ -1776,6 +1776,36 @@ mod defrag {
         }
     }
 
+    #[test]
+    fn ensure_active_page_is_in_correct_spot_after_init() {
+        // Our code depends on the invariant that the internal `Nvs::pages` vector always stores
+        // the active page as the last element. This requirement was ignored when the sectors are
+        // initially loaded, and this test ensures that it doesn't break again.
+        //
+        // Details:
+        // This test overrides the same blob multiple times. All pages are allocated sequentially.
+        // At some point, when overwriting the blob, the first page is defragmented, erased, and
+        // marked again as active.
+        // The next time the NVS is initialized, the sectors are loaded, and the pages are stored
+        // sequentially in memory. So when the blob is overwritten again, the last page in
+        // `Nvs::pages` is not marked as active and the defragmentation process is started again.
+        // Now, when the first page is evaluated if it is eligible for defragmentation, the
+        // code trips on an `unreachable!()` as the `Active` state is not expected.
+        let mut flash = common::Flash::new(3);
+
+        for i in 0..5u32 {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            let multi_page_blob: Vec<_> = (i as u8..255).cycle().take(3000).collect();
+            nvs.set(
+                &Key::from_str("main"),
+                &Key::from_str("blob"),
+                multi_page_blob.as_slice(),
+            )
+            .unwrap();
+        }
+    }
+
     // TODO: in case we we want to write a sized item to a page and it doesn't fit, before
     //  allocating an new empty page and defragmenting into it we can try to fill the still empty entries first
 }

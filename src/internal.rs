@@ -27,6 +27,8 @@ use core::mem::offset_of;
 use core::ops::Not;
 #[cfg(feature = "defmt")]
 use defmt::trace;
+#[cfg(feature = "defmt")]
+use defmt::warn;
 
 /// Maximum Key length is 15 bytes + 1 byte for the null terminator.
 /// Shorter keys need to be padded with null bytes.
@@ -157,7 +159,7 @@ impl ThinPage {
         trace!("initialize: @{:#08x}", self.address);
 
         #[cfg(feature = "debug-logs")]
-        println!("  ThinPage: initialize");
+        println!("  ThinPage: initialize {:#08x}", self.address);
 
         let mut raw_header = PageHeader {
             state: PageState::Active as u32,
@@ -187,6 +189,9 @@ impl ThinPage {
     pub(crate) fn mark_as_full<T: Platform>(&mut self, hal: &mut T) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("mark_as_full: @{:#08x}", self.address);
+
+        #[cfg(feature = "debug-logs")]
+        println!("  ThinPage: mark_as_full");
 
         let raw = (PageState::Full as u32).to_le_bytes();
 
@@ -1422,6 +1427,8 @@ where
         #[cfg(feature = "debug-logs")]
         println!("internal: load_sectors: blob_index: {:?}", blob_index);
 
+        self.ensure_active_page_order()?;
+
         self.continue_free_page()?;
 
         // After loading all pages, check for duplicate primitive/string entries and mark older ones as erased
@@ -1498,6 +1505,60 @@ where
                 self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
             }
         }
+        Ok(())
+    }
+
+    /// The active page has to be the last page in `self.pages` as we use `pop_if` to fetch it.
+    /// We also clean up any duplicate active pages that might have been created in the past
+    /// due to the borked order.
+    fn ensure_active_page_order(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "defmt")]
+        trace!("ensure_active_page_order");
+
+        let correct_active_page_stats =
+            self.pages
+                .iter()
+                .enumerate()
+                .fold(None, |acc, (idx, page)| {
+                    if page.header.state != ThinPageState::Active {
+                        return acc;
+                    }
+
+                    match acc {
+                        None => Some((idx, page.header.sequence, 1)),
+                        Some((acc_idx, acc_sequence, acc_active_page_count)) => {
+                            if page.header.sequence > acc_sequence {
+                                Some((idx, page.header.sequence, acc_active_page_count + 1))
+                            } else {
+                                Some((acc_idx, acc_sequence, acc_active_page_count + 1))
+                            }
+                        }
+                    }
+                });
+
+        if let Some((correct_active_page_idx, _, active_page_count)) = correct_active_page_stats {
+            let last_page_idx = self.pages.len() - 1;
+            if correct_active_page_idx != last_page_idx {
+                self.pages.swap(correct_active_page_idx, last_page_idx);
+            }
+
+            // Mark duplicate active pages as Full
+            if active_page_count > 1 {
+                // We actively ignore the last page as it is the correct active one
+                for idx in 0..last_page_idx {
+                    let page = &mut self.pages[idx];
+                    if page.header.state == ThinPageState::Active {
+                        #[cfg(feature = "defmt")]
+                        warn!(
+                            "detected duplicate active page, marking as full ({:#08x})",
+                            page.address
+                        );
+                        page.mark_as_full(&mut self.hal)?;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1652,6 +1713,9 @@ where
 
         let page = self.pages.swap_remove(next_page);
 
+        #[cfg(feature = "debug-logs")]
+        println!("internal: defragment: next_page: {page:?}");
+
         match page.header.state {
             ThinPageState::Uninitialized => unreachable!(),
             ThinPageState::Active => unreachable!(),
@@ -1720,6 +1784,9 @@ where
         target.initialize(&mut self.hal, next_sequence)?;
 
         self.copy_items(source, target)?;
+
+        #[cfg(feature = "debug-logs")]
+        println!("internal: copy_entries_to_reserve_page done");
 
         Ok(())
     }
@@ -1826,6 +1893,9 @@ where
             .map_err(|_| Error::FlashError)?;
 
         if buf[..size_of::<PageHeader>()] == [0xFFu8; size_of::<PageHeader>()] {
+            #[cfg(feature = "debug-logs")]
+            println!("  raw: load page: 0x{sector_address:04X} -> uninitialized");
+
             return Ok(LoadPageResult::Empty(ThinPage::uninitialized(
                 sector_address,
             )));
@@ -1833,6 +1903,12 @@ where
 
         // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc afterwards
         let raw_page: RawPage = unsafe { core::mem::transmute(buf) };
+
+        #[cfg(feature = "debug-logs")]
+        {
+            let state = PageState::from(raw_page.header.state);
+            println!("  raw: load page: 0x{sector_address:04X} -> {state}");
+        }
 
         let mut page = ThinPage {
             address: sector_address,
