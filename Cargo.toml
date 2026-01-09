@@ -1,6 +1,6 @@
 [package]
 name = "esp-nvs"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 authors = ["Lars Hemala"]
 repository = "https://github.com/lhemala/esp-nvs/"
