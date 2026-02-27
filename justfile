@@ -1,3 +1,6 @@
+default:
+    just --list
+
 fix:
     cargo fmt
     cargo clippy --fix --allow-dirty --allow-staged --release --features=defmt
