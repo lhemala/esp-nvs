@@ -61,8 +61,9 @@ impl<T: Platform> AlignedOps for T {}
     feature = "esp32h2",
 ))]
 mod chip {
-    use crate::platform::Crc;
     use esp_storage::FlashStorage;
+
+    use crate::platform::Crc;
 
     impl Crc for FlashStorage<'_> {
         fn crc32(init: u32, data: &[u8]) -> u32 {

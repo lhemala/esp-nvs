@@ -1,11 +1,11 @@
-use crate::raw;
+pub use raw::ItemType;
 use thiserror::Error;
 
-pub use raw::ItemType;
+use crate::raw;
 
 /// Errors that can occur during NVS operations. The list is likely to stay as is but marked as
-/// non-exhaustive to allow for future additions without breaking the API. A caller would likely only
-/// need to handle NamespaceNotFound and KeyNotFound as the other errors are static.
+/// non-exhaustive to allow for future additions without breaking the API. A caller would likely
+/// only need to handle NamespaceNotFound and KeyNotFound as the other errors are static.
 #[derive(Error, Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -35,7 +35,8 @@ pub enum Error {
     #[error("namespace malformed")]
     NamespaceMalformed,
 
-    /// Strings are limited to `MAX_BLOB_DATA_PER_PAGE` while blobs can be up to `MAX_BLOB_SIZE` bytes
+    /// Strings are limited to `MAX_BLOB_DATA_PER_PAGE` while blobs can be up to `MAX_BLOB_SIZE`
+    /// bytes
     #[error("value too long")]
     ValueTooLong,
 
@@ -47,7 +48,8 @@ pub enum Error {
     #[error("key too long")]
     KeyTooLong,
 
-    /// Key not found. Either the flash was corrupted and silently fixed on or no value has been written yet.
+    /// Key not found. Either the flash was corrupted and silently fixed on or no value has been
+    /// written yet.
     #[error("key not found")]
     KeyNotFound,
 

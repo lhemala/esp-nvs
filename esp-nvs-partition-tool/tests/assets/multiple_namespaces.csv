@@ -1,0 +1,7 @@
+key,type,encoding,value
+ns1,namespace,,
+key1,data,u8,1
+ns2,namespace,,
+key2,data,u8,2
+ns1,namespace,,
+key3,data,u8,3

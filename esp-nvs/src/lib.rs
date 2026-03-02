@@ -1,10 +1,11 @@
-#![doc = include_str ! ("../README.md")]
+#![doc = include_str ! ("../../README.md")]
 #![cfg_attr(not(target_arch = "x86_64"), no_std)]
 
 pub mod error;
+pub mod platform;
+
 mod get;
 mod internal;
-pub mod platform;
 mod raw;
 mod set;
 mod u24;
@@ -128,13 +129,27 @@ pub use set::Set;
 
 extern crate alloc;
 
-use crate::error::Error;
-use crate::internal::{ChunkIndex, IterPageItems, ThinPage, VersionOffset};
-use crate::platform::Platform;
-use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE, Item, ItemType};
-use alloc::collections::{BTreeMap, BinaryHeap};
+use alloc::collections::{
+    BTreeMap,
+    BinaryHeap,
+};
 use alloc::vec::Vec;
 use core::fmt;
+
+use crate::error::Error;
+use crate::internal::{
+    ChunkIndex,
+    IterPageItems,
+    ThinPage,
+    VersionOffset,
+};
+use crate::platform::Platform;
+use crate::raw::{
+    ENTRIES_PER_PAGE,
+    FLASH_SECTOR_SIZE,
+    Item,
+    ItemType,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NvsStatistics {
@@ -181,7 +196,8 @@ impl<T: Platform> Nvs<T> {
     /// 3. Cleanup duplicate entries
     /// 4. Cleanup of duplicated blobs or orphaned blob data
     ///
-    /// Pages or entries with invalid CRC32 values are marked as corrupt and are erased when necessary
+    /// Pages or entries with invalid CRC32 values are marked as corrupt and are erased when
+    /// necessary
     pub fn new(partition_offset: usize, partition_size: usize, hal: T) -> Result<Nvs<T>, Error> {
         if !partition_offset.is_multiple_of(FLASH_SECTOR_SIZE) {
             return Err(Error::InvalidPartitionOffset);
@@ -238,7 +254,8 @@ impl<T: Platform> Nvs<T> {
     /// Set a value and write it to the flash
     ///
     /// Type support:
-    ///  * bool, singed and unsigned integers up to 64-bit width: saved as primitive value with 32 bytes
+    ///  * bool, singed and unsigned integers up to 64-bit width: saved as primitive value with 32
+    ///    bytes
     ///  * &str: Saved on a single page with a max size of 4000 bytes
     ///  * &[u8]: May span multiple pages, max size ~500kB
     pub fn set<R>(&mut self, namespace: &Key, key: &Key, value: R) -> Result<(), Error>
@@ -400,7 +417,8 @@ impl<'a, T: Platform> Iterator for IterLoadedItems<'a, T> {
         // self.current is only None if there are no pages at all
         let current = self.current.as_mut()?;
 
-        // if the current page is exhausted, move to next page that has items (or until we run out of pages)
+        // if the current page is exhausted, move to next page that has items (or until we run out
+        // of pages)
         while current.is_empty() {
             let next_page = self.pages.split_off_first()?;
 
@@ -443,7 +461,8 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
         loop {
             return match self.items.next()? {
                 Ok(item) => {
-                    // Skip namespace entries (namespace_index == 0), and blobs (they are represented by their BlobData)
+                    // Skip namespace entries (namespace_index == 0), and blobs (they are
+                    // represented by their BlobData)
                     if item.namespace_index == 0
                         || item.type_ == ItemType::Blob
                         || item.type_ == ItemType::BlobIndex

@@ -1,0 +1,17 @@
+_default:
+    just --list
+
+fix:
+    cargo clippy --fix --allow-dirty --allow-staged --release -p esp-nvs-partition-tool
+
+lint:
+    cargo clippy --release -p esp-nvs-partition-tool -- -D warnings
+
+update-changelog:
+    git-cliff --bump --include-path "esp-nvs-partition-tool/**" -o CHANGELOG.md
+
+publish-dry-run:
+    cargo publish --registry crates-io --dry-run
+
+publish:
+    cargo publish --registry crates-io

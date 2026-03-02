@@ -1,6 +1,10 @@
 use crate::error::Error;
 use crate::platform::Platform;
-use crate::{Key, Nvs, raw};
+use crate::{
+    Key,
+    Nvs,
+    raw,
+};
 
 pub trait Set<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: T) -> Result<(), Error>;

@@ -2,7 +2,11 @@
 
 // filename according to https://doc.rust-lang.org/book/ch11-03-test-organization.html
 use embedded_storage::nor_flash::{
-    ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
+    ErrorType,
+    NorFlash,
+    NorFlashError,
+    NorFlashErrorKind,
+    ReadNorFlash,
 };
 
 pub const FLASH_SECTOR_SIZE: usize = 4096;
@@ -184,7 +188,8 @@ impl NorFlash for Flash {
         let offset = offset as usize;
         for (i, &val) in bytes.iter().enumerate() {
             // the esp flash we can only flip bits from 1 to 0
-            // println!("0x[{:04x}] {} &= {val} = {}",  offset+i,self.buf[offset + i], self.buf[offset + i] & val);
+            // println!("0x[{:04x}] {} &= {val} = {}",  offset+i,self.buf[offset + i],
+            // self.buf[offset + i] & val);
             self.buf[offset + i] &= val;
         }
         Ok(())

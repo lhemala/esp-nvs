@@ -11,18 +11,18 @@ name: check
 jobs:
   fmt:
     runs-on: ubuntu-latest
-    name: stable / fmt
+    name: nightly / fmt
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
         with:
           submodules: true
-      - name: Install stable
+      - name: Install nightly
         uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e # branch=master
         with:
-          toolchain: stable
+          toolchain: nightly
           components: rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt --check
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
   clippy:
     runs-on: ubuntu-latest
     name: ${{ matrix.toolchain }} / clippy
@@ -44,11 +44,10 @@ jobs:
           target: riscv32imc-unknown-none-elf,riscv32imac-unknown-none-elf,x86_64-unknown-linux-gnu
           toolchain: ${{ matrix.toolchain }}
           components: clippy
-      - name: cargo clippy
-        uses: giraffate/clippy-action@13b9d32482f25d29ead141b79e7e04e7900281e0 # tag=v1.0.1
-        with:
-          reporter: 'github-pr-check'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cargo clippy (esp-nvs)
+        run: cargo clippy --release --package esp-nvs --features=defmt -- --deny warnings
+      - name: cargo clippy (esp-nvs-partition-tool)
+        run: cargo clippy --release --package esp-nvs-partition-tool -- --deny warnings
   check:
     runs-on: ubuntu-latest
     name: stable / check
@@ -60,9 +59,8 @@ jobs:
         uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e # branch=master
         with:
           toolchain: stable
-          components: rustfmt
       - name: cargo check
-        run: cargo check
+        run: cargo check --workspace --all-targets
   doc:
     # run docs generation on nightly rather than stable. This enables features like
     # https://doc.rust-lang.org/beta/unstable-book/language-features/doc-cfg.html which allows an
@@ -79,8 +77,10 @@ jobs:
           toolchain: nightly
       - name: Install cargo-docs-rs
         uses: dtolnay/install@982daea0f5d846abc3c83e01a6a1d73c040047c1 # branch=cargo-docs-rs
-      - name: cargo docs-rs
-        run: cargo docs-rs
+      - name: cargo docs-rs (esp-nvs)
+        run: cargo docs-rs --package esp-nvs
+      - name: cargo docs-rs (esp-nvs-partition-tool)
+        run: cargo docs-rs --package esp-nvs-partition-tool
   msrv:
     runs-on: ubuntu-latest
     # we use a matrix here just because env can't be used in job names
@@ -103,4 +103,4 @@ jobs:
           path: ~/.cargo
           key: ${{ runner.os }}-cargo
       - name: cargo +${{ matrix.msrv }} check
-        run: cargo check
+        run: cargo check --workspace

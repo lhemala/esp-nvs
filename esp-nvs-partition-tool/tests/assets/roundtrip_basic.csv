@@ -1,0 +1,5 @@
+key,type,encoding,value
+test_namespace,namespace,,
+u8_val,data,u8,42
+i32_val,data,i32,-12345
+test_str,data,string,Hello World

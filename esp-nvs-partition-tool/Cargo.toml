@@ -1,0 +1,40 @@
+[package]
+name = "esp-nvs-partition-tool"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+authors = ["Lars Hemala"]
+repository = "https://github.com/lhemala/esp-nvs/"
+license = "MIT OR Apache-2.0"
+description = "ESP-IDF compatible NVS partition table parser and generator"
+keywords = ["esp", "embedded", "nvs", "partition", "esp-idf"]
+categories = ["command-line-utilities", "embedded", "parsing"]
+
+[lib]
+name = "esp_nvs_partition_tool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "esp-nvs-partition-tool"
+path = "src/bin/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[dependencies]
+base64 = "0.22.1"
+clap = { version = "4.5.60", features = ["derive"], optional = true }
+csv = "1.4.0"
+hex = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+
+[dev-dependencies]
+embedded-storage = "0.3.1"
+esp-nvs = { path = "../esp-nvs" }
+libz-sys = "1.1.22"
+similar = "2"
+tempfile = "3.25.0"
