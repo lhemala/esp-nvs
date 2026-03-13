@@ -1,5 +1,13 @@
-use esp_nvs::error::{Error, ItemType};
-use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+use esp_nvs::error::{
+    Error,
+    ItemType,
+};
+use esp_nvs::{
+    EntryStatistics,
+    Key,
+    NvsStatistics,
+    PageStatistics,
+};
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -335,6 +343,7 @@ fn corrupt_entry() {
 
 // TODO: when reading a multi-page-blob and the bounds don't match, mark the entry as corrupt
 
-// TODO: when reading a single-page-blob and the bounds don't match, mark the entry as corrupt (covers str as well)
+// TODO: when reading a single-page-blob and the bounds don't match, mark the entry as corrupt
+// (covers str as well)
 
 // TODO: when the CRC is invalid, mark the entry as corrupt

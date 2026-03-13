@@ -2,20 +2,25 @@
 
 // filename according to https://doc.rust-lang.org/book/ch11-03-test-organization.html
 use embedded_storage::nor_flash::{
-    ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
+    ErrorType,
+    NorFlash,
+    NorFlashError,
+    NorFlashErrorKind,
+    ReadNorFlash,
+};
+use esp_nvs::ENTRY_STATE_BITMAP_SIZE;
+pub use esp_nvs::{
+    FLASH_SECTOR_SIZE,
+    PAGE_HEADER_SIZE,
 };
 
-pub const FLASH_SECTOR_SIZE: usize = 4096;
 // Taken from https://github.com/esp-rs/esp-hal/blob/main/esp-storage/src/stub.rs
 pub const WORD_SIZE: usize = 4;
-pub const PAGE_HEADER_SIZE: usize = 32;
 pub const ENTRY_STATE_MAP_OFFSET: usize = PAGE_HEADER_SIZE;
-
-pub const ENTRY_STATE_MAP_SIZE: usize = 32;
+pub const ENTRY_STATE_MAP_SIZE: usize = ENTRY_STATE_BITMAP_SIZE;
 pub const ENTRY_STATE_MAP_ENTRY_SIZE: usize = 1;
 
 pub const ITEM_OFFSET: usize = PAGE_HEADER_SIZE + ENTRY_STATE_MAP_SIZE;
-pub const ITEM_SIZE: usize = 32;
 // 1 byte is the minimum that can be written
 
 #[derive(Default)]
@@ -184,7 +189,8 @@ impl NorFlash for Flash {
         let offset = offset as usize;
         for (i, &val) in bytes.iter().enumerate() {
             // the esp flash we can only flip bits from 1 to 0
-            // println!("0x[{:04x}] {} &= {val} = {}",  offset+i,self.buf[offset + i], self.buf[offset + i] & val);
+            // println!("0x[{:04x}] {} &= {val} = {}",  offset+i,self.buf[offset + i],
+            // self.buf[offset + i] & val);
             self.buf[offset + i] &= val;
         }
         Ok(())
@@ -193,9 +199,6 @@ impl NorFlash for Flash {
 
 impl esp_nvs::platform::Crc for Flash {
     fn crc32(init: u32, data: &[u8]) -> u32 {
-        // Cast to c_ulong here, because on windows this is a u32, and on linux it is a u64
-        unsafe {
-            libz_sys::crc32(init as core::ffi::c_ulong, data.as_ptr(), data.len() as u32) as u32
-        }
+        esp_nvs::platform::software_crc32(init, data)
     }
 }

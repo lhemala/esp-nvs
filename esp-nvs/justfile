@@ -1,0 +1,21 @@
+_default:
+    @just --list
+
+fix:
+    cargo clippy --fix --allow-dirty --allow-staged --release -p esp-nvs --features=defmt
+
+lint:
+    cargo clippy --release -p esp-nvs --features=defmt -- -D warnings
+
+update-changelog:
+    git-cliff --bump --include-path "esp-nvs/**" -o CHANGELOG.md
+
+publish-dry-run:
+    cargo publish --registry crates-io --dry-run
+
+publish:
+    cargo publish --registry crates-io
+
+[working-directory: 'tests/assets/']
+generate_test_nvs_bin:
+    esp-nvs-partition-tool generate test_nvs_data.csv test_nvs_data.bin --size 0x4000

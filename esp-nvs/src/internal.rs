@@ -1,38 +1,71 @@
-use crate::Key;
-use crate::error::Error;
-#[cfg(feature = "debug-logs")]
-use crate::raw::slice_with_nullbytes_to_str;
-use crate::raw::{
-    ENTRIES_PER_PAGE, ENTRY_STATE_BITMAP_SIZE, EntryMapState, FLASH_SECTOR_SIZE, Item, ItemData,
-    ItemDataBlobIndex, ItemType, MAX_BLOB_DATA_PER_PAGE, MAX_BLOB_SIZE, PageHeader, PageHeaderRaw,
-    PageState, RawItem, RawPage, write_aligned,
+use alloc::collections::BTreeMap;
+use alloc::string::{
+    String,
+    ToString,
 };
-use crate::u24::u24;
-use crate::{Nvs, raw};
-use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cmp;
 use core::cmp::Ordering;
 #[cfg(feature = "debug-logs")]
-use core::fmt::{Debug, Formatter};
-use core::mem::size_of;
-use core::ops::Range;
+use core::fmt::{
+    Debug,
+    Formatter,
+};
+use core::mem::{
+    offset_of,
+    size_of,
+};
+use core::ops::{
+    Not,
+    Range,
+};
+use core::{
+    cmp,
+    mem,
+};
 
-use crate::error::Error::{ItemTypeMismatch, KeyNotFound, PageFull};
-use crate::platform::{AlignedOps, Platform};
-use alloc::collections::BTreeMap;
-use core::mem;
-use core::mem::offset_of;
-use core::ops::Not;
 #[cfg(feature = "defmt")]
 use defmt::trace;
 #[cfg(feature = "defmt")]
 use defmt::warn;
 
-/// Maximum Key length is 15 bytes + 1 byte for the null terminator.
-/// Shorter keys need to be padded with null bytes.
-pub(crate) const MAX_KEY_LENGTH: usize = 15;
+use crate::error::Error;
+use crate::error::Error::{
+    ItemTypeMismatch,
+    KeyNotFound,
+    PageFull,
+};
+use crate::platform::{
+    AlignedOps,
+    Platform,
+};
+#[cfg(feature = "debug-logs")]
+use crate::raw::slice_with_nullbytes_to_str;
+use crate::raw::{
+    ENTRIES_PER_PAGE,
+    ENTRY_STATE_BITMAP_SIZE,
+    EntryMapState,
+    FLASH_SECTOR_SIZE,
+    Item,
+    ItemData,
+    ItemDataBlobIndex,
+    ItemType,
+    MAX_BLOB_DATA_PER_PAGE,
+    MAX_BLOB_SIZE,
+    PageHeader,
+    PageHeaderRaw,
+    PageState,
+    RawItem,
+    RawPage,
+    write_aligned,
+};
+use crate::u24::u24;
+use crate::{
+    Key,
+    MAX_KEY_LENGTH,
+    Nvs,
+    raw,
+};
 
 type BlobIndexKey = (NamespaceIndex, VersionOffset, Key);
 type BlobIndexValue = (Option<BlobIndexEntryBlobIndexData>, BlobObservedData);
@@ -405,7 +438,7 @@ impl ThinPage {
         println!("internal: load_item_data");
 
         match item.type_ {
-            ItemType::Sized | ItemType::BlobData => {}
+            ItemType::Sized | ItemType::BlobData | ItemType::Blob => {}
             _ => return Err(ItemTypeMismatch(item.type_)),
         }
 
@@ -413,7 +446,8 @@ impl ThinPage {
         let aligned_size = T::align_read(size);
 
         let mut buf = Vec::with_capacity(aligned_size);
-        // Safety: we just allocated the buffer with the exact size we need and we will override it the the call to hal.read()
+        // Safety: we just allocated the buffer with the exact size we need and we will override it
+        // the the call to hal.read()
         unsafe {
             Vec::set_len(&mut buf, aligned_size);
         }
@@ -824,52 +858,63 @@ where
             .get(namespace)
             .ok_or(Error::NamespaceNotFound)?;
 
-        let (_page_index, _item_index, item) =
+        let (page_index, item_index, item) =
             self.load_item(namespace_index, ChunkIndex::Any, key)?;
 
-        if item.type_ != ItemType::BlobIndex {
-            return Err(ItemTypeMismatch(item.type_));
-        }
+        if item.type_ == ItemType::BlobIndex {
+            let size = unsafe { item.data.blob_index.size };
 
-        let size = unsafe { item.data.blob_index.size };
-
-        if size as usize > MAX_BLOB_SIZE {
-            return Err(Error::CorruptedData);
-        }
-
-        let chunk_count = unsafe { item.data.blob_index.chunk_count };
-        let chunk_start = unsafe { item.data.blob_index.chunk_start };
-
-        let mut buf = vec![0u8; size as usize];
-        let mut offset = 0usize;
-
-        for chunk in chunk_start..chunk_start + chunk_count {
-            // Bounds check before slicing
-            if offset >= buf.len() {
-                return Err(Error::CorruptedData); // Blob metadata inconsistent - would read beyond buffer
-            }
-
-            let (page_index, item_index, item) =
-                self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
-
-            if item.type_ != ItemType::BlobData {
-                return Err(ItemTypeMismatch(item.type_));
-            }
-
-            let page = &self.pages[page_index.0];
-            let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
-
-            let data_crc = unsafe { item.data.sized.crc };
-            if data_crc != T::crc32(u32::MAX, &data) {
+            if size as usize > MAX_BLOB_SIZE {
                 return Err(Error::CorruptedData);
             }
 
-            let read_bytes = data.len().min(buf.len() - offset);
-            buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
-            offset += read_bytes;
-        }
+            let chunk_count = unsafe { item.data.blob_index.chunk_count };
+            let chunk_start = unsafe { item.data.blob_index.chunk_start };
 
-        Ok(buf)
+            let mut buf = vec![0u8; size as usize];
+            let mut offset = 0usize;
+
+            for chunk in chunk_start..chunk_start + chunk_count {
+                // Bounds check before slicing
+                if offset >= buf.len() {
+                    return Err(Error::CorruptedData);
+                }
+
+                let (page_index, item_index, item) =
+                    self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
+
+                if item.type_ != ItemType::BlobData {
+                    return Err(ItemTypeMismatch(item.type_));
+                }
+
+                let page = &self.pages[page_index.0];
+                let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+
+                let data_crc = unsafe { item.data.sized.crc };
+                if data_crc != T::crc32(u32::MAX, &data) {
+                    return Err(Error::CorruptedData);
+                }
+
+                let read_bytes = data.len().min(buf.len() - offset);
+                buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
+                offset += read_bytes;
+            }
+
+            Ok(buf)
+        } else if item.type_ == ItemType::Blob {
+            // Legacy single-page blob (version 1 format) — same layout as Sized
+            let page = &self.pages[page_index.0];
+            let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+
+            let crc = unsafe { item.data.sized.crc };
+            if crc != T::crc32(u32::MAX, &data) {
+                return Err(Error::CorruptedData);
+            }
+
+            Ok(data)
+        } else {
+            Err(ItemTypeMismatch(item.type_))
+        }
     }
 
     pub(crate) fn delete_key(
@@ -1292,9 +1337,9 @@ where
         )?;
         self.pages.push(page);
 
-        // Now that the new blob version has been successfully written, delete the old version if it exists
-        // _old_version is unused since it will be the first one that is bound to be found anyway as newer
-        // pages appear later in self.pages
+        // Now that the new blob version has been successfully written, delete the old version if it
+        // exists _old_version is unused since it will be the first one that is bound to be
+        // found anyway as newer pages appear later in self.pages
         if let Some(_old_version) = old_blob_version {
             self.delete_key(namespace_index, &key, ChunkIndex::BlobIndex)?;
         }
@@ -1369,11 +1414,10 @@ where
         let namespace_index = match self.namespaces.get(namespace) {
             Some(ns_idx) => *ns_idx,
             None => {
-                let namespace_index = self
-                    .namespaces
-                    .iter()
-                    .max_by_key(|(_, idx)| **idx)
-                    .map_or(1, |(_, idx)| idx + 1);
+                let namespace_index = match self.namespaces.iter().max_by_key(|(_, idx)| **idx) {
+                    Some((_, idx)) => idx.checked_add(1).ok_or(Error::FlashFull)?,
+                    None => 1,
+                };
 
                 page.write_namespace(&mut self.hal, *namespace, namespace_index)?;
 
@@ -1472,8 +1516,8 @@ where
 
         self.continue_free_page()?;
 
-        // After loading all pages, check for duplicate primitive/string entries and mark older ones as erased
-        // This handles cases where deletion failed after a successful write
+        // After loading all pages, check for duplicate primitive/string entries and mark older ones
+        // as erased This handles cases where deletion failed after a successful write
         self.cleanup_duplicate_entries()?;
 
         self.cleanup_dirty_blobs(blob_index)?;
@@ -1836,9 +1880,9 @@ where
         #[cfg(feature = "defmt")]
         trace!("copy_items");
 
-        // in case the operation was disturbed in the middle, target might already contain some parts
-        // of the source page, so we first get the last copied item so we can ignor it and everything
-        // before in our copy loop
+        // in case the operation was disturbed in the middle, target might already contain some
+        // parts of the source page, so we first get the last copied item so we can ignor it
+        // and everything before in our copy loop
         let mut last_copied_entry = match target.item_hash_list.iter().max_by_key(|it| it.index) {
             Some(hash_entry) => Some(target.load_item(&mut self.hal, hash_entry.index)?),
             None => None,
@@ -1942,7 +1986,8 @@ where
             )));
         }
 
-        // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc afterwards
+        // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc
+        // afterwards
         let raw_page: RawPage = unsafe { core::mem::transmute(buf) };
 
         #[cfg(feature = "debug-logs")]
@@ -1986,8 +2031,8 @@ where
 
         // Needed due to the desugaring below
         let mut namespaces: Vec<Namespace> = vec![];
-        // This iterator desugaring is necessary to be able to skip entries, e.g. a BLOB or STR entries
-        // are followed by entries containing their raw value.
+        // This iterator desugaring is necessary to be able to skip entries, e.g. a BLOB or STR
+        // entries are followed by entries containing their raw value.
         let items = &raw_page.items;
         let mut item_iter = unsafe { items.entries.iter().zip(u8::MIN..u8::MAX) };
         'item_iter: while let Some((item, item_index)) = item_iter.next() {
@@ -2029,7 +2074,8 @@ where
                             }
                             ItemType::Blob => {
                                 // TODO: should we just ignore this value or mark page corrupt?
-                                //  Alternatively, we could add support for BLOB_V1 and convert it here
+                                //  Alternatively, we could add support for BLOB_V1 and convert it
+                                // here
                                 page.used_entry_count += 1;
                                 continue 'item_iter;
                             }

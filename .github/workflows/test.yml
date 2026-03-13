@@ -30,10 +30,10 @@ jobs:
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
       - name: cargo test --locked
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
-        run: cargo test --locked --doc
+        run: cargo test --locked --workspace --doc
   os-check:
     # run cargo test on mac and windows
     runs-on: ${{ matrix.os }}
@@ -56,4 +56,4 @@ jobs:
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
       - name: cargo test
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --workspace --all-targets

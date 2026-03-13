@@ -1,11 +1,16 @@
 //! The `Get<T>` trait and its implementation in this module allows providing a single generic,
 //! overloaded function `get<T>()` for all supported types of the driver.
 
-use crate::error::Error;
-use crate::platform::Platform;
-use crate::{Key, Nvs, raw};
 use alloc::string::String;
 use alloc::vec::Vec;
+
+use crate::error::Error;
+use crate::platform::Platform;
+use crate::{
+    Key,
+    Nvs,
+    raw,
+};
 
 pub trait Get<T> {
     fn get(&mut self, namespace: &Key, key: &Key) -> Result<T, Error>;

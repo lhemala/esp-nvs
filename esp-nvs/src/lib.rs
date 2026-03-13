@@ -1,16 +1,30 @@
-#![doc = include_str ! ("../README.md")]
+#![doc = include_str ! ("../../README.md")]
 #![cfg_attr(not(target_arch = "x86_64"), no_std)]
 
 pub mod error;
+pub mod mem_flash;
+pub mod platform;
+pub mod raw;
+
 mod get;
 mod internal;
-pub mod platform;
-mod raw;
 mod set;
 mod u24;
 
+pub use raw::{
+    ENTRIES_PER_PAGE,
+    ENTRY_STATE_BITMAP_SIZE,
+    FLASH_SECTOR_SIZE,
+    ITEM_SIZE,
+    ItemType,
+    MAX_BLOB_DATA_PER_PAGE,
+    MAX_BLOB_SIZE,
+    PAGE_HEADER_SIZE,
+    PageState,
+};
+
 /// Maximum Key length is 15 bytes + 1 byte for the null terminator.
-const MAX_KEY_LENGTH: usize = 15;
+pub const MAX_KEY_LENGTH: usize = 15;
 const MAX_KEY_NUL_TERMINATED_LENGTH: usize = MAX_KEY_LENGTH + 1;
 
 /// A 16-byte key used for NVS storage (15 characters + null terminator)
@@ -66,6 +80,13 @@ impl Key {
     /// Converts a key to a byte array.
     pub const fn as_bytes(&self) -> &[u8; MAX_KEY_NUL_TERMINATED_LENGTH] {
         &self.0
+    }
+
+    /// Returns the key as a string slice, excluding null padding.
+    pub fn as_str(&self) -> &str {
+        let len = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
+        // Safety: NVS keys are always valid ASCII/UTF-8
+        unsafe { core::str::from_utf8_unchecked(&self.0[..len]) }
     }
 }
 
@@ -128,13 +149,22 @@ pub use set::Set;
 
 extern crate alloc;
 
-use crate::error::Error;
-use crate::internal::{ChunkIndex, IterPageItems, ThinPage, VersionOffset};
-use crate::platform::Platform;
-use crate::raw::{ENTRIES_PER_PAGE, FLASH_SECTOR_SIZE, Item, ItemType};
-use alloc::collections::{BTreeMap, BinaryHeap};
+use alloc::collections::{
+    BTreeMap,
+    BinaryHeap,
+};
 use alloc::vec::Vec;
 use core::fmt;
+
+use crate::error::Error;
+use crate::internal::{
+    ChunkIndex,
+    IterPageItems,
+    ThinPage,
+    VersionOffset,
+};
+use crate::platform::Platform;
+use crate::raw::Item;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NvsStatistics {
@@ -181,7 +211,8 @@ impl<T: Platform> Nvs<T> {
     /// 3. Cleanup duplicate entries
     /// 4. Cleanup of duplicated blobs or orphaned blob data
     ///
-    /// Pages or entries with invalid CRC32 values are marked as corrupt and are erased when necessary
+    /// Pages or entries with invalid CRC32 values are marked as corrupt and are erased when
+    /// necessary
     pub fn new(partition_offset: usize, partition_size: usize, hal: T) -> Result<Nvs<T>, Error> {
         if !partition_offset.is_multiple_of(FLASH_SECTOR_SIZE) {
             return Err(Error::InvalidPartitionOffset);
@@ -238,7 +269,8 @@ impl<T: Platform> Nvs<T> {
     /// Set a value and write it to the flash
     ///
     /// Type support:
-    ///  * bool, singed and unsigned integers up to 64-bit width: saved as primitive value with 32 bytes
+    ///  * bool, singed and unsigned integers up to 64-bit width: saved as primitive value with 32
+    ///    bytes
     ///  * &str: Saved on a single page with a max size of 4000 bytes
     ///  * &[u8]: May span multiple pages, max size ~500kB
     pub fn set<R>(&mut self, namespace: &Key, key: &Key, value: R) -> Result<(), Error>
@@ -273,6 +305,20 @@ impl<T: Platform> Nvs<T> {
         IterKeys::new(&self.pages, &mut self.hal, &self.namespaces)
     }
 
+    /// Returns an iterator over all data entries with their types.
+    ///
+    /// Each item yields `(namespace_key, entry_key, item_type)`. Namespace
+    /// definition entries are skipped. For multi-chunk blobs, only a single
+    /// representative entry is returned (with type [`ItemType::BlobData`]).
+    /// Legacy single-page blobs are returned with type [`ItemType::Blob`].
+    ///
+    /// # Errors
+    ///
+    /// The iterator yields an error if there is a flash read error.
+    pub fn typed_entries(&mut self) -> impl Iterator<Item = Result<(Key, Key, ItemType), Error>> {
+        IterTypedEntries::new(&self.pages, &mut self.hal, &self.namespaces)
+    }
+
     /// Delete a key
     ///
     /// Ignores missing keys or the namespaces
@@ -301,6 +347,14 @@ impl<T: Platform> Nvs<T> {
             }
             other => other,
         }
+    }
+
+    /// Consume the NVS instance and return the underlying platform / HAL.
+    ///
+    /// This is useful for extracting the flash data after writing entries
+    /// (e.g. with [`mem_flash::MemFlash`]).
+    pub fn into_inner(self) -> T {
+        self.hal
     }
 
     /// Returns detailed statistics about the NVS partition usage
@@ -400,7 +454,8 @@ impl<'a, T: Platform> Iterator for IterLoadedItems<'a, T> {
         // self.current is only None if there are no pages at all
         let current = self.current.as_mut()?;
 
-        // if the current page is exhausted, move to next page that has items (or until we run out of pages)
+        // if the current page is exhausted, move to next page that has items (or until we run out
+        // of pages)
         while current.is_empty() {
             let next_page = self.pages.split_off_first()?;
 
@@ -443,7 +498,8 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
         loop {
             return match self.items.next()? {
                 Ok(item) => {
-                    // Skip namespace entries (namespace_index == 0), and blobs (they are represented by their BlobData)
+                    // Skip namespace entries (namespace_index == 0), and blobs (they are
+                    // represented by their BlobData)
                     if item.namespace_index == 0
                         || item.type_ == ItemType::Blob
                         || item.type_ == ItemType::BlobIndex
@@ -459,6 +515,56 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
                     }
 
                     Some(Ok(self.item_to_keys(item)))
+                }
+                Err(err) => Some(Err(err)),
+            };
+        }
+    }
+}
+
+struct IterTypedEntries<'a, T: Platform> {
+    items: IterLoadedItems<'a, T>,
+    namespaces: &'a BTreeMap<Key, u8>,
+}
+
+impl<'a, T: Platform> IterTypedEntries<'a, T> {
+    fn new(pages: &'a [ThinPage], hal: &'a mut T, namespaces: &'a BTreeMap<Key, u8>) -> Self {
+        Self {
+            items: IterLoadedItems::new(pages, hal),
+            namespaces,
+        }
+    }
+
+    fn item_to_entry(&self, item: Item) -> (Key, Key, ItemType) {
+        let (namespace_key, _) = self
+            .namespaces
+            .iter()
+            .find(|(_, idx)| **idx == item.namespace_index)
+            .unwrap();
+
+        (*namespace_key, item.key, item.type_)
+    }
+}
+
+impl<'a, T: Platform> Iterator for IterTypedEntries<'a, T> {
+    type Item = Result<(Key, Key, ItemType), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            return match self.items.next()? {
+                Ok(item) => {
+                    // Skip namespace entries
+                    if item.namespace_index == 0 {
+                        continue;
+                    }
+
+                    // Skip BlobData — blobs are represented by their BlobIndex
+                    if item.type_ == ItemType::BlobData {
+                        continue;
+                    }
+
+                    // Include BlobIndex, legacy Blob (0x41), primitives, and Sized
+                    Some(Ok(self.item_to_entry(item)))
                 }
                 Err(err) => Some(Err(err)),
             };

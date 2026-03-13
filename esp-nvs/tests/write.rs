@@ -1,10 +1,11 @@
 mod common;
 
 mod set {
-    use crate::common;
     use esp_nvs::Key;
     use esp_nvs::error::Error;
     use pretty_assertions::assert_eq;
+
+    use crate::common;
 
     // TODO: test for writing namespace fails + cleanup
 
@@ -538,10 +539,16 @@ mod set {
 }
 
 mod delete {
-    use crate::common;
     use esp_nvs::error::Error;
-    use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+    use esp_nvs::{
+        EntryStatistics,
+        Key,
+        NvsStatistics,
+        PageStatistics,
+    };
     use pretty_assertions::assert_eq;
+
+    use crate::common;
 
     #[test]
     fn primitive() {
@@ -722,10 +729,19 @@ mod delete {
 }
 
 mod overwrite {
-    use crate::common;
-    use esp_nvs::error::Error::{FlashError, KeyNotFound};
-    use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+    use esp_nvs::error::Error::{
+        FlashError,
+        KeyNotFound,
+    };
+    use esp_nvs::{
+        EntryStatistics,
+        Key,
+        NvsStatistics,
+        PageStatistics,
+    };
     use pretty_assertions::assert_eq;
+
+    use crate::common;
 
     #[test]
     fn primitive_overwrites_primitive() {
@@ -1113,12 +1129,14 @@ mod overwrite {
 
     #[test]
     fn blob_overwrites_blob_atomicity_fail_to_delete_old() {
-        // fail_after_operations is the highest value that makes deleting the old, overwritten block fail.
+        // fail_after_operations is the highest value that makes deleting the old, overwritten block
+        // fail.
         let mut flash = common::Flash::new_with_fault(5, 39);
 
         // a page has 126 entries
-        // the first page contains the namespace, the header for the blob_data and the first 124*32 bytes
-        // the seconds page contains the blob_data header, 124*32 bytes of data and the blob_index entry
+        // the first page contains the namespace, the header for the blob_data and the first 124*32
+        // bytes the seconds page contains the blob_data header, 124*32 bytes of data and
+        // the blob_index entry
         let blob_initial = (u8::MIN..u8::MAX)
             .cycle()
             .take(124 * 32 + 124 * 32)
@@ -1166,12 +1184,14 @@ mod overwrite {
 
     #[test]
     fn blob_overwrites_blob_atomicity_fail_to_delete_old_twice() {
-        // fail_after_operations is the highest value that makes deleting the old, overwritten block fail.
+        // fail_after_operations is the highest value that makes deleting the old, overwritten block
+        // fail.
         let mut flash = common::Flash::new_with_fault(8, 60);
 
         // a page has 126 entries
-        // the first page contains the namespace, the header for the blob_data and the first 124*32 bytes
-        // the seconds page contains the blob_data header, 124*32 bytes of data and the blob_index entry
+        // the first page contains the namespace, the header for the blob_data and the first 124*32
+        // bytes the seconds page contains the blob_data header, 124*32 bytes of data and
+        // the blob_index entry
         let blob_initial = (u8::MIN..u8::MAX)
             .cycle()
             .take(124 * 32 + 124 * 32)
@@ -1228,11 +1248,17 @@ mod overwrite {
 // TODO overwrite small blob with fail to erase
 
 mod defrag {
+    use esp_nvs::error::Error::FlashError;
+    use esp_nvs::{
+        EntryStatistics,
+        Key,
+        NvsStatistics,
+        PageStatistics,
+    };
+    use pretty_assertions::assert_eq;
+
     use crate::common;
     use crate::common::Operation;
-    use esp_nvs::error::Error::FlashError;
-    use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn defragmentation() {
@@ -1723,8 +1749,9 @@ mod defrag {
         }
 
         // Inject fault after all entries copied but just before erase
-        // From test output: erase happens at operation #576 (196 operations after initial setup at #380)
-        // Inject fault at operation 195 to fail at operation 575 (just before erase at 576)
+        // From test output: erase happens at operation #576 (196 operations after initial setup at
+        // #380) Inject fault at operation 195 to fail at operation 575 (just before erase
+        // at 576)
         flash.fail_after_operation = flash.operations.len() + 195;
 
         {
@@ -1807,5 +1834,6 @@ mod defrag {
     }
 
     // TODO: in case we we want to write a sized item to a page and it doesn't fit, before
-    //  allocating an new empty page and defragmenting into it we can try to fill the still empty entries first
+    //  allocating an new empty page and defragmenting into it we can try to fill the still empty
+    // entries first
 }

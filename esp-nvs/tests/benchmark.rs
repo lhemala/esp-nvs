@@ -1,8 +1,19 @@
-use crate::common::Operation::{Read, Write};
-use crate::common::{
-    ENTRY_STATE_MAP_OFFSET, FLASH_SECTOR_SIZE, ITEM_OFFSET, ITEM_SIZE, PAGE_HEADER_SIZE, WORD_SIZE,
+use esp_nvs::{
+    ITEM_SIZE,
+    Key,
 };
-use esp_nvs::Key;
+
+use crate::common::Operation::{
+    Read,
+    Write,
+};
+use crate::common::{
+    ENTRY_STATE_MAP_OFFSET,
+    FLASH_SECTOR_SIZE,
+    ITEM_OFFSET,
+    PAGE_HEADER_SIZE,
+    WORD_SIZE,
+};
 
 mod common;
 
