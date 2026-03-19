@@ -1,9 +1,11 @@
 mod nvs 'esp-nvs/justfile'
+mod partition_tool 'esp-nvs-partition-tool/justfile'
 
 _default:
     @just --list
 
-fix: nvs::fix
+fix: nvs::fix partition_tool::fix
+    cargo fmt
 
 fmt-all: fmt
     just --unstable --format
@@ -12,13 +14,13 @@ fmt-all: fmt
 
 fmt: _nightly-fmt
 
-lint: _nightly-fmt-check nvs::lint
+lint: _nightly-fmt-check nvs::lint partition_tool::lint
 
 test:
     cargo test --all
     cargo test --doc
 
-update-changelog: nvs::update-changelog
+update-changelog: nvs::update-changelog partition_tool::update-changelog
 
 _nightly-fmt:
     devenv shell \

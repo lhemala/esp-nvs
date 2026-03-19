@@ -17,6 +17,36 @@ impl<T: Crc> Crc for &mut T {
     }
 }
 
+/// Software CRC32 using the IEEE 802.3 polynomial (0xEDB88320).
+///
+/// This follows the zlib convention: the internal state is obtained by XOR-ing
+/// `init` with `0xFFFFFFFF` before processing, and the returned value is the
+/// internal state XOR-ed with `0xFFFFFFFF` after processing.
+///
+/// For a standard one-shot CRC32, pass `init = 0`.
+///
+/// For incremental/streaming use, pass the previous return value as `init`.
+///
+/// This function is compatible with `libz_sys::crc32` and the ESP-IDF ROM
+/// `crc32_le` function, and can be used to implement the [`Crc`] trait on
+/// host platforms without a C library dependency.
+pub fn software_crc32(init: u32, data: &[u8]) -> u32 {
+    let mut crc = init ^ 0xFFFFFFFF;
+
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+
+    crc ^ 0xFFFFFFFF
+}
+
 pub trait AlignedOps: Platform {
     fn align_read(size: usize) -> usize {
         align_ceil(size, Self::READ_SIZE)

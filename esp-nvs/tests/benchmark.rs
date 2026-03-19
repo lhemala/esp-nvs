@@ -1,4 +1,7 @@
-use esp_nvs::Key;
+use esp_nvs::{
+    ITEM_SIZE,
+    Key,
+};
 
 use crate::common::Operation::{
     Read,
@@ -8,7 +11,6 @@ use crate::common::{
     ENTRY_STATE_MAP_OFFSET,
     FLASH_SECTOR_SIZE,
     ITEM_OFFSET,
-    ITEM_SIZE,
     PAGE_HEADER_SIZE,
     WORD_SIZE,
 };

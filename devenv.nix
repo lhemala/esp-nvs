@@ -9,7 +9,7 @@
 
   overlays = [
     (final: prev: {
-      esp-idf-nvs-partition-gen = final.callPackage ./.nix/esp-idf-nvs-partition-gen.nix {};
+      esp-nvs-partition-tool = final.callPackage ./.nix/esp-nvs-partition-tool.nix { };
     })
   ];
 
@@ -17,7 +17,7 @@
   packages = with pkgs; [
     actionlint
     cargo-edit
-    esp-idf-nvs-partition-gen
+    esp-nvs-partition-tool
     git
     just
     nixfmt

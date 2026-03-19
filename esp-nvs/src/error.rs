@@ -1,7 +1,6 @@
-pub use raw::ItemType;
 use thiserror::Error;
 
-use crate::raw;
+pub use crate::raw::ItemType;
 
 /// Errors that can occur during NVS operations. The list is likely to stay as is but marked as
 /// non-exhaustive to allow for future additions without breaking the API. A caller would likely

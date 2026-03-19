@@ -29,15 +29,18 @@ use crate::platform::{
 use crate::u24::u24;
 
 // -1 is for the leading item of type BLOB_DATA or SZ (for str)
-pub(crate) const MAX_BLOB_DATA_PER_PAGE: usize = (ENTRIES_PER_PAGE - 1) * size_of::<Item>();
-pub(crate) const MAX_BLOB_SIZE: usize = MAX_BLOB_DATA_PER_PAGE * (u8::MAX as usize - VersionOffset::V1 as usize);
-pub(crate) const FLASH_SECTOR_SIZE: usize = 4096;
-pub(crate) const ENTRY_STATE_BITMAP_SIZE: usize = 32;
-pub(crate) const ENTRIES_PER_PAGE: usize = 126;
+pub const FLASH_SECTOR_SIZE: usize = 4096;
+pub const ENTRY_STATE_BITMAP_SIZE: usize = 32;
+pub const ENTRIES_PER_PAGE: usize = 126;
+// -1 is for the leading item of type BLOB_DATA or SZ (for str)
+pub const MAX_BLOB_DATA_PER_PAGE: usize = (ENTRIES_PER_PAGE - 1) * size_of::<Item>();
+pub const MAX_BLOB_SIZE: usize = MAX_BLOB_DATA_PER_PAGE * (u8::MAX as usize - VersionOffset::V1 as usize);
+pub const PAGE_HEADER_SIZE: usize = size_of::<PageHeader>();
+pub const ITEM_SIZE: usize = size_of::<Item>();
 
 // Compile-time assertion to ensure page structure size matches flash sector size
 const _: () = assert!(
-    size_of::<PageHeader>() + ENTRY_STATE_BITMAP_SIZE + ENTRIES_PER_PAGE * size_of::<Item>() == FLASH_SECTOR_SIZE,
+    PAGE_HEADER_SIZE + ENTRY_STATE_BITMAP_SIZE + ENTRIES_PER_PAGE * ITEM_SIZE == FLASH_SECTOR_SIZE,
     "Page structure size must equal flash sector size"
 );
 
@@ -79,7 +82,7 @@ const PSB_CORRUPT: u32 = 0x8;
 
 #[derive(strum::FromRepr, strum::Display, Debug, PartialEq, Copy, Clone)]
 #[repr(u32)]
-pub(crate) enum PageState {
+pub enum PageState {
     // All bits set, default state after flash erase. Page has not been initialized yet.
     Uninitialized = u32::MAX,
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["esp-nvs"]
+members = ["esp-nvs", "esp-nvs-partition-tool"]
 resolver = "2"
 
 [profile.dev.package.esp-storage]

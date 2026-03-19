@@ -62,13 +62,10 @@ use crate::raw::{
 use crate::u24::u24;
 use crate::{
     Key,
+    MAX_KEY_LENGTH,
     Nvs,
     raw,
 };
-
-/// Maximum Key length is 15 bytes + 1 byte for the null terminator.
-/// Shorter keys need to be padded with null bytes.
-pub(crate) const MAX_KEY_LENGTH: usize = 15;
 
 type BlobIndexKey = (NamespaceIndex, VersionOffset, Key);
 type BlobIndexValue = (Option<BlobIndexEntryBlobIndexData>, BlobObservedData);
@@ -422,7 +419,7 @@ impl ThinPage {
         println!("internal: load_item_data");
 
         match item.type_ {
-            ItemType::Sized | ItemType::BlobData => {}
+            ItemType::Sized | ItemType::BlobData | ItemType::Blob => {}
             _ => return Err(ItemTypeMismatch(item.type_)),
         }
 
@@ -807,50 +804,62 @@ where
 
         let namespace_index = *self.namespaces.get(namespace).ok_or(Error::NamespaceNotFound)?;
 
-        let (_page_index, _item_index, item) = self.load_item(namespace_index, ChunkIndex::Any, key)?;
+        let (page_index, item_index, item) = self.load_item(namespace_index, ChunkIndex::Any, key)?;
 
-        if item.type_ != ItemType::BlobIndex {
-            return Err(ItemTypeMismatch(item.type_));
-        }
+        if item.type_ == ItemType::BlobIndex {
+            let size = unsafe { item.data.blob_index.size };
 
-        let size = unsafe { item.data.blob_index.size };
-
-        if size as usize > MAX_BLOB_SIZE {
-            return Err(Error::CorruptedData);
-        }
-
-        let chunk_count = unsafe { item.data.blob_index.chunk_count };
-        let chunk_start = unsafe { item.data.blob_index.chunk_start };
-
-        let mut buf = vec![0u8; size as usize];
-        let mut offset = 0usize;
-
-        for chunk in chunk_start..chunk_start + chunk_count {
-            // Bounds check before slicing
-            if offset >= buf.len() {
-                return Err(Error::CorruptedData); // Blob metadata inconsistent - would read beyond buffer
-            }
-
-            let (page_index, item_index, item) = self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
-
-            if item.type_ != ItemType::BlobData {
-                return Err(ItemTypeMismatch(item.type_));
-            }
-
-            let page = &self.pages[page_index.0];
-            let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
-
-            let data_crc = unsafe { item.data.sized.crc };
-            if data_crc != T::crc32(u32::MAX, &data) {
+            if size as usize > MAX_BLOB_SIZE {
                 return Err(Error::CorruptedData);
             }
 
-            let read_bytes = data.len().min(buf.len() - offset);
-            buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
-            offset += read_bytes;
-        }
+            let chunk_count = unsafe { item.data.blob_index.chunk_count };
+            let chunk_start = unsafe { item.data.blob_index.chunk_start };
 
-        Ok(buf)
+            let mut buf = vec![0u8; size as usize];
+            let mut offset = 0usize;
+
+            for chunk in chunk_start..chunk_start + chunk_count {
+                // Bounds check before slicing
+                if offset >= buf.len() {
+                    return Err(Error::CorruptedData);
+                }
+
+                let (page_index, item_index, item) =
+                    self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
+
+                if item.type_ != ItemType::BlobData {
+                    return Err(ItemTypeMismatch(item.type_));
+                }
+
+                let page = &self.pages[page_index.0];
+                let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+
+                let data_crc = unsafe { item.data.sized.crc };
+                if data_crc != T::crc32(u32::MAX, &data) {
+                    return Err(Error::CorruptedData);
+                }
+
+                let read_bytes = data.len().min(buf.len() - offset);
+                buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
+                offset += read_bytes;
+            }
+
+            Ok(buf)
+        } else if item.type_ == ItemType::Blob {
+            // Legacy single-page blob (version 1 format) — same layout as Sized
+            let page = &self.pages[page_index.0];
+            let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+
+            let crc = unsafe { item.data.sized.crc };
+            if crc != T::crc32(u32::MAX, &data) {
+                return Err(Error::CorruptedData);
+            }
+
+            Ok(data)
+        } else {
+            Err(ItemTypeMismatch(item.type_))
+        }
     }
 
     pub(crate) fn delete_key(&mut self, namespace_index: u8, key: &Key, chunk_index: ChunkIndex) -> Result<(), Error> {
@@ -1305,11 +1314,10 @@ where
         let namespace_index = match self.namespaces.get(namespace) {
             Some(ns_idx) => *ns_idx,
             None => {
-                let namespace_index = self
-                    .namespaces
-                    .iter()
-                    .max_by_key(|(_, idx)| **idx)
-                    .map_or(1, |(_, idx)| idx + 1);
+                let namespace_index = match self.namespaces.iter().max_by_key(|(_, idx)| **idx) {
+                    Some((_, idx)) => idx.checked_add(1).ok_or(Error::FlashFull)?,
+                    None => 1,
+                };
 
                 page.write_namespace(&mut self.hal, *namespace, namespace_index)?;
 
