@@ -1,29 +1,46 @@
-use crate::Key;
-use crate::error::Error;
-use crate::internal::{ThinPageHeader, ThinPageState, VersionOffset};
-use crate::platform::{AlignedOps, FnCrc32, Platform};
-use crate::u24::u24;
 #[cfg(feature = "debug-logs")]
 use alloc::format;
 use alloc::vec;
-use core::fmt::{Debug, Formatter};
-use core::mem::{size_of, transmute};
+use core::fmt::{
+    Debug,
+    Formatter,
+};
+use core::mem::{
+    size_of,
+    transmute,
+};
 use core::slice::from_raw_parts;
+
 #[cfg(feature = "defmt")]
 use defmt::trace;
 
+use crate::Key;
+use crate::error::Error;
+use crate::internal::{
+    ThinPageHeader,
+    ThinPageState,
+    VersionOffset,
+};
+use crate::platform::{
+    AlignedOps,
+    FnCrc32,
+    Platform,
+};
+use crate::u24::u24;
+
 // -1 is for the leading item of type BLOB_DATA or SZ (for str)
-pub(crate) const MAX_BLOB_DATA_PER_PAGE: usize = (ENTRIES_PER_PAGE - 1) * size_of::<Item>();
-pub(crate) const MAX_BLOB_SIZE: usize =
-    MAX_BLOB_DATA_PER_PAGE * (u8::MAX as usize - VersionOffset::V1 as usize);
-pub(crate) const FLASH_SECTOR_SIZE: usize = 4096;
-pub(crate) const ENTRY_STATE_BITMAP_SIZE: usize = 32;
-pub(crate) const ENTRIES_PER_PAGE: usize = 126;
+pub const FLASH_SECTOR_SIZE: usize = 4096;
+pub const ENTRY_STATE_BITMAP_SIZE: usize = 32;
+pub const ENTRIES_PER_PAGE: usize = 126;
+// -1 is for the leading item of type BLOB_DATA or SZ (for str)
+pub const MAX_BLOB_DATA_PER_PAGE: usize = (ENTRIES_PER_PAGE - 1) * size_of::<Item>();
+pub const MAX_BLOB_SIZE: usize = MAX_BLOB_DATA_PER_PAGE * (u8::MAX as usize - VersionOffset::V1 as usize);
+pub const PAGE_HEADER_SIZE: usize = size_of::<PageHeader>();
+pub const ITEM_SIZE: usize = size_of::<Item>();
 
 // Compile-time assertion to ensure page structure size matches flash sector size
 const _: () = assert!(
-    size_of::<PageHeader>() + ENTRY_STATE_BITMAP_SIZE + ENTRIES_PER_PAGE * size_of::<Item>()
-        == FLASH_SECTOR_SIZE,
+    PAGE_HEADER_SIZE + ENTRY_STATE_BITMAP_SIZE + ENTRIES_PER_PAGE * ITEM_SIZE == FLASH_SECTOR_SIZE,
     "Page structure size must equal flash sector size"
 );
 
@@ -65,7 +82,7 @@ const PSB_CORRUPT: u32 = 0x8;
 
 #[derive(strum::FromRepr, strum::Display, Debug, PartialEq, Copy, Clone)]
 #[repr(u32)]
-pub(crate) enum PageState {
+pub enum PageState {
     // All bits set, default state after flash erase. Page has not been initialized yet.
     Uninitialized = u32::MAX,
 
@@ -221,9 +238,7 @@ impl Item {
     #[cfg(feature = "debug-logs")]
     fn get_primitive(&self) -> Result<u64, Error> {
         let width = match self.type_ {
-            ItemType::I8 | ItemType::I16 | ItemType::I32 | ItemType::I64 => {
-                (self.type_ as u8) - 0x10
-            }
+            ItemType::I8 | ItemType::I16 | ItemType::I32 | ItemType::I64 => (self.type_ as u8) - 0x10,
             ItemType::U8 | ItemType::U16 | ItemType::U32 | ItemType::U64 => self.type_ as u8,
             _ => return Err(Error::ItemTypeMismatch(self.type_)),
         };
@@ -274,9 +289,7 @@ impl Debug for ItemDataSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         let size = self.size;
         let crc = self.crc;
-        f.write_fmt(format_args!(
-            "ItemDataSized {{size: {size}, crc: {crc:0>8x}}}"
-        ))
+        f.write_fmt(format_args!("ItemDataSized {{size: {size}, crc: {crc:0>8x}}}"))
     }
 }
 
@@ -294,7 +307,9 @@ impl Debug for ItemDataBlobIndex {
         let size = self.size;
         let chunk_count = self.chunk_count;
         let chunk_start = self.chunk_start;
-        f.write_fmt(format_args!("ItemDataBlobIndex {{size: {size}, chunk_count: {chunk_count}, chunk_start: {chunk_start}}}"))
+        f.write_fmt(format_args!(
+            "ItemDataBlobIndex {{size: {size}, chunk_count: {chunk_count}, chunk_start: {chunk_start}}}"
+        ))
     }
 }
 
@@ -303,19 +318,12 @@ impl Item {
         Self::calculate_hash_ref(crc32, self.namespace_index, &self.key, self.chunk_index)
     }
 
-    /// `calculate_hash_ref` follows the details of the C++ implementation and accepts more collisions in
-    /// favor of memory efficiency
-    pub(crate) fn calculate_hash_ref(
-        crc32: FnCrc32,
-        namespace_index: u8,
-        key: &Key,
-        chunk_index: u8,
-    ) -> u24 {
+    /// `calculate_hash_ref` follows the details of the C++ implementation and accepts more
+    /// collisions in favor of memory efficiency
+    pub(crate) fn calculate_hash_ref(crc32: FnCrc32, namespace_index: u8, key: &Key, chunk_index: u8) -> u24 {
         let mut result = u32::MAX;
         result = crc32(result, &[namespace_index]);
-        result = crc32(result, unsafe {
-            from_raw_parts(key.0.as_ptr(), key.0.len())
-        });
+        result = crc32(result, unsafe { from_raw_parts(key.0.as_ptr(), key.0.len()) });
         result = crc32(result, &[chunk_index]);
         u24::from_u32(result & 0xFFFFFF)
     }
@@ -341,9 +349,7 @@ impl Debug for Item {
         let key = slice_with_nullbytes_to_str(&self.key.0);
         let value = match type_ {
             ItemType::Sized | ItemType::BlobData => unsafe { format!("{:?}", self.data.sized) },
-            ItemType::Blob | ItemType::BlobIndex => unsafe {
-                format!("{:?}", self.data.blob_index)
-            },
+            ItemType::Blob | ItemType::BlobIndex => unsafe { format!("{:?}", self.data.blob_index) },
             ItemType::I8
             | ItemType::I16
             | ItemType::I32
@@ -358,9 +364,9 @@ impl Debug for Item {
     }
 }
 
-/// We know that keys and namespace names are saved in 16 byte arrays. Because they are originally C strings
-/// they are followed by a null terminator in case they are shorter than 16 byte. We have to slice
-/// before the null terminator if we want to transmute them to a str.
+/// We know that keys and namespace names are saved in 16 byte arrays. Because they are originally C
+/// strings they are followed by a null terminator in case they are shorter than 16 byte. We have to
+/// slice before the null terminator if we want to transmute them to a str.
 #[cfg(feature = "debug-logs")]
 pub(crate) fn slice_with_nullbytes_to_str(raw: &[u8]) -> &str {
     let sliced = match raw.iter().position(|&e| e == 0x00) {
@@ -371,11 +377,7 @@ pub(crate) fn slice_with_nullbytes_to_str(raw: &[u8]) -> &str {
 }
 
 #[inline(always)]
-pub(crate) fn write_aligned<T: Platform>(
-    hal: &mut T,
-    offset: u32,
-    bytes: &[u8],
-) -> Result<(), T::Error> {
+pub(crate) fn write_aligned<T: Platform>(hal: &mut T, offset: u32, bytes: &[u8]) -> Result<(), T::Error> {
     #[cfg(feature = "defmt")]
     trace!("write_aligned @{:#08x}: [{}]", offset, bytes.len());
 
@@ -389,7 +391,8 @@ pub(crate) fn write_aligned<T: Platform>(
             hal.write(offset, header)?;
         }
 
-        // no need to write the trailer if remaining data is all ones - this the default state of the flash
+        // no need to write the trailer if remaining data is all ones - this the default state of
+        // the flash
         if bytes[pivot..].iter().any(|&e| e != 0xFF) {
             let mut buf = vec![0xFFu8; T::WRITE_SIZE];
             buf[..trailer.len()].copy_from_slice(trailer);

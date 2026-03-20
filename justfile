@@ -1,27 +1,35 @@
-default:
-    just --list
+mod nvs 'esp-nvs/justfile'
+mod partition_tool 'esp-nvs-partition-tool/justfile'
 
-fix:
-    cargo fmt
-    cargo clippy --fix --allow-dirty --allow-staged --release --features=defmt
+_default:
+    @just --list
+
+fix: nvs::fix partition_tool::fix
     cargo fmt
 
-lint:
-    cargo clippy --release --features=defmt -- -D warnings
-    cargo fmt --check
+fmt-all: fmt
+    just --unstable --format
+    nixfmt devenv.nix
+    nixfmt .nix/esp-nvs-partition-tool.nix
+
+fmt: _nightly-fmt
+
+lint: _nightly-fmt-check nvs::lint partition_tool::lint
 
 test:
-    cargo test
+    cargo test --all
+    cargo test --doc
 
-publish-dry-run:
-    cargo publish --registry crates-io --dry-run
+update-changelog: nvs::update-changelog partition_tool::update-changelog
 
-publish:
-    cargo publish --registry crates-io
+_nightly-fmt:
+    devenv shell \
+        --option languages.rust.version:string 2026-02-18 \
+        --option languages.rust.channel:string nightly \
+        cargo fmt --all
 
-update-changelog:
-    git-cliff --bump -o CHANGELOG.md
-
-[working-directory: 'tests/assets/']
-generate_test_nvs_bin:
-    nvs_partition_gen generate test_nvs_data.csv test_nvs_data.bin 0x4000
+_nightly-fmt-check:
+    devenv shell \
+        --option languages.rust.version:string 2026-02-18 \
+        --option languages.rust.channel:string nightly \
+        cargo fmt --all --check

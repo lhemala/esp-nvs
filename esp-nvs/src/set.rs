@@ -1,6 +1,10 @@
 use crate::error::Error;
 use crate::platform::Platform;
-use crate::{Key, Nvs, raw};
+use crate::{
+    Key,
+    Nvs,
+    raw,
+};
 
 pub trait Set<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: T) -> Result<(), Error>;
@@ -44,45 +48,25 @@ impl<T: Platform> Set<u64> for Nvs<T> {
 
 impl<T: Platform> Set<i8> for Nvs<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: i8) -> Result<(), Error> {
-        self.set_primitive(
-            namespace,
-            *key,
-            raw::ItemType::I8,
-            value.cast_unsigned() as _,
-        )
+        self.set_primitive(namespace, *key, raw::ItemType::I8, value.cast_unsigned() as _)
     }
 }
 
 impl<T: Platform> Set<i16> for Nvs<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: i16) -> Result<(), Error> {
-        self.set_primitive(
-            namespace,
-            *key,
-            raw::ItemType::I16,
-            value.cast_unsigned() as _,
-        )
+        self.set_primitive(namespace, *key, raw::ItemType::I16, value.cast_unsigned() as _)
     }
 }
 
 impl<T: Platform> Set<i32> for Nvs<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: i32) -> Result<(), Error> {
-        self.set_primitive(
-            namespace,
-            *key,
-            raw::ItemType::I32,
-            value.cast_unsigned() as _,
-        )
+        self.set_primitive(namespace, *key, raw::ItemType::I32, value.cast_unsigned() as _)
     }
 }
 
 impl<T: Platform> Set<i64> for Nvs<T> {
     fn set(&mut self, namespace: &Key, key: &Key, value: i64) -> Result<(), Error> {
-        self.set_primitive(
-            namespace,
-            *key,
-            raw::ItemType::I64,
-            value.cast_unsigned() as _,
-        )
+        self.set_primitive(namespace, *key, raw::ItemType::I64, value.cast_unsigned() as _)
     }
 }
 

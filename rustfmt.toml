@@ -1,0 +1,16 @@
+# For more information see: https://rust-lang.github.io/rustfmt
+edition = "2024"
+
+max_width = 120
+
+# Comments
+format_code_in_doc_comments = true
+normalize_comments = true
+wrap_comments = true
+doc_comment_code_block_width = 120
+comment_width = 100
+
+# Imports
+group_imports       = "StdExternalCrate"
+imports_granularity = "Module"
+imports_layout      = "Vertical"

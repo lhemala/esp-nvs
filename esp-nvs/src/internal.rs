@@ -1,38 +1,71 @@
-use crate::Key;
-use crate::error::Error;
-#[cfg(feature = "debug-logs")]
-use crate::raw::slice_with_nullbytes_to_str;
-use crate::raw::{
-    ENTRIES_PER_PAGE, ENTRY_STATE_BITMAP_SIZE, EntryMapState, FLASH_SECTOR_SIZE, Item, ItemData,
-    ItemDataBlobIndex, ItemType, MAX_BLOB_DATA_PER_PAGE, MAX_BLOB_SIZE, PageHeader, PageHeaderRaw,
-    PageState, RawItem, RawPage, write_aligned,
+use alloc::collections::BTreeMap;
+use alloc::string::{
+    String,
+    ToString,
 };
-use crate::u24::u24;
-use crate::{Nvs, raw};
-use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cmp;
 use core::cmp::Ordering;
 #[cfg(feature = "debug-logs")]
-use core::fmt::{Debug, Formatter};
-use core::mem::size_of;
-use core::ops::Range;
+use core::fmt::{
+    Debug,
+    Formatter,
+};
+use core::mem::{
+    offset_of,
+    size_of,
+};
+use core::ops::{
+    Not,
+    Range,
+};
+use core::{
+    cmp,
+    mem,
+};
 
-use crate::error::Error::{ItemTypeMismatch, KeyNotFound, PageFull};
-use crate::platform::{AlignedOps, Platform};
-use alloc::collections::BTreeMap;
-use core::mem;
-use core::mem::offset_of;
-use core::ops::Not;
 #[cfg(feature = "defmt")]
 use defmt::trace;
 #[cfg(feature = "defmt")]
 use defmt::warn;
 
-/// Maximum Key length is 15 bytes + 1 byte for the null terminator.
-/// Shorter keys need to be padded with null bytes.
-pub(crate) const MAX_KEY_LENGTH: usize = 15;
+use crate::error::Error;
+use crate::error::Error::{
+    ItemTypeMismatch,
+    KeyNotFound,
+    PageFull,
+};
+use crate::platform::{
+    AlignedOps,
+    Platform,
+};
+#[cfg(feature = "debug-logs")]
+use crate::raw::slice_with_nullbytes_to_str;
+use crate::raw::{
+    ENTRIES_PER_PAGE,
+    ENTRY_STATE_BITMAP_SIZE,
+    EntryMapState,
+    FLASH_SECTOR_SIZE,
+    Item,
+    ItemData,
+    ItemDataBlobIndex,
+    ItemType,
+    MAX_BLOB_DATA_PER_PAGE,
+    MAX_BLOB_SIZE,
+    PageHeader,
+    PageHeaderRaw,
+    PageState,
+    RawItem,
+    RawPage,
+    write_aligned,
+};
+use crate::u24::u24;
+use crate::{
+    Key,
+    MAX_KEY_LENGTH,
+    Nvs,
+    raw,
+};
 
 type BlobIndexKey = (NamespaceIndex, VersionOffset, Key);
 type BlobIndexValue = (Option<BlobIndexEntryBlobIndexData>, BlobObservedData);
@@ -150,11 +183,7 @@ impl ThinPage {
         }
     }
 
-    pub(crate) fn initialize<T: Platform>(
-        &mut self,
-        hal: &mut T,
-        next_sequence: u32,
-    ) -> Result<(), Error> {
+    pub(crate) fn initialize<T: Platform>(&mut self, hal: &mut T, next_sequence: u32) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("initialize: @{:#08x}", self.address);
 
@@ -175,8 +204,7 @@ impl ThinPage {
             page_header: raw_header,
         };
 
-        write_aligned::<T>(hal, self.address as u32, unsafe { &raw_header.raw })
-            .map_err(|_| Error::FlashError)?;
+        write_aligned::<T>(hal, self.address as u32, unsafe { &raw_header.raw }).map_err(|_| Error::FlashError)?;
 
         self.header.state = ThinPageState::Active;
         self.header.version = 0xFE;
@@ -202,18 +230,13 @@ impl ThinPage {
         Ok(())
     }
 
-    pub(crate) fn load_item<T: Platform>(
-        &self,
-        hal: &mut T,
-        item_index: u8,
-    ) -> Result<Item, Error> {
+    pub(crate) fn load_item<T: Platform>(&self, hal: &mut T, item_index: u8) -> Result<Item, Error> {
         #[cfg(feature = "defmt")]
         trace!("load_item: @{:#08x}[{}]", self.address, item_index);
 
         let mut buf = [0u8; size_of::<Item>()];
         hal.read(
-            (self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index as usize)
-                as _,
+            (self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index as usize) as _,
             &mut buf,
         )
         .map_err(|_| Error::FlashError)?;
@@ -257,8 +280,7 @@ impl ThinPage {
         item.crc = item.calculate_crc32(T::crc32);
 
         let item_index = self.get_next_free_entry();
-        let target_addr =
-            self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index;
+        let target_addr = self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index;
 
         #[cfg(feature = "defmt")]
         trace!("load_item: @{:#08x}[{}]", self.address, item_index);
@@ -267,8 +289,7 @@ impl ThinPage {
         println!("  internal: write_item: target_addr: 0x{target_addr:0>8x}");
 
         let raw_item = RawItem { item };
-        write_aligned(hal, target_addr as _, unsafe { &raw_item.raw })
-            .map_err(|_| Error::FlashError)?;
+        write_aligned(hal, target_addr as _, unsafe { &raw_item.raw }).map_err(|_| Error::FlashError)?;
 
         self.set_entry_state(hal, item_index, EntryMapState::Written)?;
 
@@ -290,12 +311,7 @@ impl ThinPage {
         Ok(())
     }
 
-    pub(crate) fn write_namespace<T: Platform>(
-        &mut self,
-        hal: &mut T,
-        key: Key,
-        value: u8,
-    ) -> Result<(), Error> {
+    pub(crate) fn write_namespace<T: Platform>(&mut self, hal: &mut T, key: Key, value: u8) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("write_namespace: @{:#08x}", self.address);
 
@@ -357,12 +373,10 @@ impl ThinPage {
         );
 
         // Write the header entry
-        let header_addr =
-            self.address + offset_of!(RawPage, items) + size_of::<Item>() * start_index;
+        let header_addr = self.address + offset_of!(RawPage, items) + size_of::<Item>() * start_index;
         let raw_item = RawItem { item };
 
-        write_aligned(hal, header_addr as _, unsafe { &raw_item.raw })
-            .map_err(|_| Error::FlashError)?;
+        write_aligned(hal, header_addr as _, unsafe { &raw_item.raw }).map_err(|_| Error::FlashError)?;
 
         let data_addr = header_addr + size_of::<Item>();
         write_aligned(hal, data_addr as _, data).map_err(|_| Error::FlashError)?;
@@ -405,7 +419,7 @@ impl ThinPage {
         println!("internal: load_item_data");
 
         match item.type_ {
-            ItemType::Sized | ItemType::BlobData => {}
+            ItemType::Sized | ItemType::BlobData | ItemType::Blob => {}
             _ => return Err(ItemTypeMismatch(item.type_)),
         }
 
@@ -413,14 +427,13 @@ impl ThinPage {
         let aligned_size = T::align_read(size);
 
         let mut buf = Vec::with_capacity(aligned_size);
-        // Safety: we just allocated the buffer with the exact size we need and we will override it the the call to hal.read()
+        // Safety: we just allocated the buffer with the exact size we need and we will override it
+        // the the call to hal.read()
         unsafe {
             Vec::set_len(&mut buf, aligned_size);
         }
         hal.read(
-            (self.address
-                + offset_of!(RawPage, items)
-                + size_of::<Item>() * (item_index as usize + 1)) as _,
+            (self.address + offset_of!(RawPage, items) + size_of::<Item>() * (item_index as usize + 1)) as _,
             &mut buf,
         )
         .map_err(|_| Error::FlashError)?;
@@ -440,10 +453,7 @@ impl ThinPage {
         state: EntryMapState,
     ) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
-        trace!(
-            "set_entry_state: @{:#08x}[{}]: {}",
-            self.address, item_index, state
-        );
+        trace!("set_entry_state: @{:#08x}[{}]: {}", self.address, item_index, state);
 
         #[cfg(feature = "debug-logs")]
         println!("internal: set_entry_state");
@@ -459,10 +469,7 @@ impl ThinPage {
         let state = EntryMapState::from_repr(two_bits).unwrap();
 
         #[cfg(feature = "defmt")]
-        trace!(
-            "get_entry_state: @{:#08x}[{}]: {}",
-            self.address, item_index, state
-        );
+        trace!("get_entry_state: @{:#08x}[{}]: {}", self.address, item_index, state);
 
         #[cfg(feature = "debug-logs")]
         println!(
@@ -501,8 +508,7 @@ impl ThinPage {
         let aligned_start_byte = T::align_write_floor(start_byte);
         let aligned_end_byte = T::align_write_ceil(end_byte + 1);
 
-        let offset_in_raw_flash =
-            self.address + offset_of!(RawPage, entry_state_bitmap) + start_byte;
+        let offset_in_raw_flash = self.address + offset_of!(RawPage, entry_state_bitmap) + start_byte;
         let aligned_offset_in_raw_flash = T::align_write_floor(offset_in_raw_flash) as _;
 
         #[cfg(feature = "debug-logs")]
@@ -553,12 +559,7 @@ impl ThinPage {
         (empty, written, erased, illegal)
     }
 
-    pub(crate) fn erase_item<T: Platform>(
-        &mut self,
-        hal: &mut T,
-        item_index: u8,
-        span: u8,
-    ) -> Result<(), Error> {
+    pub(crate) fn erase_item<T: Platform>(&mut self, hal: &mut T, item_index: u8, span: u8) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!(
             "erase_item: @{:#08x}[{}-{}]",
@@ -574,8 +575,7 @@ impl ThinPage {
 
         self.erased_entry_count += span;
         self.used_entry_count -= span;
-        self.item_hash_list
-            .retain(|entry| entry.index != item_index);
+        self.item_hash_list.retain(|entry| entry.index != item_index);
 
         Ok(())
     }
@@ -612,9 +612,7 @@ impl Eq for ThinPage {}
 impl Ord for ThinPage {
     fn cmp(&self, other: &Self) -> Ordering {
         match (&self.header.state, &other.header.state) {
-            (ThinPageState::Uninitialized, ThinPageState::Uninitialized) => {
-                other.address.cmp(&self.address)
-            }
+            (ThinPageState::Uninitialized, ThinPageState::Uninitialized) => other.address.cmp(&self.address),
             (ThinPageState::Uninitialized, _) => Ordering::Greater,
             (_, ThinPageState::Uninitialized) => Ordering::Less,
             (_, _) => other.header.sequence.cmp(&self.header.sequence),
@@ -627,9 +625,7 @@ impl Debug for ThinPage {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         let address = self.address;
         let header = &self.header;
-        f.write_fmt(format_args!(
-            "Page {{ address: 0x{address:0>8x} {header:?} "
-        ))?;
+        f.write_fmt(format_args!("Page {{ address: 0x{address:0>8x} {header:?} "))?;
         match header.state {
             ThinPageState::Full | ThinPageState::Active => (),
             _ => {
@@ -734,12 +730,7 @@ impl<T> Nvs<T>
 where
     T: Platform,
 {
-    pub(crate) fn get_primitive(
-        &mut self,
-        namespace: &Key,
-        key: &Key,
-        type_: ItemType,
-    ) -> Result<u64, Error> {
+    pub(crate) fn get_primitive(&mut self, namespace: &Key, key: &Key, type_: ItemType) -> Result<u64, Error> {
         #[cfg(feature = "defmt")]
         trace!("get_primitive");
 
@@ -753,10 +744,7 @@ where
             return Err(Error::NamespaceMalformed);
         }
 
-        let namespace_index = *self
-            .namespaces
-            .get(namespace)
-            .ok_or(Error::NamespaceNotFound)?;
+        let namespace_index = *self.namespaces.get(namespace).ok_or(Error::NamespaceNotFound)?;
 
         let (_, _, item) = self.load_item(namespace_index, ChunkIndex::Any, key)?;
 
@@ -780,13 +768,9 @@ where
             return Err(Error::NamespaceMalformed);
         }
 
-        let namespace_index = *self
-            .namespaces
-            .get(namespace)
-            .ok_or(Error::NamespaceNotFound)?;
+        let namespace_index = *self.namespaces.get(namespace).ok_or(Error::NamespaceNotFound)?;
 
-        let (page_index, item_index, item) =
-            self.load_item(namespace_index, ChunkIndex::Any, key)?;
+        let (page_index, item_index, item) = self.load_item(namespace_index, ChunkIndex::Any, key)?;
 
         if item.type_ != ItemType::Sized {
             return Err(ItemTypeMismatch(item.type_));
@@ -800,8 +784,7 @@ where
             return Err(Error::KeyNotFound);
         }
 
-        let str =
-            core::str::from_utf8(&data[..data.len() - 1]).map_err(|_| Error::CorruptedData)?; // we don't want the null terminator
+        let str = core::str::from_utf8(&data[..data.len() - 1]).map_err(|_| Error::CorruptedData)?; // we don't want the null terminator
         Ok(str.to_string())
     }
 
@@ -819,73 +802,74 @@ where
             return Err(Error::NamespaceMalformed);
         }
 
-        let namespace_index = *self
-            .namespaces
-            .get(namespace)
-            .ok_or(Error::NamespaceNotFound)?;
+        let namespace_index = *self.namespaces.get(namespace).ok_or(Error::NamespaceNotFound)?;
 
-        let (_page_index, _item_index, item) =
-            self.load_item(namespace_index, ChunkIndex::Any, key)?;
+        let (page_index, item_index, item) = self.load_item(namespace_index, ChunkIndex::Any, key)?;
 
-        if item.type_ != ItemType::BlobIndex {
-            return Err(ItemTypeMismatch(item.type_));
-        }
+        if item.type_ == ItemType::BlobIndex {
+            let size = unsafe { item.data.blob_index.size };
 
-        let size = unsafe { item.data.blob_index.size };
-
-        if size as usize > MAX_BLOB_SIZE {
-            return Err(Error::CorruptedData);
-        }
-
-        let chunk_count = unsafe { item.data.blob_index.chunk_count };
-        let chunk_start = unsafe { item.data.blob_index.chunk_start };
-
-        let mut buf = vec![0u8; size as usize];
-        let mut offset = 0usize;
-
-        for chunk in chunk_start..chunk_start + chunk_count {
-            // Bounds check before slicing
-            if offset >= buf.len() {
-                return Err(Error::CorruptedData); // Blob metadata inconsistent - would read beyond buffer
-            }
-
-            let (page_index, item_index, item) =
-                self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
-
-            if item.type_ != ItemType::BlobData {
-                return Err(ItemTypeMismatch(item.type_));
-            }
-
-            let page = &self.pages[page_index.0];
-            let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
-
-            let data_crc = unsafe { item.data.sized.crc };
-            if data_crc != T::crc32(u32::MAX, &data) {
+            if size as usize > MAX_BLOB_SIZE {
                 return Err(Error::CorruptedData);
             }
 
-            let read_bytes = data.len().min(buf.len() - offset);
-            buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
-            offset += read_bytes;
-        }
+            let chunk_count = unsafe { item.data.blob_index.chunk_count };
+            let chunk_start = unsafe { item.data.blob_index.chunk_start };
 
-        Ok(buf)
+            let mut buf = vec![0u8; size as usize];
+            let mut offset = 0usize;
+
+            for chunk in chunk_start..chunk_start + chunk_count {
+                // Bounds check before slicing
+                if offset >= buf.len() {
+                    return Err(Error::CorruptedData);
+                }
+
+                let (page_index, item_index, item) =
+                    self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
+
+                if item.type_ != ItemType::BlobData {
+                    return Err(ItemTypeMismatch(item.type_));
+                }
+
+                let page = &self.pages[page_index.0];
+                let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+
+                let data_crc = unsafe { item.data.sized.crc };
+                if data_crc != T::crc32(u32::MAX, &data) {
+                    return Err(Error::CorruptedData);
+                }
+
+                let read_bytes = data.len().min(buf.len() - offset);
+                buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
+                offset += read_bytes;
+            }
+
+            Ok(buf)
+        } else if item.type_ == ItemType::Blob {
+            // Legacy single-page blob (version 1 format) — same layout as Sized
+            let page = &self.pages[page_index.0];
+            let data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+
+            let crc = unsafe { item.data.sized.crc };
+            if crc != T::crc32(u32::MAX, &data) {
+                return Err(Error::CorruptedData);
+            }
+
+            Ok(data)
+        } else {
+            Err(ItemTypeMismatch(item.type_))
+        }
     }
 
-    pub(crate) fn delete_key(
-        &mut self,
-        namespace_index: u8,
-        key: &Key,
-        chunk_index: ChunkIndex,
-    ) -> Result<(), Error> {
+    pub(crate) fn delete_key(&mut self, namespace_index: u8, key: &Key, chunk_index: ChunkIndex) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("delete_key");
 
         #[cfg(feature = "debug-logs")]
         println!("internal: delete_key");
 
-        let (page_index, item_index, item) =
-            self.load_item(namespace_index, chunk_index.clone(), key)?;
+        let (page_index, item_index, item) = self.load_item(namespace_index, chunk_index.clone(), key)?;
 
         let page = self.pages.get_mut(page_index.0).unwrap();
 
@@ -901,12 +885,7 @@ where
         Ok(())
     }
 
-    fn delete_blob_data(
-        &mut self,
-        namespace_index: u8,
-        key: &Key,
-        chunk_start: VersionOffset,
-    ) -> Result<(), Error> {
+    fn delete_blob_data(&mut self, namespace_index: u8, key: &Key, chunk_start: VersionOffset) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("delete_blob_data");
 
@@ -933,13 +912,7 @@ where
         Ok(())
     }
 
-    fn blob_is_equal(
-        &mut self,
-        namespace_index: u8,
-        key: &Key,
-        blob_item: &Item,
-        data: &[u8],
-    ) -> Result<bool, Error> {
+    fn blob_is_equal(&mut self, namespace_index: u8, key: &Key, blob_item: &Item, data: &[u8]) -> Result<bool, Error> {
         #[cfg(feature = "defmt")]
         trace!("blob_is_equal");
 
@@ -1004,9 +977,7 @@ where
         match self.load_item(namespace_index, ChunkIndex::Any, key) {
             Ok((_page_index, _item_index, item)) => {
                 if item.type_ == ItemType::BlobIndex {
-                    Some(VersionOffset::from(unsafe {
-                        item.data.blob_index.chunk_start
-                    }))
+                    Some(VersionOffset::from(unsafe { item.data.blob_index.chunk_start }))
                 } else {
                     None
                 }
@@ -1051,22 +1022,21 @@ where
         // the active page needs to be in the vec for it to be considered by load_item()
         self.pages.push(page);
 
-        let old_entry_location = if let Ok((page_index, item_index, item)) =
-            self.load_item(namespace_index, ChunkIndex::Any, &key)
-        {
-            if unsafe { item.data.raw } == raw_value {
+        let old_entry_location =
+            if let Ok((page_index, item_index, item)) = self.load_item(namespace_index, ChunkIndex::Any, &key) {
+                if unsafe { item.data.raw } == raw_value {
+                    #[cfg(feature = "debug-logs")]
+                    println!("internal: set_primitive: entry already exists and matches");
+                    return Ok(());
+                }
+
                 #[cfg(feature = "debug-logs")]
-                println!("internal: set_primitive: entry already exists and matches");
-                return Ok(());
-            }
+                println!("internal: set_primitive: entry already exists and needs to be removed");
 
-            #[cfg(feature = "debug-logs")]
-            println!("internal: set_primitive: entry already exists and needs to be removed");
-
-            Some((page_index, item_index))
-        } else {
-            None
-        };
+                Some((page_index, item_index))
+            } else {
+                None
+            };
 
         // safe since we just pushed before
         page = self.pages.pop().unwrap();
@@ -1146,28 +1116,14 @@ where
         let mut page = self.get_active_page()?;
         let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
 
-        match page.write_variable_sized_item::<T>(
-            &mut self.hal,
-            namespace_index,
-            key,
-            ItemType::Sized,
-            None,
-            &buf,
-        ) {
+        match page.write_variable_sized_item::<T>(&mut self.hal, namespace_index, key, ItemType::Sized, None, &buf) {
             Ok(_) => {}
             Err(Error::PageFull) => {
                 page.mark_as_full::<T>(&mut self.hal)?;
                 self.pages.push(page);
 
                 page = self.get_active_page()?;
-                page.write_variable_sized_item::<T>(
-                    &mut self.hal,
-                    namespace_index,
-                    key,
-                    ItemType::Sized,
-                    None,
-                    &buf,
-                )?;
+                page.write_variable_sized_item::<T>(&mut self.hal, namespace_index, key, ItemType::Sized, None, &buf)?;
             }
             Err(e) => return Err(e),
         }
@@ -1292,9 +1248,9 @@ where
         )?;
         self.pages.push(page);
 
-        // Now that the new blob version has been successfully written, delete the old version if it exists
-        // _old_version is unused since it will be the first one that is bound to be found anyway as newer
-        // pages appear later in self.pages
+        // Now that the new blob version has been successfully written, delete the old version if it
+        // exists _old_version is unused since it will be the first one that is bound to be
+        // found anyway as newer pages appear later in self.pages
         if let Some(_old_version) = old_blob_version {
             self.delete_key(namespace_index, &key, ChunkIndex::BlobIndex)?;
         }
@@ -1306,9 +1262,7 @@ where
         #[cfg(feature = "defmt")]
         trace!("get_active_page");
 
-        let page = self
-            .pages
-            .pop_if(|page| page.header.state == ThinPageState::Active);
+        let page = self.pages.pop_if(|page| page.header.state == ThinPageState::Active);
         if let Some(page) = page {
             return Ok(page);
         }
@@ -1318,9 +1272,7 @@ where
             self.defragment()?;
         }
 
-        let page = self
-            .pages
-            .pop_if(|page| page.header.state == ThinPageState::Active);
+        let page = self.pages.pop_if(|page| page.header.state == ThinPageState::Active);
         if let Some(page) = page {
             return Ok(page);
         }
@@ -1335,10 +1287,7 @@ where
 
         if page.header.state != ThinPageState::Uninitialized {
             self.hal
-                .erase(
-                    page.address as _,
-                    (page.address + raw::FLASH_SECTOR_SIZE) as _,
-                )
+                .erase(page.address as _, (page.address + raw::FLASH_SECTOR_SIZE) as _)
                 .map_err(|_| Error::FlashError)?;
         }
 
@@ -1355,11 +1304,7 @@ where
         }
     }
 
-    fn get_or_create_namespace(
-        &mut self,
-        namespace: &Key,
-        page: &mut ThinPage,
-    ) -> Result<u8, Error> {
+    fn get_or_create_namespace(&mut self, namespace: &Key, page: &mut ThinPage) -> Result<u8, Error> {
         #[cfg(feature = "defmt")]
         trace!("get_or_create_namespace");
 
@@ -1369,11 +1314,10 @@ where
         let namespace_index = match self.namespaces.get(namespace) {
             Some(ns_idx) => *ns_idx,
             None => {
-                let namespace_index = self
-                    .namespaces
-                    .iter()
-                    .max_by_key(|(_, idx)| **idx)
-                    .map_or(1, |(_, idx)| idx + 1);
+                let namespace_index = match self.namespaces.iter().max_by_key(|(_, idx)| **idx) {
+                    Some((_, idx)) => idx.checked_add(1).ok_or(Error::FlashFull)?,
+                    None => 1,
+                };
 
                 page.write_namespace(&mut self.hal, *namespace, namespace_index)?;
 
@@ -1472,8 +1416,8 @@ where
 
         self.continue_free_page()?;
 
-        // After loading all pages, check for duplicate primitive/string entries and mark older ones as erased
-        // This handles cases where deletion failed after a successful write
+        // After loading all pages, check for duplicate primitive/string entries and mark older ones
+        // as erased This handles cases where deletion failed after a successful write
         self.cleanup_duplicate_entries()?;
 
         self.cleanup_dirty_blobs(blob_index)?;
@@ -1485,17 +1429,15 @@ where
         #[cfg(feature = "defmt")]
         trace!("cleanup_dirty_blobs");
 
-        while let Some(((namespace_index, chunk_start, key), (index, observed))) =
-            blob_index.pop_first()
-        {
+        while let Some(((namespace_index, chunk_start, key), (index, observed))) = blob_index.pop_first() {
             if let Some(index) = index {
                 // Calculate total chunks and data size from all observed chunks
-                let (chunk_count, data_size) = observed.chunks_by_page.iter().fold(
-                    (0u8, 0u32),
-                    |(count, size), chunk_data| {
+                let (chunk_count, data_size) = observed
+                    .chunks_by_page
+                    .iter()
+                    .fold((0u8, 0u32), |(count, size), chunk_data| {
                         (count + chunk_data.chunk_count, size + chunk_data.data_size)
-                    },
-                );
+                    });
 
                 if index.chunk_count != chunk_count || index.size != data_size {
                     #[cfg(feature = "debug-logs")]
@@ -1507,8 +1449,7 @@ where
                     // Also delete the orphaned data chunks for this version
                     self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
                     continue;
-                } else if let Some(other) =
-                    blob_index.get(&(namespace_index, chunk_start.invert(), key))
+                } else if let Some(other) = blob_index.get(&(namespace_index, chunk_start.invert(), key))
                     && let Some(other_index) = &other.0
                 {
                     // We have both versions - keep the newer one, delete the older one
@@ -1556,26 +1497,22 @@ where
         #[cfg(feature = "defmt")]
         trace!("ensure_active_page_order");
 
-        let correct_active_page_stats =
-            self.pages
-                .iter()
-                .enumerate()
-                .fold(None, |acc, (idx, page)| {
-                    if page.header.state != ThinPageState::Active {
-                        return acc;
-                    }
+        let correct_active_page_stats = self.pages.iter().enumerate().fold(None, |acc, (idx, page)| {
+            if page.header.state != ThinPageState::Active {
+                return acc;
+            }
 
-                    match acc {
-                        None => Some((idx, page.header.sequence, 1)),
-                        Some((acc_idx, acc_sequence, acc_active_page_count)) => {
-                            if page.header.sequence > acc_sequence {
-                                Some((idx, page.header.sequence, acc_active_page_count + 1))
-                            } else {
-                                Some((acc_idx, acc_sequence, acc_active_page_count + 1))
-                            }
-                        }
+            match acc {
+                None => Some((idx, page.header.sequence, 1)),
+                Some((acc_idx, acc_sequence, acc_active_page_count)) => {
+                    if page.header.sequence > acc_sequence {
+                        Some((idx, page.header.sequence, acc_active_page_count + 1))
+                    } else {
+                        Some((acc_idx, acc_sequence, acc_active_page_count + 1))
                     }
-                });
+                }
+            }
+        });
 
         if let Some((correct_active_page_idx, _, active_page_count)) = correct_active_page_stats {
             let last_page_idx = self.pages.len() - 1;
@@ -1654,8 +1591,7 @@ where
 
         // Build a map of hash (as u32) -> Vec<(page_index, item_index, page_sequence)>
         // Use the hash as a quick filter - duplicates will have the same hash
-        let mut hash_to_item: BTreeMap<u24, Vec<(PageIndex, ItemIndex, PageSequence)>> =
-            BTreeMap::new();
+        let mut hash_to_item: BTreeMap<u24, Vec<(PageIndex, ItemIndex, PageSequence)>> = BTreeMap::new();
 
         for (page_idx, page) in self.pages.iter().enumerate() {
             for hash_entry in &page.item_hash_list {
@@ -1681,10 +1617,7 @@ where
                 // Skip namespace entries (namespace_index == 0) and blob entries
                 // Namespace entries are special and should not be cleaned up
                 // Blob entries have their own cleanup logic
-                if item.namespace_index == 0
-                    || item.type_ == ItemType::BlobIndex
-                    || item.type_ == ItemType::BlobData
-                {
+                if item.namespace_index == 0 || item.type_ == ItemType::BlobIndex || item.type_ == ItemType::BlobData {
                     continue;
                 }
 
@@ -1711,9 +1644,7 @@ where
 
                 // Keep the newest (last after sort), erase older ones
                 let keep_count = group.len() - 1;
-                for (PageIndex(page_index), ItemIndex(item_index), _, span) in
-                    group.into_iter().take(keep_count)
-                {
+                for (PageIndex(page_index), ItemIndex(item_index), _, span) in group.into_iter().take(keep_count) {
                     let page = self.pages.get_mut(page_index).unwrap();
                     page.erase_item::<T>(&mut self.hal, item_index, span)?;
                 }
@@ -1816,10 +1747,7 @@ where
         let mut target = self.free_pages.pop().ok_or(Error::FlashFull)?;
         if target.header.state != ThinPageState::Uninitialized {
             self.hal
-                .erase(
-                    target.address as _,
-                    (target.address + FLASH_SECTOR_SIZE) as _,
-                )
+                .erase(target.address as _, (target.address + FLASH_SECTOR_SIZE) as _)
                 .map_err(|_| Error::FlashError)?;
         }
         target.initialize(&mut self.hal, next_sequence)?;
@@ -1836,9 +1764,9 @@ where
         #[cfg(feature = "defmt")]
         trace!("copy_items");
 
-        // in case the operation was disturbed in the middle, target might already contain some parts
-        // of the source page, so we first get the last copied item so we can ignor it and everything
-        // before in our copy loop
+        // in case the operation was disturbed in the middle, target might already contain some
+        // parts of the source page, so we first get the last copied item so we can ignor it
+        // and everything before in our copy loop
         let mut last_copied_entry = match target.item_hash_list.iter().max_by_key(|it| it.index) {
             Some(hash_entry) => Some(target.load_item(&mut self.hal, hash_entry.index)?),
             None => None,
@@ -1937,12 +1865,11 @@ where
             #[cfg(feature = "debug-logs")]
             println!("  raw: load page: 0x{sector_address:04X} -> uninitialized");
 
-            return Ok(LoadPageResult::Empty(ThinPage::uninitialized(
-                sector_address,
-            )));
+            return Ok(LoadPageResult::Empty(ThinPage::uninitialized(sector_address)));
         }
 
-        // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc afterwards
+        // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc
+        // afterwards
         let raw_page: RawPage = unsafe { core::mem::transmute(buf) };
 
         #[cfg(feature = "debug-logs")]
@@ -1986,8 +1913,8 @@ where
 
         // Needed due to the desugaring below
         let mut namespaces: Vec<Namespace> = vec![];
-        // This iterator desugaring is necessary to be able to skip entries, e.g. a BLOB or STR entries
-        // are followed by entries containing their raw value.
+        // This iterator desugaring is necessary to be able to skip entries, e.g. a BLOB or STR
+        // entries are followed by entries containing their raw value.
         let items = &raw_page.items;
         let mut item_iter = unsafe { items.entries.iter().zip(u8::MIN..u8::MAX) };
         'item_iter: while let Some((item, item_index)) = item_iter.next() {
@@ -2004,10 +1931,7 @@ where
                 EntryMapState::Empty => {
                     // maybe data was written but the map was not updated yet
                     let calculated_crc = item.calculate_crc32(T::crc32);
-                    if item.crc == calculated_crc
-                        && item.type_ != ItemType::Any
-                        && item.span != u8::MAX
-                    {
+                    if item.crc == calculated_crc && item.type_ != ItemType::Any && item.span != u8::MAX {
                         match item.type_ {
                             ItemType::U8
                             | ItemType::I8
@@ -2020,26 +1944,20 @@ where
                             | ItemType::BlobIndex => {
                                 #[cfg(feature = "debug-logs")]
                                 println!("encountered valid but empty scalar item at {item_index}");
-                                page.set_entry_state(
-                                    &mut self.hal,
-                                    item_index as _,
-                                    EntryMapState::Written,
-                                )?;
+                                page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Written)?;
                                 page.used_entry_count += 1;
                             }
                             ItemType::Blob => {
                                 // TODO: should we just ignore this value or mark page corrupt?
-                                //  Alternatively, we could add support for BLOB_V1 and convert it here
+                                //  Alternatively, we could add support for BLOB_V1 and convert it
+                                // here
                                 page.used_entry_count += 1;
                                 continue 'item_iter;
                             }
                             ItemType::Sized | ItemType::BlobData => {
                                 #[cfg(feature = "debug-logs")]
-                                println!(
-                                    "encountered valid but EMPTY variable sized item at {item_index}"
-                                );
-                                let data =
-                                    page.load_referenced_data(&mut self.hal, item_index, item)?;
+                                println!("encountered valid but EMPTY variable sized item at {item_index}");
+                                let data = page.load_referenced_data(&mut self.hal, item_index, item)?;
                                 let data_crc = T::crc32(u32::MAX, &data);
                                 if data_crc != unsafe { item.data.sized.crc } {
                                     page.set_entry_state_range(
@@ -2146,9 +2064,7 @@ where
                                 size: unsafe { item.data.blob_index.size },
                                 chunk_count: unsafe { item.data.blob_index.chunk_count },
                             }),
-                            BlobObservedData {
-                                chunks_by_page: vec![],
-                            },
+                            BlobObservedData { chunks_by_page: vec![] },
                         ),
                     );
                 } else {

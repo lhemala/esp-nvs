@@ -23,7 +23,7 @@ jobs:
       - name: rustup target add riscv32imc-unknown-none-elf
         run: rustup target add riscv32imc-unknown-none-elf
       - name: cargo check
-        run: cargo check --target riscv32imc-unknown-none-elf --no-default-features
+        run: cargo check --package esp-nvs --target riscv32imc-unknown-none-elf --no-default-features
   riscv32imac:
     runs-on: ubuntu-latest
     name: riscv32imac-unknown-none-elf
@@ -38,12 +38,12 @@ jobs:
       - name: rustup target add riscv32imac-unknown-none-elf
         run: rustup target add riscv32imac-unknown-none-elf
       - name: cargo check
-        run: cargo check --target riscv32imac-unknown-none-elf --no-default-features
+        run: cargo check --package esp-nvs --target riscv32imac-unknown-none-elf --no-default-features
   xtensa:
     runs-on: ubuntu-latest
     name: xtensa-esp32-none-elf
     env:
-      GITHUB_TOKEN: ${{ secrets. GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
         with:
@@ -55,4 +55,4 @@ jobs:
           version: "latest"
           buildtargets: "esp32"
       - name: cargo check
-        run: cargo check --target xtensa-esp32-none-elf --no-default-features -Zbuild-std=core,alloc
+        run: cargo check --package esp-nvs --target xtensa-esp32-none-elf --no-default-features -Zbuild-std=core,alloc

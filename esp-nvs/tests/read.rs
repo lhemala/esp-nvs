@@ -1,5 +1,13 @@
-use esp_nvs::error::{Error, ItemType};
-use esp_nvs::{EntryStatistics, Key, NvsStatistics, PageStatistics};
+use esp_nvs::error::{
+    Error,
+    ItemType,
+};
+use esp_nvs::{
+    EntryStatistics,
+    Key,
+    NvsStatistics,
+    PageStatistics,
+};
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -11,51 +19,33 @@ fn from_generated_partition() {
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
 
     assert_eq!(
-        nvs.get::<u8>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_u8")
-        )
-        .unwrap(),
+        nvs.get::<u8>(&Key::from_str("namespace_one"), &Key::from_str("example_u8"))
+            .unwrap(),
         100
     );
     assert_eq!(
-        nvs.get::<i8>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_i8")
-        )
-        .unwrap(),
+        nvs.get::<i8>(&Key::from_str("namespace_one"), &Key::from_str("example_i8"))
+            .unwrap(),
         -100
     );
     assert_eq!(
-        nvs.get::<u16>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_u16")
-        )
-        .unwrap(),
+        nvs.get::<u16>(&Key::from_str("namespace_one"), &Key::from_str("example_u16"))
+            .unwrap(),
         65000
     );
     assert_eq!(
-        nvs.get::<i16>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_i16")
-        )
-        .unwrap(),
+        nvs.get::<i16>(&Key::from_str("namespace_one"), &Key::from_str("example_i16"))
+            .unwrap(),
         -32000
     );
     assert_eq!(
-        nvs.get::<u32>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_u32")
-        )
-        .unwrap(),
+        nvs.get::<u32>(&Key::from_str("namespace_one"), &Key::from_str("example_u32"))
+            .unwrap(),
         4294960000
     );
     assert_eq!(
-        nvs.get::<i32>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_i32")
-        )
-        .unwrap(),
+        nvs.get::<i32>(&Key::from_str("namespace_one"), &Key::from_str("example_i32"))
+            .unwrap(),
         -2147480000
     );
 
@@ -63,72 +53,47 @@ fn from_generated_partition() {
     // the write test still reads them though
 
     assert_eq!(
-        nvs.get::<String>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_s_short")
-        )
-        .unwrap(),
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short"))
+            .unwrap(),
         "short string"
     );
     assert_eq!(
-        nvs.get::<String>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_s_long")
-        )
-        .unwrap(),
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_long"))
+            .unwrap(),
         "long string spanning multiple entries whereas each entry is 32 bytes in total"
     );
 
     assert_eq!(
-        nvs.get::<Vec<u8>>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_b_short")
-        )
-        .unwrap(),
+        nvs.get::<Vec<u8>>(&Key::from_str("namespace_one"), &Key::from_str("example_b_short"))
+            .unwrap(),
         vec![
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
-            0xFF, 0x00, 0xAA,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xFF, 0x00, 0xAA,
         ]
     );
     assert_eq!(
-        nvs.get::<Vec<u8>>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_b_long")
-        )
-        .unwrap(),
+        nvs.get::<Vec<u8>>(&Key::from_str("namespace_one"), &Key::from_str("example_b_long"))
+            .unwrap(),
         std::fs::read("tests/assets/multi_page_blob.bin").unwrap()
     );
 
     assert_eq!(
-        nvs.get::<u8>(
-            &Key::from_str("namespace_two"),
-            &Key::from_str("example_u8")
-        )
-        .unwrap(),
+        nvs.get::<u8>(&Key::from_str("namespace_two"), &Key::from_str("example_u8"))
+            .unwrap(),
         123
     );
     assert_eq!(
-        nvs.get::<u8>(
-            &Key::from_str("namespace_two"),
-            &Key::from_str("only_in_two")
-        )
-        .unwrap(),
+        nvs.get::<u8>(&Key::from_str("namespace_two"), &Key::from_str("only_in_two"))
+            .unwrap(),
         1
     );
     assert!(
-        nvs.get::<bool>(
-            &Key::from_str("namespace_two"),
-            &Key::from_str("only_in_two")
-        )
-        .unwrap()
+        nvs.get::<bool>(&Key::from_str("namespace_two"), &Key::from_str("only_in_two"))
+            .unwrap()
     );
 
     // Item type mismatch is reported correctly -> only_in_two is an u8
     assert_eq!(
-        nvs.get::<u32>(
-            &Key::from_str("namespace_one"),
-            &Key::from_str("example_u16")
-        ),
+        nvs.get::<u32>(&Key::from_str("namespace_one"), &Key::from_str("example_u16")),
         Err(Error::ItemTypeMismatch(ItemType::U16))
     );
 }
@@ -141,10 +106,7 @@ fn iter_namespaces() {
 
     assert_eq!(
         nvs.namespaces().collect::<Vec<_>>(),
-        vec![
-            &Key::from_array(b"namespace_one"),
-            &Key::from_array(b"namespace_two")
-        ]
+        vec![&Key::from_array(b"namespace_one"), &Key::from_array(b"namespace_two")]
     );
 }
 
@@ -157,54 +119,18 @@ fn iter_keys() {
     assert_eq!(
         nvs.keys().collect::<Vec<_>>(),
         vec![
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_u8")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_i8")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_u16")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_i16")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_u32")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_i32")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_s_short")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_s_long")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_b_short")
-            )),
-            Ok((
-                Key::from_array(b"namespace_one"),
-                Key::from_array(b"example_b_long")
-            )),
-            Ok((
-                Key::from_array(b"namespace_two"),
-                Key::from_array(b"example_u8")
-            )),
-            Ok((
-                Key::from_array(b"namespace_two"),
-                Key::from_array(b"only_in_two")
-            ))
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_u8"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_i8"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_u16"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_i16"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_u32"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_i32"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_s_short"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_s_long"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_b_short"))),
+            Ok((Key::from_array(b"namespace_one"), Key::from_array(b"example_b_long"))),
+            Ok((Key::from_array(b"namespace_two"), Key::from_array(b"example_u8"))),
+            Ok((Key::from_array(b"namespace_two"), Key::from_array(b"only_in_two")))
         ]
     );
 }
@@ -218,10 +144,7 @@ fn corrupt_page() {
     flash.buf[4] = 123;
 
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
-    let result = nvs.get::<u8>(
-        &Key::from_str("namespace_one"),
-        &Key::from_str("example_u8"),
-    );
+    let result = nvs.get::<u8>(&Key::from_str("namespace_one"), &Key::from_str("example_u8"));
     assert_eq!(result, Err(Error::NamespaceNotFound));
 
     assert_eq!(
@@ -279,10 +202,7 @@ fn corrupt_entry() {
     flash.buf[0x60] = 123;
 
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
-    let result = nvs.get::<u8>(
-        &Key::from_str("namespace_one"),
-        &Key::from_str("example_u8"),
-    );
+    let result = nvs.get::<u8>(&Key::from_str("namespace_one"), &Key::from_str("example_u8"));
     assert!(result.is_err());
 
     assert_eq!(result.err().unwrap(), Error::KeyNotFound);
@@ -335,6 +255,7 @@ fn corrupt_entry() {
 
 // TODO: when reading a multi-page-blob and the bounds don't match, mark the entry as corrupt
 
-// TODO: when reading a single-page-blob and the bounds don't match, mark the entry as corrupt (covers str as well)
+// TODO: when reading a single-page-blob and the bounds don't match, mark the entry as corrupt
+// (covers str as well)
 
 // TODO: when the CRC is invalid, mark the entry as corrupt

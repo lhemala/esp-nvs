@@ -1,4 +1,7 @@
-use core::fmt::{Debug, Formatter};
+use core::fmt::{
+    Debug,
+    Formatter,
+};
 
 #[derive(Copy, Clone, PartialEq, Ord, PartialOrd, Eq)]
 #[allow(non_camel_case_types)]

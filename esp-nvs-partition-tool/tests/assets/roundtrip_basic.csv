@@ -1,0 +1,5 @@
+key,type,encoding,value
+storage,namespace,,
+int32_test,data,i32,42
+uint32_test,data,u32,42
+int8_test,data,i8,100

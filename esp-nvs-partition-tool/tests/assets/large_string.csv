@@ -1,0 +1,7 @@
+key,type,encoding,value
+storage,namespace,,
+short_str_key,data,string,Hello world!
+blob_key,file,binary,sample_blob.bin
+lorem_str_key,file,string,lorem_string.txt
+uniq_string_key,data,string,I am unique!
+multi_blob_key,file,binary,sample_multipage_blob.bin

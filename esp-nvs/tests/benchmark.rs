@@ -1,8 +1,19 @@
-use crate::common::Operation::{Read, Write};
-use crate::common::{
-    ENTRY_STATE_MAP_OFFSET, FLASH_SECTOR_SIZE, ITEM_OFFSET, ITEM_SIZE, PAGE_HEADER_SIZE, WORD_SIZE,
+use esp_nvs::{
+    ITEM_SIZE,
+    Key,
 };
-use esp_nvs::Key;
+
+use crate::common::Operation::{
+    Read,
+    Write,
+};
+use crate::common::{
+    ENTRY_STATE_MAP_OFFSET,
+    FLASH_SECTOR_SIZE,
+    ITEM_OFFSET,
+    PAGE_HEADER_SIZE,
+    WORD_SIZE,
+};
 
 mod common;
 
@@ -11,8 +22,7 @@ fn single_primitve() {
     let mut flash = common::Flash::new(2);
 
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
-    nvs.set(&Key::from_str("ns1"), &Key::from_str("value"), 0xAAu8)
-        .unwrap();
+    nvs.set(&Key::from_str("ns1"), &Key::from_str("value"), 0xAAu8).unwrap();
 
     let ops_init = vec![
         Read {
@@ -56,8 +66,7 @@ fn single_primitve() {
 
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
     assert_eq!(
-        nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("value"))
-            .unwrap(),
+        nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("value")).unwrap(),
         0xAA
     );
 
