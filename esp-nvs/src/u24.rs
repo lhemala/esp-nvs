@@ -1,3 +1,7 @@
+//! A 24-bit unsigned integer type.
+//!
+//! Used for compact storage of values that fit in 3 bytes.
+
 use core::fmt::{
     Debug,
     Formatter,

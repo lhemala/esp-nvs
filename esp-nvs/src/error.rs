@@ -1,3 +1,5 @@
+//! Error types for NVS operations.
+
 use thiserror::Error;
 
 pub use crate::raw::ItemType;

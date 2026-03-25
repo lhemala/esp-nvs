@@ -16,16 +16,16 @@ use defmt::trace;
 
 use crate::Key;
 use crate::error::Error;
-use crate::internal::{
+use crate::page::{
     ThinPageHeader,
     ThinPageState,
-    VersionOffset,
 };
 use crate::platform::{
     AlignedOps,
     FnCrc32,
     Platform,
 };
+use crate::types::VersionOffset;
 use crate::u24::u24;
 
 // -1 is for the leading item of type BLOB_DATA or SZ (for str)
