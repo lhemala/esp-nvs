@@ -1,3 +1,6 @@
+//! The `Set<T>` trait and its implementations allow providing a single generic,
+//! overloaded function `set<T>()` for all supported types of the driver.
+
 use crate::error::Error;
 use crate::platform::Platform;
 use crate::{

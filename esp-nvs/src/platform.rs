@@ -1,3 +1,8 @@
+//! Platform abstraction traits for NVS.
+//!
+//! This module defines the [`Platform`] trait that combines flash storage
+//! and CRC capabilities required by the NVS driver.
+
 use embedded_storage::nor_flash::NorFlash;
 
 /// See README.md for an example implementation.
