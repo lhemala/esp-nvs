@@ -115,26 +115,7 @@ impl fmt::Debug for Key {
 #[cfg(feature = "defmt")]
 impl defmt::Format for Key {
     fn format(&self, f: defmt::Formatter) {
-        // for defmt representation, print as binary string
-        defmt::write!(f, "Key(b\"");
-
-        // skip the null terminator at the end, which is always null,
-        // and might be confusing in the output if you passed a 15-byte key,
-        // and it shows a \0 at the end. We can't use core::ascii::escape_default
-        // for defmt so some characters are manually escaped.
-        for &byte in &self.0[..self.0.len() - 1] {
-            match byte {
-                b'\t' => defmt::write!(f, "\\t"),
-                b'\n' => defmt::write!(f, "\\n"),
-                b'\r' => defmt::write!(f, "\\r"),
-                b'\\' => defmt::write!(f, "\\\\"),
-                b'"' => defmt::write!(f, "\\\""),
-                0x20..=0x7e => defmt::write!(f, "{}", byte as char),
-                _ => defmt::write!(f, "\\x{:02x}", byte),
-            }
-        }
-
-        defmt::write!(f, "\")");
+        defmt::write!(f, "{}", self.as_str());
     }
 }
 
