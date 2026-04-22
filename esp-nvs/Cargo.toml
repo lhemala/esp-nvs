@@ -24,7 +24,7 @@ esp32h2 = ["dep:esp-storage", "esp-storage/esp32h2", "dep:esp-hal", "esp-hal/esp
 strum = { version = "0.27.1", default-features = false, features = ["derive"] }
 embedded-storage = "0.3.1"
 defmt = { version = "1.0.1", optional = true }
-esp-storage = { version = "0.8.1", optional = true }
+esp-storage = { version = ">=0.8.1, <0.10", optional = true }
 esp-hal = { version = ">=1.0.0, <2", optional = true }
 thiserror = { version = "2.0.0", default-features = false }
 
