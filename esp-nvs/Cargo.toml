@@ -17,6 +17,7 @@ esp32s2 = ["dep:esp-storage", "esp-storage/esp32s2", "dep:esp-hal", "esp-hal/esp
 esp32s3 = ["dep:esp-storage", "esp-storage/esp32s3", "dep:esp-hal", "esp-hal/esp32s3"]
 esp32c2 = ["dep:esp-storage", "esp-storage/esp32c2", "dep:esp-hal", "esp-hal/esp32c2"]
 esp32c3 = ["dep:esp-storage", "esp-storage/esp32c3", "dep:esp-hal", "esp-hal/esp32c3"]
+esp32c5 = ["dep:esp-storage", "esp-storage/esp32c5", "dep:esp-hal", "esp-hal/esp32c5"]
 esp32c6 = ["dep:esp-storage", "esp-storage/esp32c6", "dep:esp-hal", "esp-hal/esp32c6"]
 esp32h2 = ["dep:esp-storage", "esp-storage/esp32h2", "dep:esp-hal", "esp-hal/esp32h2"]
 
