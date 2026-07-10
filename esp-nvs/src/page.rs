@@ -18,7 +18,10 @@ use core::mem::{
 use core::ops::Range;
 
 #[cfg(feature = "defmt")]
-use defmt::trace;
+use defmt::{
+    trace,
+    warn,
+};
 
 use crate::Key;
 use crate::error::Error;
@@ -460,6 +463,61 @@ impl ThinPage {
         self.erased_entry_count += span;
         self.used_entry_count -= span;
         self.item_hash_list.retain(|entry| entry.index != item_index);
+
+        Ok(())
+    }
+
+    /// Physically overwrites the flash bytes of `span` entries starting at `item_index` with
+    /// zeros.
+    pub(crate) fn purge_entries<T: Platform>(&mut self, hal: &mut T, item_index: u8, span: u8) -> Result<(), Error> {
+        let max_span = (ENTRIES_PER_PAGE as u8).saturating_sub(item_index);
+        if max_span == 0 {
+            return Ok(());
+        }
+
+        // Clamped to the page so a corrupt header can never cause a write past the sector boundary
+        let span = span.clamp(1, max_span);
+
+        // Scrub the item's header and data.
+        let offset = self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index as usize;
+        let zeros = vec![0u8; span as usize * size_of::<Item>()];
+
+        write_aligned(hal, offset as u32, &zeros).map_err(|_| Error::FlashError)
+    }
+
+    /// Physically zeroes every entry currently marked as erased that belongs to `namespace_index`.
+    pub(crate) fn purge_erased_for_namespace<T: Platform>(
+        &mut self,
+        hal: &mut T,
+        namespace_index: u8,
+    ) -> Result<(), Error> {
+        let mut index = 0u8;
+        while (index as usize) < ENTRIES_PER_PAGE {
+            let span = match self.get_entry_state(index) {
+                EntryMapState::Erased => match self.load_item(hal, index) {
+                    Ok(item) => {
+                        if item.namespace_index == namespace_index {
+                            self.purge_entries(hal, index, item.span)?;
+                        }
+                        item.span
+                    }
+                    Err(e) => {
+                        #[cfg(feature = "defmt")]
+                        warn!("failed to load item index={} err={}", index, e);
+
+                        #[cfg(not(feature = "defmt"))]
+                        let _ = e;
+
+                        // Step to the next entry.
+                        1
+                    }
+                },
+                EntryMapState::Written => self.load_item(hal, index).map(|item| item.span).unwrap_or(1),
+                EntryMapState::Empty | EntryMapState::Illegal => 1,
+            };
+
+            index = index.saturating_add(span.max(1));
+        }
 
         Ok(())
     }

@@ -1639,3 +1639,225 @@ mod defrag {
     //  allocating an new empty page and defragmenting into it we can try to fill the still empty
     // entries first
 }
+
+mod purge {
+    use esp_nvs::error::Error::KeyNotFound;
+    use esp_nvs::{
+        ITEM_SIZE,
+        Key,
+    };
+    use pretty_assertions::assert_eq;
+
+    use crate::common;
+
+    fn entry_range(index: usize) -> core::ops::Range<usize> {
+        let start = common::ITEM_OFFSET + index * ITEM_SIZE;
+        start..start + ITEM_SIZE
+    }
+
+    fn span_range(first: usize, last: usize) -> core::ops::Range<usize> {
+        entry_range(first).start..entry_range(last).end
+    }
+
+    #[test]
+    fn continuous_purge_zeroes_deleted_primitive() {
+        let mut flash = common::Flash::new(2);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set_purge_mode(true);
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("secret"), 0xAABBCCDDu32)
+                .unwrap();
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("secret")).unwrap();
+        }
+
+        // The value entry is physically zeroed.
+        assert_eq!(flash.buf[entry_range(1)], vec![0u8; ITEM_SIZE]);
+
+        // Reloading the purged flash succeeds and the key is gone.
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(
+            nvs.get::<u32>(&Key::from_str("ns1"), &Key::from_str("secret"))
+                .err()
+                .unwrap(),
+            KeyNotFound
+        );
+    }
+
+    #[test]
+    fn continuous_purge_zeroes_overwritten_primitive() {
+        let mut flash = common::Flash::new(2);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set_purge_mode(true);
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), 42u8).unwrap();
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), 99u8).unwrap();
+
+            assert_eq!(nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k")).unwrap(), 99);
+        }
+
+        // The overwritten value is zeroed, the new value remains.
+        assert_eq!(flash.buf[entry_range(1)], vec![0u8; ITEM_SIZE]);
+        assert_ne!(flash.buf[entry_range(2)], vec![0u8; ITEM_SIZE]);
+    }
+
+    #[test]
+    fn continuous_purge_zeroes_deleted_string() {
+        let mut flash = common::Flash::new(2);
+
+        // 40 bytes + null terminator spans two data entries, so the item occupies entries 1..=3.
+        let value = "A".repeat(40);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set_purge_mode(true);
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("s"), value.as_str())
+                .unwrap();
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("s")).unwrap();
+        }
+
+        // Header and both data entries are zeroed.
+        assert_eq!(flash.buf[span_range(1, 3)], vec![0u8; 3 * ITEM_SIZE]);
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(
+            nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("s"))
+                .err()
+                .unwrap(),
+            KeyNotFound
+        );
+    }
+
+    #[test]
+    fn continuous_purge_zeroes_deleted_blob() {
+        let mut flash = common::Flash::new(2);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set_purge_mode(true);
+            // A 3-byte blob: chunk header + data at entries 1..=2, blob index at entry 3.
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), [1u8, 2, 3].as_slice())
+                .unwrap();
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("b")).unwrap();
+        }
+
+        // Chunk (entries 1 and 2) and blob index (entry 3) are all zeroed.
+        assert_eq!(flash.buf[span_range(1, 3)], vec![0u8; 3 * ITEM_SIZE]);
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("b"))
+                .err()
+                .unwrap(),
+            KeyNotFound
+        );
+    }
+
+    #[test]
+    fn default_mode_leaves_deleted_value_in_flash() {
+        let mut flash = common::Flash::new(2);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            assert!(!nvs.purge_mode());
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), 0x11223344u32)
+                .unwrap();
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("k")).unwrap();
+        }
+
+        // Without purge mode, the deleted value's bytes remain physically present.
+        assert_ne!(flash.buf[entry_range(1)], vec![0u8; ITEM_SIZE]);
+    }
+
+    #[test]
+    fn one_time_purge_all_zeroes_existing_erased_data() {
+        let mut flash = common::Flash::new(2);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), 0xDEADBEEFu32)
+                .unwrap();
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("k")).unwrap();
+
+            nvs.purge_all(&Key::from_str("ns1")).unwrap();
+        }
+
+        assert_eq!(flash.buf[entry_range(1)], vec![0u8; ITEM_SIZE]);
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(
+            nvs.get::<u32>(&Key::from_str("ns1"), &Key::from_str("k"))
+                .err()
+                .unwrap(),
+            KeyNotFound
+        );
+    }
+
+    #[test]
+    fn purge_all_only_affects_target_namespace() {
+        let mut flash = common::Flash::new(2);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set(&Key::from_str("ns_a"), &Key::from_str("k"), 0xAAu8).unwrap();
+            nvs.set(&Key::from_str("ns_b"), &Key::from_str("k"), 0xBBu8).unwrap();
+            nvs.delete(&Key::from_str("ns_a"), &Key::from_str("k")).unwrap();
+            nvs.delete(&Key::from_str("ns_b"), &Key::from_str("k")).unwrap();
+
+            nvs.purge_all(&Key::from_str("ns_a")).unwrap();
+        }
+
+        // Only `ns_a` erased value is scrubbed, `ns_b` erased value remains untouched.
+        assert_eq!(flash.buf[entry_range(1)], vec![0u8; ITEM_SIZE]);
+        assert_ne!(flash.buf[entry_range(3)], vec![0u8; ITEM_SIZE]);
+
+        // Reloading the partition still succeeds.
+        esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    }
+
+    #[test]
+    fn purge_all_scrubs_overwritten_value_keeping_live_keys() {
+        let mut flash = common::Flash::new(2);
+
+        let namespace = Key::from_str("ns1");
+        let key1 = Key::from_str("k1");
+        let key2 = Key::from_str("k2");
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set(&namespace, &key1, 0x11111111u32).unwrap();
+            nvs.set(&namespace, &key2, 0x33333333u32).unwrap();
+            nvs.set(&namespace, &key1, 0x22222222u32).unwrap();
+
+            nvs.purge_all(&namespace).unwrap();
+
+            // Both live values are unaffected by the purge.
+            assert_eq!(nvs.get::<u32>(&namespace, &key1).unwrap(), 0x22222222);
+            assert_eq!(nvs.get::<u32>(&namespace, &key2).unwrap(), 0x33333333);
+        }
+
+        // Only the stale `k1` value is physically zeroed, both live entries remain.
+        assert_eq!(flash.buf[entry_range(1)], vec![0u8; ITEM_SIZE]);
+        assert_ne!(flash.buf[entry_range(2)], vec![0u8; ITEM_SIZE]);
+        assert_ne!(flash.buf[entry_range(3)], vec![0u8; ITEM_SIZE]);
+
+        // Reloading confirms both keys survive with their expected values.
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(nvs.get::<u32>(&namespace, &key1).unwrap(), 0x22222222);
+        assert_eq!(nvs.get::<u32>(&namespace, &key2).unwrap(), 0x33333333);
+    }
+
+    #[test]
+    fn purge_all_missing_namespace_is_noop() {
+        let mut flash = common::Flash::new(2);
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), 1u8).unwrap();
+
+        nvs.purge_all(&Key::from_str("absent")).unwrap();
+
+        // Unrelated data is still readable.
+        assert_eq!(nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k")).unwrap(), 1);
+    }
+}

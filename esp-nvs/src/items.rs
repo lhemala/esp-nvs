@@ -194,6 +194,9 @@ where
         let page = self.pages.get_mut(page_index.0).unwrap();
 
         page.erase_item::<T>(&mut self.hal, item_index.0, item.span)?;
+        if self.purge {
+            page.purge_entries::<T>(&mut self.hal, item_index.0, item.span)?;
+        }
 
         // If we deleted a BLOB_IDX we need to delete all associated BLOB_DATA entries
         if item.type_ == ItemType::BlobIndex {
@@ -385,6 +388,9 @@ where
             // is called after we got it
             let old_page = self.pages.get_mut(page_index.0).unwrap();
             old_page.erase_item(&mut self.hal, item_index.0, 1)?;
+            if self.purge {
+                old_page.purge_entries(&mut self.hal, item_index.0, 1)?;
+            }
         }
 
         Ok(())

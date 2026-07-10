@@ -43,6 +43,7 @@ pub struct Nvs<T: Platform> {
     pub(crate) base_address: usize,
     pub(crate) sectors: u16,
     pub(crate) faulted: bool,
+    pub(crate) purge: bool,
 
     // set after calling self.load_sectors
     pub(crate) namespaces: BTreeMap<Key, u8>,
@@ -81,6 +82,7 @@ impl<T: Platform> Nvs<T> {
             free_pages: Default::default(),
             pages: Default::default(),
             faulted: false,
+            purge: false,
         };
 
         match nvs.load_sectors() {
@@ -193,6 +195,59 @@ impl<T: Platform> Nvs<T> {
             }
             other => other,
         }
+    }
+
+    /// Enable or disable continuous purge mode.
+    ///
+    /// When enabled, every subsequent delete or overwrite physically zeroes the old value's bytes
+    /// in flash in addition to marking the entry erased, mirroring the ESP-IDF
+    /// `NVS_READWRITE_PURGE` open mode. It is disabled by default, preserving the standard
+    /// mark-as-erased behavior and its flash-write economy.
+    ///
+    /// Enabling this does not purge data that is already marked erased, call [`Self::purge_all()`]
+    /// once for that.
+    pub fn set_purge_mode(&mut self, enabled: bool) {
+        self.purge = enabled;
+    }
+
+    /// Returns whether continuous purge mode is enabled.
+    pub fn purge_mode(&self) -> bool {
+        self.purge
+    }
+
+    /// Physically overwrite with zeros every value in `namespace` that is marked erased (by an
+    /// earlier delete or overwrite) but whose bytes still remain in flash.
+    ///
+    /// Purging performs additional flash writes but does not change which keys are readable. A
+    /// missing namespace is a no-op.
+    ///
+    /// Scrubbing relies on each erased item's header still being intact to determine how many
+    /// entries the item spans. This holds for values erased in the standard mark-as-erased mode. A
+    /// multi-entry item whose header is corrupt, or was already partially zeroed, *may* have its
+    /// trailing data entries left unscrubbed.
+    pub fn purge_all(&mut self, namespace: &Key) -> Result<(), Error> {
+        if self.faulted {
+            return Err(Error::FlashError);
+        }
+
+        if namespace.0[MAX_KEY_LENGTH] != b'\0' {
+            return Err(Error::NamespaceMalformed);
+        }
+
+        let Some(namespace_index) = self.namespaces.get(namespace) else {
+            // Namespace doesn't exist, nothing to purge.
+            return Ok(());
+        };
+
+        for index in 0..self.pages.len() {
+            let page = self.pages.get_mut(index).unwrap();
+            if let Err(Error::FlashError) = page.purge_erased_for_namespace(&mut self.hal, *namespace_index) {
+                self.faulted = true;
+                return Err(Error::FlashError);
+            }
+        }
+
+        Ok(())
     }
 
     /// Consume the NVS instance and return the underlying platform / HAL.
