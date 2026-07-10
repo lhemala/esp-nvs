@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-10
+
+### Features
+
+- Implement data physical purging
+
+### Bug Fixes
+
+- *(esp-nvs)* Simplify the defmt Format implementation
+- Assert key characters are within the ascii range
+- *(types)* Avoid problematic defmt symbol in key implementation
+- *(esp-nvs: docs)* Fix path to readme
+
+### Other
+
+- Relax esp-hal dependency version requirement
+- Relax esp-storage dependency version requirement
+
+### Refactor
+
+- *(esp-nvs)* Split code into more atomic modules
+
+
 ## [0.4.0] - 2026-03-26
 
 ### Features
