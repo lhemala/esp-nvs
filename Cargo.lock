@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "esp-nvs-partition-tool"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "clap",
