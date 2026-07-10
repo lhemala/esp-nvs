@@ -1,4 +1,4 @@
-#![doc = include_str!("../../README.md")]
+#![doc = include_str!("../README.md")]
 #![cfg_attr(not(target_arch = "x86_64"), no_std)]
 
 extern crate alloc;
