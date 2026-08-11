@@ -13,15 +13,63 @@ mod key {
 mod set {
     use esp_nvs::error::Error;
     use esp_nvs::{
+        EntryStatistics,
         ITEM_SIZE,
         Key,
+        MAX_BLOB_DATA_PER_PAGE,
         MAX_BLOB_SIZE,
+        Nvs,
     };
     use pretty_assertions::assert_eq;
 
     use crate::common;
 
     // TODO: test for writing namespace fails + cleanup
+
+    /// Writes single entry items to `namespace` until the first page has `leave_free` entries left.
+    ///
+    /// Only meaningful on a partition that is still fresh, where everything lands on page 0 and
+    /// that page is the active one.
+    ///
+    /// The first `set` also writes the namespace record, so page 0 goes 126 -> 124 -> 123 -> ...
+    /// and `leave_free = 125` is unreachable: it trips the assert below instead of looping.
+    fn fill_active_page(nvs: &mut Nvs<&mut common::Flash>, namespace: &Key, leave_free: u32) {
+        for i in 0u32.. {
+            let free = nvs.statistics().unwrap().entries_per_page[0].empty;
+            assert!(free >= leave_free, "overshot the requested fill level");
+            if free == leave_free {
+                return;
+            }
+
+            nvs.set(namespace, &Key::from_str(&format!("filler{i:03}")), i as u8)
+                .unwrap();
+        }
+    }
+
+    /// A flash operation budget for the tests that guard against `set_blob` looping.
+    ///
+    /// The failure mode is an endless loop, which without a bound hangs the suite instead of
+    /// failing it. Handing [`common::Flash::new_with_fault`] a budget bounds the write in flash
+    /// operations rather than wall clock: it fails deterministically in milliseconds, needs no
+    /// worker thread, and cannot flake on a loaded machine.
+    ///
+    /// The bodies below measure at ~800 operations, while a loop writes a `Full` marker, erases a
+    /// sector and copies 126 entries every turn, so this budget separates the two by a wide margin.
+    const SPIN_BUDGET: usize = 20_000;
+
+    /// Asserts `result` is `expected`, naming an exhausted [`SPIN_BUDGET`] for what it is.
+    ///
+    /// Running out of budget surfaces as `FlashError`, which on its own says nothing about why.
+    #[track_caller]
+    fn assert_no_spin(result: Result<(), Error>, expected: Error) {
+        assert_ne!(
+            result,
+            Err(Error::FlashError),
+            "the write used more than {SPIN_BUDGET} flash operations instead of returning \
+             {expected:?}, which means it looped rather than making progress"
+        );
+        assert_eq!(result, Err(expected));
+    }
 
     #[test]
     fn primitives() {
@@ -198,21 +246,15 @@ mod set {
     /// A blob version owns 128 chunk indices, one of which (0xFF) is reserved, so at most 127
     /// chunks can be addressed and deleted again.
     ///
-    /// Where that puts the byte ceiling depends on the layout, since every chunk takes whatever
-    /// the active page has left. On a fresh partition the first chunk shares its page with the
-    /// namespace record and holds one entry less than a full one, which puts the ceiling at
-    /// `MAX_BLOB_SIZE - ITEM_SIZE`. Anything above that needs a 128th chunk and has to be rejected
-    /// rather than stored in a shape that cannot be read or deleted again.
+    /// A blob that needs every one of them retires a partially filled active page first, so all of
+    /// its chunks are whole `MAX_BLOB_DATA_PER_PAGE` ones. That puts the ceiling at
+    /// `MAX_BLOB_SIZE - 1` no matter what the partition looked like beforehand. Anything above it
+    /// would need a 128th chunk and has to be rejected rather than stored in a shape that cannot be
+    /// read or deleted again.
     #[test]
     fn blob_needing_more_chunks_than_the_index_space_is_rejected() {
-        let largest = (u8::MIN..u8::MAX)
-            .cycle()
-            .take(MAX_BLOB_SIZE - ITEM_SIZE)
-            .collect::<Vec<_>>();
-        let one_byte_too_long = (u8::MIN..u8::MAX)
-            .cycle()
-            .take(MAX_BLOB_SIZE - ITEM_SIZE + 1)
-            .collect::<Vec<_>>();
+        let largest = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE - 1).collect::<Vec<_>>();
+        let one_byte_too_long = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE).collect::<Vec<_>>();
 
         println!("the largest blob a fresh partition can hold is stored and survives a reopen");
         {
@@ -240,8 +282,9 @@ mod set {
         }
 
         println!("one byte more is rejected and leaves the partition usable");
-        // The rejected write bails out after 127 chunks, so the partition needs room for those
-        // orphans next to the value that is already stored.
+        // The byte guard rejects this before a single chunk is written, so nothing is left behind.
+        // The partition is still sized generously so a leftover would have room to show up rather
+        // than turning into a `FlashFull` that masks it.
         let mut flash = common::Flash::new(200);
 
         let kept = (u8::MIN..u8::MAX).rev().cycle().take(5000).collect::<Vec<_>>();
@@ -271,8 +314,8 @@ mod set {
         }
 
         println!("re-open the partition");
-        // Init cleans up the chunks the rejected write left behind. They carry the same key and
-        // the same chunk indices a retry writes, so a leftover would corrupt the retried blob.
+        // A rejected write must not leave chunks behind. They would carry the same key and the same
+        // chunk indices a retry writes, so a leftover would corrupt the retried blob.
         let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
 
         assert_eq!(
@@ -292,6 +335,252 @@ mod set {
             nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("kept"))
                 .unwrap(),
             kept
+        );
+    }
+
+    /// The accepted blob size must not depend on how full the active page happens to be.
+    ///
+    /// A chunk only takes what the active page has left, so without the retire-and-restart in
+    /// `set_blob` a blob that fits on a fresh partition would be rejected on one whose active page
+    /// is a few entries short - even with plenty of free pages. Both layouts have to agree on the
+    /// same boundary: `MAX_BLOB_SIZE - 1` in, `MAX_BLOB_SIZE` out.
+    #[test]
+    fn blob_size_limit_is_independent_of_the_starting_layout() {
+        // 127 chunks need 128 pages, the rest is headroom for the filler page and the reserve.
+        const PAGES: usize = 140;
+        // Two entries left is the worst case a chunk can be handed: one for its header, one for
+        // 32 bytes of data.
+        const WORST_CASE_FREE_ENTRIES: u32 = 2;
+
+        let largest = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE - 1).collect::<Vec<_>>();
+        let one_byte_too_long = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE).collect::<Vec<_>>();
+
+        for prefill in [None, Some(WORST_CASE_FREE_ENTRIES)] {
+            println!("largest blob with prefill {prefill:?}");
+            let mut flash = common::Flash::new(PAGES);
+            let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+            if let Some(leave_free) = prefill {
+                fill_active_page(&mut nvs, &Key::from_str("ns1"), leave_free);
+            }
+
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), largest.as_slice())
+                .unwrap();
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                largest
+            );
+
+            println!("one byte too long with prefill {prefill:?}");
+            let mut flash = common::Flash::new(PAGES);
+            let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+            if let Some(leave_free) = prefill {
+                fill_active_page(&mut nvs, &Key::from_str("ns1"), leave_free);
+            }
+
+            assert_eq!(
+                nvs.set(
+                    &Key::from_str("ns1"),
+                    &Key::from_str("blob"),
+                    one_byte_too_long.as_slice()
+                ),
+                Err(Error::ValueTooLong)
+            );
+        }
+    }
+
+    /// A blob that no longer fits into the chunk indices left has to retire the active page and
+    /// restart on a fresh one.
+    ///
+    /// With three entries left the first chunk could only take 64 bytes, which caps the blob at
+    /// `64 + 126 * MAX_BLOB_DATA_PER_PAGE` bytes. One byte more used to be rejected on a partition
+    /// that was 99% empty; it now retires that page and stores the blob in 127 whole chunks.
+    #[test]
+    fn blob_too_large_for_the_active_page_restarts_on_a_fresh_one() {
+        const FREE_ENTRIES: u32 = 3;
+        let len = (FREE_ENTRIES as usize - 1) * ITEM_SIZE + 126 * MAX_BLOB_DATA_PER_PAGE + 1;
+        assert_eq!(len, 504_065);
+
+        let blob = (u8::MIN..u8::MAX).cycle().take(len).collect::<Vec<_>>();
+
+        let mut flash = common::Flash::new(200);
+        {
+            let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+            fill_active_page(&mut nvs, &Key::from_str("ns1"), FREE_ENTRIES);
+
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), blob.as_slice())
+                .unwrap();
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                blob
+            );
+
+            // The retired page keeps its three unused entries, the blob itself is written in whole
+            // chunks that need no more than the 127 available indices.
+            assert_eq!(nvs.statistics().unwrap().entries_per_page[0].empty, FREE_ENTRIES);
+        }
+
+        println!("re-open the partition");
+        let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            blob
+        );
+    }
+
+    /// Only a blob large enough to run out of chunk indices may retire the active page.
+    ///
+    /// An ordinary write has to keep filling the page it is handed, otherwise every write onto a
+    /// nearly full page would burn the rest of that page.
+    #[test]
+    fn small_blob_fills_the_active_page_instead_of_skipping_it() {
+        const FREE_ENTRIES: u32 = 4;
+
+        let mut flash = common::Flash::new(4);
+        let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+        fill_active_page(&mut nvs, &Key::from_str("ns1"), FREE_ENTRIES);
+
+        // A header entry plus two data entries, which leaves exactly one entry for the blob index.
+        let blob = (u8::MIN..u8::MAX).cycle().take(2 * ITEM_SIZE).collect::<Vec<_>>();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), blob.as_slice())
+            .unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            blob
+        );
+
+        let statistics = nvs.statistics().unwrap();
+        assert_eq!(
+            statistics.entries_per_page[0],
+            EntryStatistics {
+                empty: 0,
+                written: 126,
+                erased: 0,
+                illegal: 0,
+            }
+        );
+        // No page was skipped, so nothing beyond the first one has been touched.
+        assert_eq!(statistics.pages.empty, 3);
+    }
+
+    /// Retiring the active page must not cost a page without buying a chunk.
+    ///
+    /// `get_active_page` does not only hand out fresh pages: once the reserve is down to one it
+    /// goes through `defragment`, which copies a page's live entries into a new one and hands that
+    /// back as the active page - partially filled, and reproducible verbatim for as long as no
+    /// entry is erased. Retiring such a page unconditionally never terminates: every turn writes a
+    /// `Full` marker, erases a sector and copies 126 entries, and arrives at the same state.
+    ///
+    /// So the retire only happens once per chunk. If the page after it still does not fit, the
+    /// partial chunk is written after all, which always advances and lets the write end in the
+    /// `FlashFull` (or, once the chunk indices run out, `ValueTooLong`) it belongs in.
+    #[test]
+    fn blob_too_large_for_the_partition_fails_instead_of_spinning() {
+        println!("overwriting a blob the partition can only hold once");
+        {
+            // A single blob of this size fits, a second version next to it does not, so the
+            // overwrite has to defragment mid-write and gets a copied page rather than a fresh one.
+            let first = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE - 1).collect::<Vec<_>>();
+            let second = (u8::MIN..u8::MAX)
+                .rev()
+                .cycle()
+                .take(MAX_BLOB_SIZE - 1)
+                .collect::<Vec<_>>();
+
+            let mut flash = common::Flash::new_with_fault(130, SPIN_BUDGET);
+            let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), first.as_slice())
+                .unwrap();
+            assert_no_spin(
+                nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), second.as_slice()),
+                Error::FlashFull,
+            );
+            // The version that was already stored has to survive the failed overwrite.
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                first
+            );
+        }
+
+        println!("a blob larger than the partition, with erased entries present");
+        {
+            // Erased entries are what gives `defragment` something to reclaim, so they decide
+            // whether it hands back a copied page at all. A partition too small for the blob has to
+            // say so rather than shuffling pages forever.
+            let mut flash = common::Flash::new_with_fault(120, SPIN_BUDGET);
+            let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            for i in 0..10u32 {
+                nvs.set(&Key::from_str("ns1"), &Key::from_str(&format!("gone{i}")), i as u8)
+                    .unwrap();
+            }
+            for i in 0..10u32 {
+                nvs.delete(&Key::from_str("ns1"), &Key::from_str(&format!("gone{i}")))
+                    .unwrap();
+            }
+
+            let blob = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE - 1).collect::<Vec<_>>();
+            assert_no_spin(
+                nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), blob.as_slice()),
+                Error::FlashFull,
+            );
+        }
+    }
+
+    /// Reaches the chunk count backstop inside `set_blob`'s loop.
+    ///
+    /// This is the guard commit `9906399` added, and it is the one thing standing between a blob
+    /// that runs out of chunk indices and permanent corruption. Reaching it needs a blob that gets
+    /// past the byte guard and *still* runs out, which only happens where the retire has to give
+    /// up: a partition too small to keep handing out fresh pages, so the remaining chunks come
+    /// out partial and a 128th index would be needed.
+    ///
+    /// At this size `ValueTooLong` can only come from that in-loop guard - the byte guard rejects
+    /// from `MAX_BLOB_SIZE` upwards and this blob is one byte below it - so the assertion is proof
+    /// the guard was reached.
+    #[test]
+    fn blob_running_out_of_chunk_indices_mid_write_is_rejected() {
+        let blob = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE - 1).collect::<Vec<_>>();
+        let retry = (u8::MIN..u8::MAX).rev().cycle().take(5_000).collect::<Vec<_>>();
+
+        let mut flash = common::Flash::new_with_fault(128, SPIN_BUDGET);
+        {
+            let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            // One erased entry is what gives `defragment` something to reclaim, which is how the
+            // write ends up with a partially filled page instead of a fresh one.
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("gone"), 1u8).unwrap();
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("gone")).unwrap();
+
+            assert_no_spin(
+                nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), blob.as_slice()),
+                Error::ValueTooLong,
+            );
+        }
+
+        println!("re-open the partition");
+        // Unlike the byte guard, this bail-out happens after chunks have been written, so it does
+        // leave orphans behind. They carry the same key and the same chunk indices a retry writes,
+        // so init has to clean them up or the retried blob is corrupted.
+        flash.disable_faults();
+        let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob")),
+            Err(Error::KeyNotFound)
+        );
+
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), retry.as_slice())
+            .unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            retry
         );
     }
 

@@ -38,13 +38,20 @@ pub enum Error {
 
     /// Strings are limited to `MAX_BLOB_DATA_PER_PAGE` bytes.
     ///
-    /// Blobs are limited twice over: by a byte count of `MAX_BLOB_SIZE - 1`, and by the 127 chunk
-    /// indices a blob version can address. The chunk limit is the tighter of the two and depends
-    /// on the layout at the time of the write, because every chunk is filled with whatever the
-    /// active page has left: an identical blob can therefore be stored on a fresh partition but
-    /// rejected on one whose active page is a few entries short. The effective ceiling ranges from
-    /// 504,032 bytes (the active page down to its last two entries) to `MAX_BLOB_SIZE - 1` (the
-    /// active page just filled up, so all 127 chunks are whole).
+    /// Blobs are limited to `MAX_BLOB_SIZE - 1` bytes, that is 507,999. The limit follows from the
+    /// 127 chunk indices a blob version can address, each holding at most
+    /// `MAX_BLOB_DATA_PER_PAGE` (4,000) bytes. Anything from `MAX_BLOB_SIZE` upwards is rejected on
+    /// sight, before a single byte is written.
+    ///
+    /// The limit does not depend on how full the *active page* is, as long as the partition can
+    /// hand out a fresh page: a blob large enough to need every chunk index retires a partially
+    /// filled active page first, so all of its chunks are whole.
+    ///
+    /// On a partition that cannot do that, a blob within the byte limit may still fail. Usually
+    /// that is [`Error::FlashFull`], but a partition too small to give the blob whole chunks
+    /// runs out of chunk indices and reports `ValueTooLong` for a blob a roomier partition
+    /// would accept. That bail-out happens mid-write, so unlike the byte limit it leaves the
+    /// written chunks behind as orphans, which the next `Nvs::new` cleans up.
     #[error("value too long")]
     ValueTooLong,
 

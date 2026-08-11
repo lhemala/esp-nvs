@@ -30,6 +30,7 @@ use crate::raw::{
     ItemData,
     ItemDataBlobIndex,
     ItemType,
+    MAX_BLOB_CHUNK_COUNT,
     MAX_BLOB_DATA_PER_PAGE,
     MAX_BLOB_SIZE,
 };
@@ -539,15 +540,23 @@ where
         let version_base = new_version_offset.clone() as u8;
         let mut chunk_count = 0u8;
         let mut offset = 0usize;
+        // Whether a page was already retired for this chunk, see the skip below.
+        let mut retired_a_page = false;
 
         while offset < data.len() {
             // Chunk indices are `version_base + chunk_count`, so a blob version only owns the 128
             // wide half of the index space starting at its base, and 0xFF is reserved as "no chunk
-            // index". `delete_blob_data` therefore only ever cleans up 127 chunks. Writing a 128th
-            // one would alias the reserved index (or leak the surplus chunk on the next
-            // overwrite), so refuse the blob instead of storing it in a shape we cannot read or
-            // delete again.
-            if chunk_count >= VersionOffset::V1 as u8 - 1 {
+            // index". `delete_blob_data` therefore only ever cleans up `MAX_BLOB_CHUNK_COUNT`
+            // chunks. Writing one more would alias the reserved index (or leak the surplus chunk on
+            // the next overwrite), so refuse the blob instead of storing it in a shape we cannot
+            // read or delete again.
+            //
+            // Whenever the skip below can retire a partially filled page this is unreachable, since
+            // every chunk is then whole and 127 of them cover any blob that passed the byte guard.
+            // It is still the backstop that catches the case where the skip has to give up - a
+            // partition too small for the blob, where the next page is a defragmentation target
+            // rather than a fresh one.
+            if chunk_count >= MAX_BLOB_CHUNK_COUNT as u8 {
                 return Err(Error::ValueTooLong);
             }
 
@@ -560,7 +569,40 @@ where
                 self.pages.push(page);
                 continue;
             }
-            let data_len = cmp::min((free_entries - 1) * size_of::<Item>(), data.len() - offset);
+
+            // A chunk only ever takes what the active page has left, so writing the rest of a blob
+            // onto a partially filled page costs the same chunk index as a whole one but stores
+            // less. That would make the largest storable blob depend on how full the active page
+            // happened to be. Retire such a page instead - before any chunk of this blob is
+            // written, so nothing is wasted on a write that then restarts - whenever the rest of
+            // the blob would no longer fit into the chunk indices that are left. The next page is
+            // then either a fresh one or, in the `FlashFull` region below, a defragmentation
+            // target, and a fresh one makes every following chunk whole, which pins the accepted
+            // size at `MAX_BLOB_SIZE - 1` for every layout.
+            //
+            // Only retire once per chunk. `get_active_page` may go through `defragment`, which
+            // hands back a partially filled page that it can keep reproducing verbatim: retiring it
+            // again would spin forever, erasing a sector per turn. Falling through to the partial
+            // write instead always advances `offset`, so the loop terminates and the write ends in
+            // the `ValueTooLong`/`FlashFull` it reported before this skip existed.
+            //
+            // The skip needs the remainder to exceed
+            // `(MAX_BLOB_CHUNK_COUNT - 1) * MAX_BLOB_DATA_PER_PAGE`, which in practice only blobs
+            // of that order reach, so ordinary writes do not lose a page to it. Note
+            // the bound is on the remainder at this point rather than on `data.len()`:
+            // a shorter blob whose earlier chunks came out partial could reach it
+            // algebraically, it has just never been possible to construct one.
+            let remaining = data.len() - offset;
+            let fits_here = (free_entries - 1) * size_of::<Item>();
+            let fits_in_remaining_chunks = (MAX_BLOB_CHUNK_COUNT - 1 - chunk_count as usize) * MAX_BLOB_DATA_PER_PAGE;
+            if !retired_a_page && remaining > fits_here + fits_in_remaining_chunks {
+                retired_a_page = true;
+                page.mark_as_full::<T>(&mut self.hal)?;
+                self.pages.push(page);
+                continue;
+            }
+
+            let data_len = cmp::min(fits_here, remaining);
 
             match page.write_variable_sized_item::<T>(
                 &mut self.hal,
@@ -573,6 +615,7 @@ where
                 Ok(_) => {
                     offset += data_len;
                     chunk_count += 1;
+                    retired_a_page = false;
                     self.pages.push(page);
                 }
                 Err(Error::PageFull) => {

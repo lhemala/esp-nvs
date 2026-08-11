@@ -34,7 +34,10 @@ pub const ENTRY_STATE_BITMAP_SIZE: usize = 32;
 pub const ENTRIES_PER_PAGE: usize = 126;
 // -1 is for the leading item of type BLOB_DATA or SZ (for str)
 pub const MAX_BLOB_DATA_PER_PAGE: usize = (ENTRIES_PER_PAGE - 1) * size_of::<Item>();
-pub const MAX_BLOB_SIZE: usize = MAX_BLOB_DATA_PER_PAGE * (u8::MAX as usize - VersionOffset::V1 as usize);
+/// A blob version owns the 128 wide chunk-index half that starts at its version base, and 0xFF is
+/// reserved as "no chunk index", so a blob version can address at most 127 chunks.
+pub(crate) const MAX_BLOB_CHUNK_COUNT: usize = u8::MAX as usize - VersionOffset::V1 as usize;
+pub const MAX_BLOB_SIZE: usize = MAX_BLOB_DATA_PER_PAGE * MAX_BLOB_CHUNK_COUNT;
 pub const PAGE_HEADER_SIZE: usize = size_of::<PageHeader>();
 pub const ITEM_SIZE: usize = size_of::<Item>();
 
