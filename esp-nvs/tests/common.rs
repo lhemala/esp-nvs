@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 // filename according to https://doc.rust-lang.org/book/ch11-03-test-organization.html
 use embedded_storage::nor_flash::{
     ErrorType,
@@ -195,6 +198,67 @@ impl NorFlash for Flash {
 }
 
 impl esp_nvs::platform::Crc for Flash {
+    fn crc32(init: u32, data: &[u8]) -> u32 {
+        esp_nvs::platform::software_crc32(init, data)
+    }
+}
+
+/// A [`Flash`] behind a shared handle.
+///
+/// `Nvs::new` takes ownership of the HAL, so with a plain [`Flash`] the backing buffer is
+/// unreachable for as long as the `Nvs` instance lives. Cloning a `SharedFlash` hands the
+/// `Nvs` one handle while the test keeps another, which allows simulating corruption that
+/// appears *after* the partition has been scanned and cached.
+#[derive(Clone, Default)]
+pub struct SharedFlash(Rc<RefCell<Flash>>);
+
+#[allow(clippy::len_without_is_empty)]
+impl SharedFlash {
+    pub fn new(pages: usize) -> Self {
+        Self(Rc::new(RefCell::new(Flash::new(pages))))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// Gives temporary mutable access to the raw partition image.
+    pub fn with_buf<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        f(&mut self.0.borrow_mut().buf)
+    }
+}
+
+impl ErrorType for SharedFlash {
+    type Error = FlashError;
+}
+
+impl ReadNorFlash for SharedFlash {
+    const READ_SIZE: usize = WORD_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().read(offset, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        self.0.borrow().buf.len()
+    }
+}
+
+impl NorFlash for SharedFlash {
+    const WRITE_SIZE: usize = WORD_SIZE;
+
+    const ERASE_SIZE: usize = FLASH_SECTOR_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        self.0.borrow_mut().erase(from, to)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().write(offset, bytes)
+    }
+}
+
+impl esp_nvs::platform::Crc for SharedFlash {
     fn crc32(init: u32, data: &[u8]) -> u32 {
         esp_nvs::platform::software_crc32(init, data)
     }
