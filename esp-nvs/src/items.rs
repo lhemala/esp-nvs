@@ -541,6 +541,16 @@ where
         let mut offset = 0usize;
 
         while offset < data.len() {
+            // Chunk indices are `version_base + chunk_count`, so a blob version only owns the 128
+            // wide half of the index space starting at its base, and 0xFF is reserved as "no chunk
+            // index". `delete_blob_data` therefore only ever cleans up 127 chunks. Writing a 128th
+            // one would alias the reserved index (or leak the surplus chunk on the next
+            // overwrite), so refuse the blob instead of storing it in a shape we cannot read or
+            // delete again.
+            if chunk_count >= VersionOffset::V1 as u8 - 1 {
+                return Err(Error::ValueTooLong);
+            }
+
             let mut page = self.get_active_page()?;
 
             // Calculate how much data we can fit

@@ -11,8 +11,12 @@ mod key {
 }
 
 mod set {
-    use esp_nvs::Key;
     use esp_nvs::error::Error;
+    use esp_nvs::{
+        ITEM_SIZE,
+        Key,
+        MAX_BLOB_SIZE,
+    };
     use pretty_assertions::assert_eq;
 
     use crate::common;
@@ -188,6 +192,106 @@ mod set {
             nvs.get::<Vec<u8>>(&Key::from_str("hello world"), &Key::from_str("multi page blob"))
                 .unwrap(),
             multi_page_blob
+        );
+    }
+
+    /// A blob version owns 128 chunk indices, one of which (0xFF) is reserved, so at most 127
+    /// chunks can be addressed and deleted again.
+    ///
+    /// Where that puts the byte ceiling depends on the layout, since every chunk takes whatever
+    /// the active page has left. On a fresh partition the first chunk shares its page with the
+    /// namespace record and holds one entry less than a full one, which puts the ceiling at
+    /// `MAX_BLOB_SIZE - ITEM_SIZE`. Anything above that needs a 128th chunk and has to be rejected
+    /// rather than stored in a shape that cannot be read or deleted again.
+    #[test]
+    fn blob_needing_more_chunks_than_the_index_space_is_rejected() {
+        let largest = (u8::MIN..u8::MAX)
+            .cycle()
+            .take(MAX_BLOB_SIZE - ITEM_SIZE)
+            .collect::<Vec<_>>();
+        let one_byte_too_long = (u8::MIN..u8::MAX)
+            .cycle()
+            .take(MAX_BLOB_SIZE - ITEM_SIZE + 1)
+            .collect::<Vec<_>>();
+
+        println!("the largest blob a fresh partition can hold is stored and survives a reopen");
+        {
+            // 127 chunks need 128 pages, the rest is headroom.
+            let mut flash = common::Flash::new(140);
+
+            {
+                let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+                nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), largest.as_slice())
+                    .unwrap();
+                assert_eq!(
+                    nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                        .unwrap(),
+                    largest
+                );
+            }
+
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                largest
+            );
+        }
+
+        println!("one byte more is rejected and leaves the partition usable");
+        // The rejected write bails out after 127 chunks, so the partition needs room for those
+        // orphans next to the value that is already stored.
+        let mut flash = common::Flash::new(200);
+
+        let kept = (u8::MIN..u8::MAX).rev().cycle().take(5000).collect::<Vec<_>>();
+        let retry = (u8::MIN..u8::MAX).cycle().skip(3).take(200_000).collect::<Vec<_>>();
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("kept"), kept.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.set(
+                    &Key::from_str("ns1"),
+                    &Key::from_str("blob"),
+                    one_byte_too_long.as_slice()
+                ),
+                Err(Error::ValueTooLong)
+            );
+
+            // The rejected write must not have touched the value that was already stored.
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("kept"))
+                    .unwrap(),
+                kept
+            );
+        }
+
+        println!("re-open the partition");
+        // Init cleans up the chunks the rejected write left behind. They carry the same key and
+        // the same chunk indices a retry writes, so a leftover would corrupt the retried blob.
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("kept"))
+                .unwrap(),
+            kept
+        );
+
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), retry.as_slice())
+            .unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            retry
+        );
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("kept"))
+                .unwrap(),
+            kept
         );
     }
 
@@ -675,7 +779,9 @@ mod overwrite {
     };
     use esp_nvs::{
         EntryStatistics,
+        ITEM_SIZE,
         Key,
+        MAX_BLOB_SIZE,
         NvsStatistics,
         PageStatistics,
     };
@@ -911,10 +1017,527 @@ mod overwrite {
             nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), blob.as_slice())
                 .unwrap();
         }
+    }
 
-        // TODO smaller override bigger
+    /// A blob spanning three chunks is overwritten by one that fits into a single chunk.
+    ///
+    /// The two surplus chunks of the old blob have to be erased. If they were left behind the
+    /// written entry count would be higher than the one asserted below, and re-opening the
+    /// partition would make `cleanup_dirty_blobs` delete the whole blob.
+    #[test]
+    fn blob_shrinks_across_chunk_boundary() {
+        let mut flash = common::Flash::new(6);
 
-        // TODO bigger override smaller
+        // 8192 bytes need three chunks: 3968 bytes (124 of the 125 entries left on the page that
+        // also holds the namespace record), 4000 bytes (125 entries of a whole page) and the
+        // remaining 224 bytes.
+        let big = (u8::MIN..u8::MAX).cycle().take(8192).collect::<Vec<_>>();
+        // 1000 bytes fit into a single chunk.
+        let small = (u8::MIN..u8::MAX).rev().cycle().take(1000).collect::<Vec<_>>();
+
+        let statistics_after_shrink;
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            println!("write the three chunk blob");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), big.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                big
+            );
+
+            // namespace + 3 chunk headers + 8192 / 32 data entries + blob index
+            assert_eq!(
+                nvs.statistics().unwrap(),
+                NvsStatistics {
+                    pages: PageStatistics {
+                        empty: 3,
+                        active: 1,
+                        full: 2,
+                        erasing: 0,
+                        corrupted: 0,
+                    },
+                    entries_per_page: vec![
+                        // namespace + first chunk (1 header + 124 data)
+                        EntryStatistics {
+                            empty: 0,
+                            written: 1 + 125,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        // second chunk (1 header + 125 data)
+                        EntryStatistics {
+                            empty: 0,
+                            written: 126,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        // third chunk (1 header + 7 data) + blob index
+                        EntryStatistics {
+                            empty: 117,
+                            written: 8 + 1,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                    ],
+                    entries_overall: EntryStatistics {
+                        empty: 756 - 261,
+                        written: 1 + 3 + 8192 / 32 + 1,
+                        erased: 0,
+                        illegal: 0,
+                    },
+                }
+            );
+
+            println!("overwrite it with the single chunk blob");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), small.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                small
+            );
+
+            // namespace + 1 chunk header + ceil(1000 / 32) data entries + blob index. Everything
+            // the three chunk blob occupied is erased, including its two surplus chunks.
+            assert_eq!(
+                nvs.statistics().unwrap(),
+                NvsStatistics {
+                    pages: PageStatistics {
+                        empty: 3,
+                        active: 1,
+                        full: 2,
+                        erasing: 0,
+                        corrupted: 0,
+                    },
+                    entries_per_page: vec![
+                        // namespace stays, the first old chunk is erased
+                        EntryStatistics {
+                            empty: 0,
+                            written: 1,
+                            erased: 125,
+                            illegal: 0,
+                        },
+                        // the whole second old chunk is erased
+                        EntryStatistics {
+                            empty: 0,
+                            written: 0,
+                            erased: 126,
+                            illegal: 0,
+                        },
+                        // new chunk (1 header + 32 data) + new blob index, old third chunk and old
+                        // blob index erased
+                        EntryStatistics {
+                            empty: 126 - 9 - 34,
+                            written: 33 + 1,
+                            erased: 8 + 1,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                    ],
+                    entries_overall: EntryStatistics {
+                        empty: 756 - 35 - 260,
+                        written: 1 + 1 + 1000_usize.div_ceil(32) as u32 + 1,
+                        erased: 125 + 126 + 9,
+                        illegal: 0,
+                    },
+                }
+            );
+
+            statistics_after_shrink = nvs.statistics().unwrap();
+        }
+
+        println!("re-open the partition");
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        // A leaked or missing chunk would let `cleanup_dirty_blobs` delete the blob during init.
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            small
+        );
+        assert_eq!(nvs.statistics().unwrap(), statistics_after_shrink);
+    }
+
+    /// A blob that fits into a single chunk is overwritten by one spanning three chunks.
+    #[test]
+    fn blob_grows_across_chunk_boundary() {
+        let mut flash = common::Flash::new(6);
+
+        let small = (u8::MIN..u8::MAX).cycle().take(1000).collect::<Vec<_>>();
+        let big = (u8::MIN..u8::MAX).rev().cycle().take(8192).collect::<Vec<_>>();
+
+        let statistics_after_growth;
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            println!("write the single chunk blob");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), small.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                small
+            );
+
+            // namespace + 1 chunk header + ceil(1000 / 32) data entries + blob index
+            assert_eq!(
+                nvs.statistics().unwrap(),
+                NvsStatistics {
+                    pages: PageStatistics {
+                        empty: 5,
+                        active: 1,
+                        full: 0,
+                        erasing: 0,
+                        corrupted: 0,
+                    },
+                    entries_per_page: vec![
+                        EntryStatistics {
+                            empty: 126 - 35,
+                            written: 1 + 33 + 1,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                    ],
+                    entries_overall: EntryStatistics {
+                        empty: 756 - 35,
+                        written: 1 + 1 + 1000_usize.div_ceil(32) as u32 + 1,
+                        erased: 0,
+                        illegal: 0,
+                    },
+                }
+            );
+
+            println!("overwrite it with the three chunk blob");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), big.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                big
+            );
+
+            // The 91 entries left on the first page take 2880 bytes, the second page 4000 bytes
+            // and the remaining 1312 bytes end up on the third page: namespace + 3 chunk headers +
+            // 8192 / 32 data entries + blob index.
+            assert_eq!(
+                nvs.statistics().unwrap(),
+                NvsStatistics {
+                    pages: PageStatistics {
+                        empty: 3,
+                        active: 1,
+                        full: 2,
+                        erasing: 0,
+                        corrupted: 0,
+                    },
+                    entries_per_page: vec![
+                        // namespace + first new chunk (1 header + 90 data), old chunk and old blob
+                        // index erased
+                        EntryStatistics {
+                            empty: 0,
+                            written: 1 + 91,
+                            erased: 33 + 1,
+                            illegal: 0,
+                        },
+                        // second new chunk (1 header + 125 data)
+                        EntryStatistics {
+                            empty: 0,
+                            written: 126,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        // third new chunk (1 header + 41 data) + new blob index
+                        EntryStatistics {
+                            empty: 126 - 43,
+                            written: 42 + 1,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                        EntryStatistics {
+                            empty: 126,
+                            written: 0,
+                            erased: 0,
+                            illegal: 0,
+                        },
+                    ],
+                    entries_overall: EntryStatistics {
+                        empty: 756 - 261 - 34,
+                        written: 1 + 3 + 8192 / 32 + 1,
+                        erased: 34,
+                        illegal: 0,
+                    },
+                }
+            );
+
+            statistics_after_growth = nvs.statistics().unwrap();
+        }
+
+        println!("re-open the partition");
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            big
+        );
+        assert_eq!(nvs.statistics().unwrap(), statistics_after_growth);
+    }
+
+    /// Shrinking and growing a blob while the chunk count stays the same.
+    #[test]
+    fn blob_resizes_within_the_same_chunk_count() {
+        let mut flash = common::Flash::new(6);
+
+        // 5000 bytes span two chunks: 3968 bytes next to the namespace record and 1032 bytes.
+        let large = (u8::MIN..u8::MAX).cycle().take(5000).collect::<Vec<_>>();
+        // 4500 bytes still span two chunks, the split just moves.
+        let smaller = (u8::MIN..u8::MAX).rev().cycle().take(4500).collect::<Vec<_>>();
+        // 5000 bytes again, with yet another pattern so stale chunks show up as wrong content.
+        let large_again = (u8::MIN..u8::MAX).cycle().skip(7).take(5000).collect::<Vec<_>>();
+
+        let statistics_after_regrowth;
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            println!("write 5000 bytes");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), large.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                large
+            );
+
+            let statistics = nvs.statistics().unwrap();
+            // namespace + 2 chunk headers + 124 + ceil(1032 / 32) data entries + blob index
+            assert_eq!(
+                statistics.entries_overall,
+                EntryStatistics {
+                    empty: 756 - 161,
+                    written: 1 + 2 + 124 + 1032_usize.div_ceil(32) as u32 + 1,
+                    erased: 0,
+                    illegal: 0,
+                }
+            );
+
+            println!("shrink it to 4500 bytes");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), smaller.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                smaller
+            );
+
+            let statistics = nvs.statistics().unwrap();
+            // 2880 bytes fill the second page, 1620 bytes go to the third one: namespace +
+            // 2 chunk headers + 90 + ceil(1620 / 32) data entries + blob index
+            assert_eq!(
+                statistics.entries_overall,
+                EntryStatistics {
+                    empty: 756 - 145 - 160,
+                    written: 1 + 2 + 90 + 1620_usize.div_ceil(32) as u32 + 1,
+                    erased: 125 + 35,
+                    illegal: 0,
+                }
+            );
+
+            println!("grow it back to 5000 bytes");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), large_again.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                large_again
+            );
+
+            let statistics = nvs.statistics().unwrap();
+            // 2304 bytes fill the third page, 2696 bytes go to the fourth one: namespace +
+            // 2 chunk headers + 72 + ceil(2696 / 32) data entries + blob index
+            assert_eq!(
+                statistics.entries_overall,
+                EntryStatistics {
+                    empty: 756 - 161 - 304,
+                    written: 1 + 2 + 72 + 2696_usize.div_ceil(32) as u32 + 1,
+                    erased: 125 + 126 + 53,
+                    illegal: 0,
+                }
+            );
+
+            statistics_after_regrowth = statistics.entries_overall;
+        }
+
+        println!("re-open the partition");
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            large_again
+        );
+        assert_eq!(nvs.statistics().unwrap().entries_overall, statistics_after_regrowth);
+    }
+
+    /// Pins the range `delete_blob_data` sweeps.
+    ///
+    /// This blob uses all 127 chunk indices a blob version owns, which is legal, so the test does
+    /// not exercise the chunk count guard in `set_blob`. What it does exercise is the cleanup of
+    /// the old version: the last index it has to reach is `chunk_start + 126`, so narrowing the
+    /// sweep by a single chunk leaves the last one behind and shows up as a higher written count
+    /// below.
+    #[test]
+    fn largest_blob_overwrites_itself() {
+        // Both versions coexist until the old one is deleted, so the partition has to hold two of
+        // them (128 pages each) plus a page to reclaim into.
+        let mut flash = common::Flash::new(260);
+
+        let before = (u8::MIN..u8::MAX)
+            .cycle()
+            .take(MAX_BLOB_SIZE - ITEM_SIZE)
+            .collect::<Vec<_>>();
+        let after = (u8::MIN..u8::MAX)
+            .rev()
+            .cycle()
+            .take(MAX_BLOB_SIZE - ITEM_SIZE)
+            .collect::<Vec<_>>();
+
+        // namespace + 127 chunk headers + (MAX_BLOB_SIZE - ITEM_SIZE) / 32 data entries + index
+        let live_entries = 1 + 127 + (MAX_BLOB_SIZE - ITEM_SIZE) as u32 / 32 + 1;
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            println!("write the 127 chunk blob");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), before.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                before
+            );
+            assert_eq!(nvs.statistics().unwrap().entries_overall.written, live_entries);
+
+            println!("overwrite it with another 127 chunk blob");
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), after.as_slice())
+                .unwrap();
+
+            assert_eq!(
+                nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                    .unwrap(),
+                after
+            );
+            // Everything of the old version except the namespace record is gone; a chunk index
+            // that cannot be addressed by `delete_blob_data` would show up as a higher written
+            // count here.
+            assert_eq!(
+                nvs.statistics().unwrap().entries_overall,
+                EntryStatistics {
+                    empty: 260 * 126 - live_entries - (live_entries - 1),
+                    written: live_entries,
+                    erased: live_entries - 1,
+                    illegal: 0,
+                }
+            );
+        }
+
+        println!("re-open the partition");
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            after
+        );
     }
 
     #[test]

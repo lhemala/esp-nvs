@@ -36,8 +36,15 @@ pub enum Error {
     #[error("namespace malformed")]
     NamespaceMalformed,
 
-    /// Strings are limited to `MAX_BLOB_DATA_PER_PAGE` while blobs can be up to `MAX_BLOB_SIZE`
-    /// bytes
+    /// Strings are limited to `MAX_BLOB_DATA_PER_PAGE` bytes.
+    ///
+    /// Blobs are limited twice over: by a byte count of `MAX_BLOB_SIZE - 1`, and by the 127 chunk
+    /// indices a blob version can address. The chunk limit is the tighter of the two and depends
+    /// on the layout at the time of the write, because every chunk is filled with whatever the
+    /// active page has left: an identical blob can therefore be stored on a fresh partition but
+    /// rejected on one whose active page is a few entries short. The effective ceiling ranges from
+    /// 504,032 bytes (the active page down to its last two entries) to `MAX_BLOB_SIZE - 1` (the
+    /// active page just filled up, so all 127 chunks are whole).
     #[error("value too long")]
     ValueTooLong,
 
