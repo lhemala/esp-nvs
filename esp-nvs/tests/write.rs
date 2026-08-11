@@ -13,6 +13,7 @@ mod key {
 mod set {
     use esp_nvs::error::Error;
     use esp_nvs::{
+        ENTRIES_PER_PAGE,
         EntryStatistics,
         ITEM_SIZE,
         Key,
@@ -44,6 +45,46 @@ mod set {
             nvs.set(namespace, &Key::from_str(&format!("filler{i:03}")), i as u8)
                 .unwrap();
         }
+    }
+
+    /// Fills `flash` with single entry items until nothing more fits, then erases the ones at
+    /// `erase_at` again, and arms a [`SPIN_BUDGET`] for whatever the caller does next. Returns how
+    /// many items were written.
+    ///
+    /// This is the layout `defragment` has to work with when the reserve is down to its last free
+    /// page: the number of erased entries on the page it reclaims is exactly the number of free
+    /// entries the copy it hands back as the new active page will have.
+    ///
+    /// The fill gets a budget of its own and the caller opens the partition again afterwards,
+    /// because filling a large partition costs far more flash operations than the write under test
+    /// is allowed to, and a budget that covered both would no longer separate a write from a spin.
+    /// The fill's own budget is generous - it measures at under 300 operations per page - but
+    /// finite on purpose, so a spin in the fill fails the test rather than hanging the suite.
+    fn fill_partition(
+        flash: &mut common::Flash,
+        namespace: &Key,
+        pages: usize,
+        erase_at: impl Fn(usize) -> Vec<usize>,
+    ) -> usize {
+        let mut written = 0;
+        flash.arm_fault(pages * SPIN_BUDGET);
+        {
+            let mut nvs = Nvs::new(0, flash.len(), &mut *flash).unwrap();
+            for i in 0..pages * ENTRIES_PER_PAGE {
+                if nvs
+                    .set(namespace, &Key::from_str(&format!("k{i:05}")), (i % 251) as u8)
+                    .is_err()
+                {
+                    break;
+                }
+                written += 1;
+            }
+            for i in erase_at(written) {
+                nvs.delete(namespace, &Key::from_str(&format!("k{i:05}"))).unwrap();
+            }
+        }
+        flash.arm_fault(SPIN_BUDGET);
+        written
     }
 
     /// A flash operation budget for the tests that guard against `set_blob` looping.
@@ -355,7 +396,14 @@ mod set {
         let largest = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE - 1).collect::<Vec<_>>();
         let one_byte_too_long = (u8::MIN..u8::MAX).cycle().take(MAX_BLOB_SIZE).collect::<Vec<_>>();
 
-        for prefill in [None, Some(WORST_CASE_FREE_ENTRIES)] {
+        // Zero and one free entry are the layouts where the active page cannot hold a chunk at all,
+        // so they exercise the other retire in `set_blob` rather than the chunk index one. Neither
+        // reaches its `FlashFull` bail-out - with 140 pages the reserve is nowhere near exhausted,
+        // so `Some(1)` retires once with the budget unspent and `Some(0)` finds no active page to
+        // retire at all. They are here because the boundary has to come out the same whichever
+        // retire the layout happens to hit, not as coverage of the bail-out; the tests below own
+        // that.
+        for prefill in [None, Some(0), Some(1), Some(WORST_CASE_FREE_ENTRIES)] {
             println!("largest blob with prefill {prefill:?}");
             let mut flash = common::Flash::new(PAGES);
             let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
@@ -582,6 +630,185 @@ mod set {
                 .unwrap(),
             retry
         );
+    }
+
+    /// A full partition with exactly one erased entry must report `FlashFull`, not spin.
+    ///
+    /// Once the reserve is down to one free page, `get_active_page` goes through `defragment`,
+    /// which copies the live entries of the page it reclaims into that reserve page and pushes the
+    /// erased source back into the reserve. The free page count is therefore invariant, and the
+    /// copy it hands back as the new active page has exactly as many free entries as the source had
+    /// erased ones. With exactly one erased entry that is one free entry - one short of the two a
+    /// blob chunk needs for its header and its first data entry - so the retire that follows
+    /// arrives at a state indistinguishable from the one before it, and did so forever: every turn
+    /// wrote a `Full` marker, erased a sector and copied 125 entries.
+    ///
+    /// This hung on v0.5.0, and a hang is the harmless reading of it. At roughly a thousand erases
+    /// per second it wears a sector past a typical 100k cycle NOR endurance in under a minute, so
+    /// the device does not recover by being power cycled.
+    ///
+    /// `FlashFull` is the right answer here rather than `ValueTooLong`: the blob is not too long
+    /// for anything. The condition is `free_entries <= 1` and never looks at the length, so a one
+    /// byte blob spins exactly like the largest one - it still needs a header entry and a data
+    /// entry.
+    #[test]
+    fn blob_on_a_full_partition_with_one_erased_entry_fails_instead_of_spinning() {
+        let mut flash = common::Flash::new(3);
+        let written = fill_partition(&mut flash, &Key::from_str("ns1"), 3, |_| vec![0]);
+        assert_eq!(written, 251, "the fill no longer fills the partition");
+        {
+            let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+            // `entries_per_page` has one entry per page the instance still tracks, in the page list
+            // plus the reserve, so a dropped page shows up as a missing one.
+            let pages_before = nvs.statistics().unwrap().entries_per_page.len();
+            let keys_before = nvs.keys().count();
+
+            assert_no_spin(
+                nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), [0u8; 64].as_slice()),
+                Error::FlashFull,
+            );
+
+            // `FlashFull` is an error the caller handles and carries on from, so the *same*
+            // instance has to come out of it intact. `get_active_page` pops the active page out of
+            // the page list, and a bail-out that forgot to hand it back dropped every live entry on
+            // it and leaked its sector out of both the page list and the reserve - invisible to a
+            // test that only looks after `Nvs::new` has rebuilt everything from flash.
+            assert_eq!(nvs.statistics().unwrap().entries_per_page.len(), pages_before);
+            assert_eq!(nvs.keys().count(), keys_before);
+            assert_eq!(
+                nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k00001")).unwrap(),
+                1
+            );
+            assert_eq!(
+                nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k00250")).unwrap(),
+                250
+            );
+        }
+
+        println!("re-open the partition");
+        // The bail-out happens after `mark_as_full` markers have been written, so the partition it
+        // leaves behind has to still be readable and writable.
+        flash.disable_faults();
+        let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob")),
+            Err(Error::KeyNotFound)
+        );
+        assert_eq!(
+            nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k00001")).unwrap(),
+            1
+        );
+        assert_eq!(
+            nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k00250")).unwrap(),
+            250
+        );
+
+        // Freeing enough entries has to make the very same write succeed again.
+        for i in 1..4u32 {
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str(&format!("k{i:05}")))
+                .unwrap();
+        }
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), [0u8; 64].as_slice())
+            .unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                .unwrap(),
+            vec![0u8; 64]
+        );
+    }
+
+    /// The number of erased entries decides whether the write can proceed, and every count has to
+    /// terminate.
+    ///
+    /// It is a sharp signature: the copy `defragment` hands back has one free entry per erased
+    /// entry on the page it reclaimed, and only *exactly one* leaves it one short of a chunk while
+    /// still handing back a page at all. Zero and two or more always terminated; one is the trigger
+    /// and is covered explicitly.
+    ///
+    /// Four is the first count that fits a 64 byte blob - a chunk header, two data entries and the
+    /// blob index - and it has to keep succeeding, which is what stops the guard from being an
+    /// unconditional `FlashFull`.
+    #[test]
+    fn blob_terminates_for_every_erased_entry_count() {
+        for pages in [3usize, 8] {
+            for erased in 0..=4usize {
+                for size in [64usize, MAX_BLOB_SIZE - 1] {
+                    println!("pages={pages} erased={erased} size={size}");
+
+                    let mut flash = common::Flash::new(pages);
+                    fill_partition(&mut flash, &Key::from_str("ns1"), pages, |_| (0..erased).collect());
+                    let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+                    let blob = (u8::MIN..u8::MAX).cycle().take(size).collect::<Vec<_>>();
+                    let result = nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), blob.as_slice());
+
+                    if erased == 4 && size == 64 {
+                        assert_eq!(result, Ok(()));
+                        assert_eq!(
+                            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("blob"))
+                                .unwrap(),
+                            blob
+                        );
+                    } else {
+                        assert_no_spin(result, Error::FlashFull);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The spin was not tied to a partition size, a blob size or where the erased entry sat.
+    ///
+    /// Every combination below hung before the guard: the loop never looks at any of them, it only
+    /// ever sees an active page it cannot use. The spread is here so a future change that makes the
+    /// guard depend on one of them fails rather than passing on the minimal case alone.
+    #[test]
+    fn blob_terminates_across_partition_and_blob_sizes() {
+        // 4001 straddles `MAX_BLOB_DATA_PER_PAGE`, so it is the smallest blob that needs a second
+        // chunk; 504_065 is the size that commit `4b2db32` made storable; 507_999 is the ceiling.
+        let sizes: &[usize] = &[64, 4000, 4001, 100_000, 504_065, MAX_BLOB_SIZE - 1];
+
+        for (pages, sizes) in [
+            (3usize, sizes),
+            (8, &sizes[..4]),
+            (20, &sizes[..2]),
+            (40, &sizes[..2]),
+            (128, &sizes[5..]),
+            (130, &sizes[..1]),
+        ] {
+            for size in sizes {
+                println!("pages={pages} size={size}");
+
+                let mut flash = common::Flash::new(pages);
+                fill_partition(&mut flash, &Key::from_str("ns1"), pages, |_| vec![0]);
+                let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+                let blob = (u8::MIN..u8::MAX).cycle().take(*size).collect::<Vec<_>>();
+                assert_no_spin(
+                    nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), blob.as_slice()),
+                    Error::FlashFull,
+                );
+            }
+        }
+
+        println!("the erased entry's position does not matter either");
+        for pages in [3usize, 8] {
+            for pick in [0usize, 1, 2] {
+                let mut flash = common::Flash::new(pages);
+                // First, middle and last of what was written, which puts the erased entry on the
+                // first page, somewhere in the middle and on the last one.
+                fill_partition(&mut flash, &Key::from_str("ns1"), pages, |written| {
+                    vec![[0, written / 2, written - 1][pick]]
+                });
+                let mut nvs = Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+                assert_no_spin(
+                    nvs.set(&Key::from_str("ns1"), &Key::from_str("blob"), [0u8; 64].as_slice()),
+                    Error::FlashFull,
+                );
+            }
+        }
     }
 
     #[test]

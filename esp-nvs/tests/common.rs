@@ -74,6 +74,15 @@ impl Flash {
         self.fail_after_operation = usize::MAX;
     }
 
+    /// Fails every operation past the next `budget` ones.
+    ///
+    /// Same mechanism as [`Flash::new_with_fault`], only counted from here rather than from the
+    /// first operation, so a test can set up a large partition and still hand the operation under
+    /// test a budget of its own.
+    pub fn arm_fault(&mut self, budget: usize) {
+        self.fail_after_operation = self.operations.len() + budget;
+    }
+
     pub fn erases(&mut self) -> usize {
         self.operations
             .iter()

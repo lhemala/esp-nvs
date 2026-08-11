@@ -540,7 +540,30 @@ where
         let version_base = new_version_offset.clone() as u8;
         let mut chunk_count = 0u8;
         let mut offset = 0usize;
-        // Whether a page was already retired for this chunk, see the skip below.
+        // Retiring the active page is the only move this loop can make without writing a chunk, so
+        // it is also the only one that can repeat forever. `get_active_page` does not only hand out
+        // fresh pages: once the reserve is down to one it goes through `defragment`, which copies a
+        // page's live entries into the reserve page and hands that back as the new active page,
+        // pushing the erased source back into the reserve. The free page count is invariant across
+        // that, and so is the copy's free entry count, so it can keep reproducing an unusable
+        // active page verbatim - each turn writing a `Full` marker, erasing a sector and copying up
+        // to 126 entries.
+        //
+        // Hence a budget of one retire per chunk. Every retire below is guarded by this flag and
+        // sets it; only a chunk that was actually written clears it again. Once the budget is
+        // spent, a branch that has a way to make progress takes it (the skip falls through to a
+        // partial write), and one that has none reports `FlashFull`.
+        //
+        // That bounds the loop. Every iteration either writes a chunk, retires a page, or returns;
+        // no two retires happen without a chunk written between them, so there are at most one more
+        // retire than there are chunks written. Each written chunk spends one of the
+        // `MAX_BLOB_CHUNK_COUNT` indices the guard below counts, which caps the chunks at 127, so
+        // the loop runs at most 2 * MAX_BLOB_CHUNK_COUNT + 1 times. The cap rests on `chunk_count`
+        // alone, not on a minimum `data_len` - the last chunk of a blob can be a single byte.
+        //
+        // Note what the bound does not rest on either: nothing about which page `get_active_page`
+        // hands back, how full it is, or what `defragment` does with the free page count. Reasoning
+        // about that is what produced this loop in the first place.
         let mut retired_a_page = false;
 
         while offset < data.len() {
@@ -564,7 +587,32 @@ where
 
             // Calculate how much data we can fit
             let free_entries = page.get_free_entry_count();
+
+            // A chunk needs at least two entries, one for its header and one for data, so a page
+            // with fewer has to be retired before anything can be written at all.
+            //
+            // With the retire budget already spent this is where the spin used to start: the page
+            // we get after retiring one is under no obligation to be a better one, and a
+            // defragmentation target reproduced verbatim never is. There is nothing left to try -
+            // the retire is this branch's only move and it has no partial write to fall back on -
+            // so report that the partition has no room for the chunk. The blob's own length is not
+            // at fault here, that is what the byte guard above and the chunk count guard below are
+            // for, which is why this is `FlashFull` rather than `ValueTooLong`. Nor does the
+            // condition look at the length: a one byte blob still needs a header entry and a data
+            // entry, so it spins on a page with one free entry exactly like the largest one does.
             if free_entries <= 1 {
+                if retired_a_page {
+                    // `get_active_page` popped this page out of `self.pages`, so bailing out
+                    // without handing it back would drop the live entries on it from this instance
+                    // and leak its sector out of both `pages` and `free_pages`, where `defragment`
+                    // can never reclaim it again. `FlashFull` is an error the caller is expected to
+                    // handle and carry on from, so the instance has to survive it intact. Pushing
+                    // an `Active` page back at the tail is the order `get_active_page` and
+                    // `ensure_active_page_order` expect.
+                    self.pages.push(page);
+                    return Err(Error::FlashFull);
+                }
+                retired_a_page = true;
                 page.mark_as_full::<T>(&mut self.hal)?;
                 self.pages.push(page);
                 continue;
@@ -580,11 +628,10 @@ where
             // target, and a fresh one makes every following chunk whole, which pins the accepted
             // size at `MAX_BLOB_SIZE - 1` for every layout.
             //
-            // Only retire once per chunk. `get_active_page` may go through `defragment`, which
-            // hands back a partially filled page that it can keep reproducing verbatim: retiring it
-            // again would spin forever, erasing a sector per turn. Falling through to the partial
-            // write instead always advances `offset`, so the loop terminates and the write ends in
-            // the `ValueTooLong`/`FlashFull` it reported before this skip existed.
+            // This branch spends the retire budget described at `retired_a_page`. Once it is spent
+            // the skip is off: falling through to the partial write always advances `offset`, so
+            // the write ends in the `ValueTooLong`/`FlashFull` it reported before this skip
+            // existed, rather than retiring a page per turn forever.
             //
             // The skip needs the remainder to exceed
             // `(MAX_BLOB_CHUNK_COUNT - 1) * MAX_BLOB_DATA_PER_PAGE`, which in practice only blobs
@@ -618,7 +665,18 @@ where
                     retired_a_page = false;
                     self.pages.push(page);
                 }
+                // Provably unreachable: `data_len <= (free_entries - 1) * size_of::<Item>()` gives
+                // `span <= free_entries`, which is exactly the check `write_variable_sized_item`
+                // reports `PageFull` from. The arm is kept as a backstop, and it spends the retire
+                // budget like every other retire so that the bound on the loop holds even if that
+                // stops being true.
                 Err(Error::PageFull) => {
+                    if retired_a_page {
+                        // See the same bail-out above: the page has to go back into `self.pages`.
+                        self.pages.push(page);
+                        return Err(Error::FlashFull);
+                    }
+                    retired_a_page = true;
                     page.mark_as_full::<T>(&mut self.hal)?;
                     self.pages.push(page);
                     continue;
