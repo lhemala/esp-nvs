@@ -129,6 +129,7 @@ where
         if item.type_ == ItemType::BlobIndex {
             let size = unsafe { item.data.blob_index.size };
 
+            // Checked before allocating: a corrupt size would otherwise ask for up to 4 GiB below.
             if size as usize > MAX_BLOB_SIZE {
                 return Err(Error::CorruptedData);
             }
@@ -136,17 +137,20 @@ where
             let chunk_count = unsafe { item.data.blob_index.chunk_count };
             let chunk_start = unsafe { item.data.blob_index.chunk_start };
 
+            // Both come straight from flash, so their sum can overflow on a corrupt index.
+            let chunk_end = chunk_start.checked_add(chunk_count).ok_or(Error::CorruptedData)?;
+
             let mut buf = vec![0u8; size as usize];
             let mut offset = 0usize;
 
-            for chunk in chunk_start..chunk_start + chunk_count {
-                // Bounds check before slicing
-                if offset >= buf.len() {
-                    return Err(Error::CorruptedData);
-                }
-
+            for chunk in chunk_start..chunk_end {
                 let (page_index, item_index, item) =
-                    self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
+                    match self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key) {
+                        // The index promises this chunk, so a missing one means the stored blob is
+                        // incomplete, not that the key was never written.
+                        Err(Error::KeyNotFound) => return Err(Error::CorruptedData),
+                        result => result?,
+                    };
 
                 if item.type_ != ItemType::BlobData {
                     return Err(ItemTypeMismatch(item.type_));
@@ -160,9 +164,20 @@ where
                     return Err(Error::CorruptedData);
                 }
 
-                let read_bytes = data.len().min(buf.len() - offset);
-                buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
-                offset += read_bytes;
+                // The chunks hold more data than the index claims, so index and chunks disagree.
+                // Copying only the part that still fits would silently return a truncated blob.
+                if offset + data.len() > buf.len() {
+                    return Err(Error::CorruptedData);
+                }
+
+                buf[offset..offset + data.len()].copy_from_slice(&data);
+                offset += data.len();
+            }
+
+            // The chunks hold less data than the index claims; the tail of `buf` would still be
+            // zero, which would silently return a zero padded blob.
+            if offset != buf.len() {
+                return Err(Error::CorruptedData);
             }
 
             Ok(buf)

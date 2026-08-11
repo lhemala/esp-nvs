@@ -259,11 +259,6 @@ fn corrupt_entry() {
     );
 }
 
-// TODO: when reading a multi-page-blob and the bounds don't match, mark the entry as corrupt
-
-// TODO: when reading a single-page-blob and the bounds don't match, mark the entry as corrupt
-// (covers str as well)
-
 // TODO: when a data CRC is invalid, mark the entry as corrupt instead of only reporting it.
 // The blob paths below do report `CorruptedData`, but the entry stays WRITTEN on flash, so every
 // later read fails again. The Sized/string path (`items.rs`, `get_string`) additionally reports
@@ -286,6 +281,10 @@ const ITEM_KEY_OFFSET: usize = 8;
 const ITEM_DATA_OFFSET: usize = 24;
 /// `ItemDataBlobIndex.size` is the first field of the 8 byte data union: a u32 little endian.
 const BLOB_INDEX_SIZE_OFFSET: usize = ITEM_DATA_OFFSET;
+/// `ItemDataBlobIndex.chunk_count` is a single byte following `size`.
+const BLOB_INDEX_CHUNK_COUNT_OFFSET: usize = ITEM_DATA_OFFSET + 4;
+/// `ItemDataBlobIndex.chunk_start` is a single byte following `chunk_count`.
+const BLOB_INDEX_CHUNK_START_OFFSET: usize = ITEM_DATA_OFFSET + 5;
 
 /// `EntryMapState::Written` as stored in the two-bit-per-entry entry state bitmap.
 const ENTRY_STATE_WRITTEN: u8 = 0b10;
@@ -337,17 +336,33 @@ fn find_item_entry(buf: &[u8], namespace_index: u8, type_byte: u8, key: &Key) ->
     None
 }
 
-/// Writes a multi-chunk blob into a fresh partition and returns the still-open NVS instance
+/// Writes a blob of `len` bytes into a fresh partition and returns the still-open NVS instance
 /// together with a handle on the raw partition image.
-fn multi_chunk_blob_partition(namespace: &Key, key: &Key) -> (esp_nvs::Nvs<common::SharedFlash>, common::SharedFlash) {
+fn blob_partition(namespace: &Key, key: &Key, len: usize) -> (esp_nvs::Nvs<common::SharedFlash>, common::SharedFlash) {
     let flash = common::SharedFlash::new(6);
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
 
     // 0xAB never collides with an item type byte, which keeps `find_item_entry` unambiguous.
-    let blob = vec![0xABu8; MAX_BLOB_DATA_PER_PAGE + 1000];
+    let blob = vec![0xABu8; len];
     nvs.set(namespace, key, blob.as_slice()).unwrap();
 
     (nvs, flash)
+}
+
+/// Writes a blob that spans more than one page, so its BLOB_IDX references several BLOB_DATA
+/// chunks.
+fn multi_chunk_blob_partition(namespace: &Key, key: &Key) -> (esp_nvs::Nvs<common::SharedFlash>, common::SharedFlash) {
+    blob_partition(namespace, key, MAX_BLOB_DATA_PER_PAGE + 1000)
+}
+
+/// Rewrites the `size` field of a live BLOB_IDX and repairs the entry CRC.
+fn patch_blob_index_size(flash: &common::SharedFlash, key: &Key, size: u32) {
+    flash.with_buf(|buf| {
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_BLOB_INDEX, key).unwrap();
+        let offset = index + BLOB_INDEX_SIZE_OFFSET;
+        buf[offset..offset + 4].copy_from_slice(&size.to_le_bytes());
+        fix_item_crc(buf, index);
+    });
 }
 
 #[test]
@@ -383,12 +398,7 @@ fn blob_index_with_oversized_length_is_reported_as_corrupted() {
     // Claim a blob larger than the partition format can ever hold. The corruption is applied
     // to a live instance on purpose: a rescan would notice that the BLOB_IDX no longer agrees
     // with the chunks on flash and drop the blob before it can be read.
-    flash.with_buf(|buf| {
-        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_BLOB_INDEX, &key).unwrap();
-        let size = index + BLOB_INDEX_SIZE_OFFSET;
-        buf[size..size + 4].copy_from_slice(&((MAX_BLOB_SIZE + 1) as u32).to_le_bytes());
-        fix_item_crc(buf, index);
-    });
+    patch_blob_index_size(&flash, &key, (MAX_BLOB_SIZE + 1) as u32);
 
     assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
 }
@@ -399,13 +409,95 @@ fn blob_index_shorter_than_its_chunks_is_reported_as_corrupted() {
     let key = Key::from_str("example_b_long");
     let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
 
-    // Shrink the recorded size so that the first chunk alone already fills the output buffer.
-    // Walking to the second chunk then runs past the buffer, which has to be rejected instead
-    // of silently returning a truncated blob.
+    // Shrink the recorded size so drastically that the first chunk alone already overshoots the
+    // output buffer, which has to be rejected instead of silently returning a truncated blob.
+    patch_blob_index_size(&flash, &key, 100);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_index_slightly_shorter_than_its_chunks_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let blob_len = MAX_BLOB_DATA_PER_PAGE + 1000;
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Shrink the recorded size by less than one chunk: the first chunk still fits, only the
+    // last one overshoots the buffer by a few bytes. Truncating that chunk to fit would return
+    // a blob that is neither what was written nor flagged as broken. Corrupting a live instance
+    // is required because a rescan would drop the blob for disagreeing with its chunks.
+    patch_blob_index_size(&flash, &key, (blob_len - 10) as u32);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_index_longer_than_its_chunks_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let blob_len = MAX_BLOB_DATA_PER_PAGE + 1000;
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Grow the recorded size beyond what the chunks hold. All chunks are read successfully but
+    // leave the tail of the output buffer untouched, which must not be returned as a blob that
+    // is silently zero padded. Again only reachable on a live instance.
+    patch_blob_index_size(&flash, &key, (blob_len + 100) as u32);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn single_page_blob_index_shorter_than_its_chunk_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    // Written by this test, not read from the asset partition.
+    let key = Key::from_str("local_b_single");
+    let (mut nvs, flash) = blob_partition(&namespace, &key, 1000);
+
+    // Same disagreement for a blob that fits into a single chunk: the one chunk holds more data
+    // than the index claims.
+    patch_blob_index_size(&flash, &key, 900);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_with_missing_chunk_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let blob_len = MAX_BLOB_DATA_PER_PAGE + 1000;
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Claim one chunk (holding the extra 100 bytes the grown size accounts for) more than was
+    // ever written. The chunks that do exist leave room in the buffer, so the missing one is
+    // actually looked up, which must not be reported as `KeyNotFound` because the key clearly
+    // exists. Only reachable on a live instance: at init the chunk count is compared against
+    // the chunks found on flash and a blob that disagrees is deleted outright.
     flash.with_buf(|buf| {
         let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_BLOB_INDEX, &key).unwrap();
         let size = index + BLOB_INDEX_SIZE_OFFSET;
-        buf[size..size + 4].copy_from_slice(&100u32.to_le_bytes());
+        buf[size..size + 4].copy_from_slice(&((blob_len + 100) as u32).to_le_bytes());
+        buf[index + BLOB_INDEX_CHUNK_COUNT_OFFSET] += 1;
+        fix_item_crc(buf, index);
+    });
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_index_with_overflowing_chunk_range_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // `chunk_start + chunk_count` are two raw flash bytes: 200 + 100 does not fit into the u8
+    // they are read back as. `size` is left alone so the blob passes the `MAX_BLOB_SIZE` guard
+    // and the overflowing range is really evaluated. Live instance again, since an index this
+    // far off its chunks would not survive a rescan.
+    flash.with_buf(|buf| {
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_BLOB_INDEX, &key).unwrap();
+        buf[index + BLOB_INDEX_CHUNK_START_OFFSET] = 200;
+        buf[index + BLOB_INDEX_CHUNK_COUNT_OFFSET] = 100;
         fix_item_crc(buf, index);
     });
 
