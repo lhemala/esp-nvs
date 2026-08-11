@@ -2245,6 +2245,199 @@ mod overwrite {
             blob_initial
         );
     }
+
+    /// The type a key held before says nothing about what may be written to it next, so every
+    /// combination has to end up with the new value under the key and the old item gone.
+    ///
+    /// Writing a blob over a key holding a string or a primitive used to return `Ok(())` and then
+    /// be unreadable: the old item was only deleted when the key had held a blob before, and
+    /// `load_item` returns the older of two items with the same key, so the leftover shadowed the
+    /// blob that had just been written. Writing a primitive over a longer item erased one entry
+    /// instead of the item's whole span, which left the tail of a string behind and orphaned a
+    /// blob's chunks.
+    #[test]
+    fn set_replaces_a_value_of_any_previous_type() {
+        // A blob long enough to span several chunks, so a stale index leaves chunks behind too.
+        let multi_chunk: Vec<u8> = (0u8..=255).cycle().take(9000).collect();
+
+        for from in Value::ALL {
+            for to in Value::ALL {
+                println!("{from:?} -> {to:?}");
+
+                let mut flash = common::Flash::new(8);
+                {
+                    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+                    from.write(&mut nvs, &multi_chunk);
+                    to.write(&mut nvs, &multi_chunk);
+
+                    to.assert_readable(&mut nvs, &multi_chunk, "before reopen");
+                    assert_eq!(
+                        nvs.keys().count(),
+                        1,
+                        "{from:?} -> {to:?}: the replaced item is still on flash"
+                    );
+                }
+
+                let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+                to.assert_readable(&mut nvs, &multi_chunk, "after reopen");
+                assert_eq!(
+                    nvs.keys().count(),
+                    1,
+                    "{from:?} -> {to:?}: the replaced item survived a reopen"
+                );
+            }
+        }
+    }
+
+    /// Replacing a multi-chunk blob with a primitive has to erase the chunks, not just the index.
+    /// Counting entries is what catches an orphan: the key reads back correctly either way, because
+    /// a stale chunk is only reachable through the index that is now gone.
+    ///
+    /// This is the direction that used to leak. `set_primitive` erased a single entry and knew
+    /// nothing about chunks, so replacing a three chunk blob left its 284 entries written forever.
+    #[test]
+    fn multi_chunk_blob_replaced_by_a_primitive_erases_its_chunks() {
+        let mut flash = common::Flash::new(8);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        let blob: Vec<u8> = (0u8..=255).cycle().take(9000).collect();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), blob.as_slice())
+            .unwrap();
+
+        // The blob splits into three chunks, each rounding its data up to whole entries, plus the
+        // namespace record and the blob index.
+        let before = nvs.statistics().unwrap().entries_overall;
+        assert_eq!(before.written, 287);
+        assert_eq!(before.erased, 0);
+
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), 42u8).unwrap();
+
+        // Only the namespace and the primitive are left written, everything else is erased.
+        let after = nvs.statistics().unwrap().entries_overall;
+        assert_eq!(after.written, 1 + 1, "the old chunks were not erased");
+        assert_eq!(after.erased, before.written - 1);
+
+        assert_eq!(nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k")).unwrap(), 42);
+    }
+
+    /// The same for a string, which spans several entries but has no chunks. `set_primitive` used
+    /// to erase one entry regardless of the item's span, leaving the string's data behind.
+    #[test]
+    fn string_replaced_by_a_primitive_erases_its_whole_span() {
+        let mut flash = common::Flash::new(4);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        // Long enough to need several data entries on top of its header.
+        let long = "x".repeat(200);
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), long.as_str())
+            .unwrap();
+
+        let before = nvs.statistics().unwrap().entries_overall;
+        assert_eq!(before.written, 1 + 1 + 201_u32.div_ceil(ITEM_SIZE as u32));
+
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("k"), 42u8).unwrap();
+
+        let after = nvs.statistics().unwrap().entries_overall;
+        assert_eq!(after.written, 1 + 1, "the string's data entries were not erased");
+        assert_eq!(after.erased, before.written - 1);
+    }
+
+    /// A fault while replacing a value of a different type must leave exactly one readable value.
+    /// The new value is written before the old one is erased, so whichever survives, the key is
+    /// never left holding neither.
+    #[test]
+    fn faulted_replacement_of_a_different_type_leaves_one_value() {
+        let multi_chunk: Vec<u8> = (0u8..=255).cycle().take(9000).collect();
+
+        for from in Value::ALL {
+            for to in Value::ALL {
+                // Sweep the fault across the whole sequence rather than guessing where the
+                // interesting point is. Faults landing in the first write are skipped: the key
+                // never held the old value, so there is nothing to preserve.
+                let mut checked = 0;
+                for fail_after in 0..700 {
+                    let mut flash = common::Flash::new_with_fault(8, fail_after);
+                    {
+                        let mut nvs = match esp_nvs::Nvs::new(0, flash.len(), &mut flash) {
+                            Ok(nvs) => nvs,
+                            Err(_) => continue,
+                        };
+                        if from.try_write(&mut nvs, &multi_chunk).is_err() {
+                            continue;
+                        }
+                        // Either outcome is fine, the faulted write may or may not have got there.
+                        let _ = to.try_write(&mut nvs, &multi_chunk);
+                    }
+                    flash.disable_faults();
+
+                    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+                    let old_ok = from.is_readable(&mut nvs, &multi_chunk);
+                    let new_ok = to.is_readable(&mut nvs, &multi_chunk);
+                    assert!(
+                        old_ok || new_ok,
+                        "{from:?} -> {to:?} faulted after {fail_after} operations: \
+                         the key holds neither value"
+                    );
+                    checked += 1;
+                }
+                assert!(checked > 0, "{from:?} -> {to:?}: no fault landed after the first write");
+            }
+        }
+    }
+
+    /// The four shapes a value can take on flash: a primitive, a string, a blob short enough for a
+    /// single chunk, and one that needs several.
+    #[derive(Clone, Copy, Debug)]
+    enum Value {
+        Primitive,
+        Str,
+        SingleChunkBlob,
+        MultiChunkBlob,
+    }
+
+    impl Value {
+        const ALL: [Value; 4] = [
+            Value::Primitive,
+            Value::Str,
+            Value::SingleChunkBlob,
+            Value::MultiChunkBlob,
+        ];
+
+        fn try_write(
+            self,
+            nvs: &mut esp_nvs::Nvs<&mut common::Flash>,
+            multi_chunk: &[u8],
+        ) -> Result<(), esp_nvs::error::Error> {
+            let ns = Key::from_str("ns1");
+            let key = Key::from_str("k");
+            match self {
+                Value::Primitive => nvs.set(&ns, &key, 42u8),
+                Value::Str => nvs.set(&ns, &key, "short string"),
+                Value::SingleChunkBlob => nvs.set(&ns, &key, [7u8; 64].as_slice()),
+                Value::MultiChunkBlob => nvs.set(&ns, &key, multi_chunk),
+            }
+        }
+
+        fn write(self, nvs: &mut esp_nvs::Nvs<&mut common::Flash>, multi_chunk: &[u8]) {
+            self.try_write(nvs, multi_chunk)
+                .unwrap_or_else(|e| panic!("writing {self:?} failed: {e:?}"));
+        }
+
+        fn is_readable(self, nvs: &mut esp_nvs::Nvs<&mut common::Flash>, multi_chunk: &[u8]) -> bool {
+            let ns = Key::from_str("ns1");
+            let key = Key::from_str("k");
+            match self {
+                Value::Primitive => nvs.get::<u8>(&ns, &key) == Ok(42),
+                Value::Str => nvs.get::<String>(&ns, &key).as_deref() == Ok("short string"),
+                Value::SingleChunkBlob => nvs.get::<Vec<u8>>(&ns, &key) == Ok(vec![7u8; 64]),
+                Value::MultiChunkBlob => nvs.get::<Vec<u8>>(&ns, &key) == Ok(multi_chunk.to_vec()),
+            }
+        }
+
+        fn assert_readable(self, nvs: &mut esp_nvs::Nvs<&mut common::Flash>, multi_chunk: &[u8], when: &str) {
+            assert!(self.is_readable(nvs, multi_chunk), "{self:?} did not read back {when}");
+        }
+    }
 }
 
 // TODO overwrite small blob with fail to erase

@@ -368,7 +368,7 @@ where
 
         let old_entry_location =
             if let Ok((page_index, item_index, item)) = self.load_item(namespace_index, ChunkIndex::Any, &key) {
-                if unsafe { item.data.raw } == raw_value {
+                if item.type_ == type_ && unsafe { item.data.raw } == raw_value {
                     #[cfg(feature = "debug-logs")]
                     println!("internal: set_primitive: entry already exists and matches");
                     return Ok(());
@@ -377,7 +377,15 @@ where
                 #[cfg(feature = "debug-logs")]
                 println!("internal: set_primitive: entry already exists and needs to be removed");
 
-                Some((page_index, item_index))
+                // The span and the type are taken from the item found here rather than assumed: the
+                // key may hold a string spanning several entries, or a blob index whose chunks have
+                // to go as well.
+                let old_blob_start = if item.type_ == ItemType::BlobIndex {
+                    Some(unsafe { VersionOffset::from(item.data.blob_index.chunk_start) })
+                } else {
+                    None
+                };
+                Some((page_index, item_index, item.span, old_blob_start))
             } else {
                 None
             };
@@ -399,13 +407,20 @@ where
         // just in case
         self.pages.push(page);
 
-        if let Some((page_index, item_index)) = old_entry_location {
+        // The old item is whatever the key held before, which is not necessarily another primitive.
+        // Erasing a single entry would leave the tail of a longer item behind, and erasing a blob
+        // index would orphan its chunks, so both the span and the chunks come from the item that
+        // was actually found.
+        if let Some((page_index, item_index, span, old_blob_start)) = old_entry_location {
             // page_index might only change on defragmentation when load_active_page()
             // is called after we got it
             let old_page = self.pages.get_mut(page_index.0).unwrap();
-            old_page.erase_item(&mut self.hal, item_index.0, 1)?;
+            old_page.erase_item(&mut self.hal, item_index.0, span)?;
             if self.purge {
-                old_page.purge_entries(&mut self.hal, item_index.0, 1)?;
+                old_page.purge_entries(&mut self.hal, item_index.0, span)?;
+            }
+            if let Some(chunk_start) = old_blob_start {
+                self.delete_blob_data(namespace_index, &key, chunk_start)?;
             }
         }
 
@@ -507,9 +522,13 @@ where
         let old_blob_version = self.find_existing_blob_version(namespace, &key);
 
         // Check if the value already exists and matches (only if namespace exists)
+        // `had_old_item` also covers a key that currently holds something other than a blob, which
+        // still has to be deleted once the new blob is written.
+        let mut had_old_item = false;
         let should_write = if let Some(&namespace_index) = self.namespaces.get(namespace) {
             match self.load_item(namespace_index, ChunkIndex::Any, &key) {
                 Ok((_page_index, _item_index, item)) => {
+                    had_old_item = true;
                     if item.type_ != ItemType::BlobIndex {
                         true // Type differs, need to write
                     } else {
@@ -705,11 +724,17 @@ where
         )?;
         self.pages.push(page);
 
-        // Now that the new blob version has been successfully written, delete the old version if it
-        // exists _old_version is unused since it will be the first one that is bound to be
-        // found anyway as newer pages appear later in self.pages
-        if let Some(_old_version) = old_blob_version {
-            self.delete_key(namespace_index, &key, ChunkIndex::BlobIndex)?;
+        // Now that the new blob version has been successfully written, delete whatever the key held
+        // before. That is gated on an item having been there at all rather than on a previous blob
+        // version: a key holding a string or a primitive has no blob version, and leaving that item
+        // in place used to shadow the blob just written, since `load_item` returns the older of the
+        // two. The write then reported success while the value could never be read back.
+        //
+        // Which item is deleted is not passed in, because it is bound to be the first one found
+        // anyway as newer pages appear later in self.pages. `ChunkIndex::Any` hashes the same as
+        // `ChunkIndex::BlobIndex`, so this finds an old blob index just as well as a foreign item.
+        if had_old_item {
+            self.delete_key(namespace_index, &key, ChunkIndex::Any)?;
         }
 
         Ok(())
