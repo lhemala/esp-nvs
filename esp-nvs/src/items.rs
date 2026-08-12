@@ -363,11 +363,23 @@ where
         raw_value[..width].copy_from_slice(&value.to_le_bytes()[..width]);
 
         let mut page = self.get_active_page()?;
-        let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
+        let namespace_index = match self.get_or_create_namespace(namespace, &mut page) {
+            Ok(namespace_index) => namespace_index,
+            Err(e) => {
+                // `get_active_page` popped the page out of `self.pages`, so returning without it
+                // would drop every live entry on it from this instance and leak its sector, where
+                // no defragmentation can reach it again.
+                self.pages.push(page);
+                return Err(e);
+            }
+        };
 
         // page might be full after creating a new namespace
         if page.is_full() {
-            page.mark_as_full(&mut self.hal)?;
+            let result = page.mark_as_full(&mut self.hal);
+            // Retired or not, the page belongs back in the list before another one is taken.
+            self.pages.push(page);
+            result?;
             page = self.get_active_page()?;
         }
 
@@ -484,18 +496,52 @@ where
 
         // Load active page for writing using ThinPage
         let mut page = self.get_active_page()?;
-        let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
+        let namespace_index = match self.get_or_create_namespace(namespace, &mut page) {
+            Ok(namespace_index) => namespace_index,
+            Err(e) => {
+                self.pages.push(page);
+                return Err(e);
+            }
+        };
 
         match page.write_variable_sized_item::<T>(&mut self.hal, namespace_index, key, ItemType::Sized, None, &buf) {
             Ok(_) => {}
             Err(Error::PageFull) => {
-                page.mark_as_full::<T>(&mut self.hal)?;
+                let retired = page.mark_as_full::<T>(&mut self.hal);
                 self.pages.push(page);
+                retired?;
 
                 page = self.get_active_page()?;
-                page.write_variable_sized_item::<T>(&mut self.hal, namespace_index, key, ItemType::Sized, None, &buf)?;
+                let written = page.write_variable_sized_item::<T>(
+                    &mut self.hal,
+                    namespace_index,
+                    key,
+                    ItemType::Sized,
+                    None,
+                    &buf,
+                );
+                self.pages.push(page);
+                match written {
+                    Ok(_) => {}
+                    // The page after a retire is not guaranteed to be a fresh one: with the reserve
+                    // down to one, `get_active_page` goes through `defragment`, which hands back a
+                    // partially filled copy. `PageFull` is an internal signal for "try another
+                    // page", and there is no other page to try, so the partition has no room for
+                    // this value. Reporting it verbatim leaked an error documented as internal.
+                    Err(Error::PageFull) => return Err(Error::FlashFull),
+                    Err(e) => return Err(e),
+                }
+
+                // The page is already back in the list, so skip the push below.
+                if let Some((_page_index, _item_index)) = old_entry_location {
+                    self.delete_key(namespace_index, &key, ChunkIndex::Any)?;
+                }
+                return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.pages.push(page);
+                return Err(e);
+            }
         }
 
         self.pages.push(page);

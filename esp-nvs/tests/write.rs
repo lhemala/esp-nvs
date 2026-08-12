@@ -27,6 +27,85 @@ mod set {
 
     // TODO: test for writing namespace fails + cleanup
 
+    /// `PageFull` is an internal "try another page" signal, documented as such on the error type. A
+    /// caller must never see it: once there is no other page to try, the honest answer is that the
+    /// partition is out of room.
+    ///
+    /// It escaped when the retry page could not hold the value either, which is reachable because
+    /// the page after a retire is not guaranteed to be a fresh one - with the reserve down to a
+    /// single free page, `get_active_page` goes through defragmentation and hands back a partially
+    /// filled copy.
+    #[test]
+    fn a_string_that_no_longer_fits_reports_flash_full_not_page_full() {
+        let mut flash = common::Flash::new(3);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        // Ten entry strings, so the partition runs out part way through a page rather than exactly
+        // at a boundary.
+        let value = "x".repeat(9 * ITEM_SIZE);
+        let mut written = 0;
+        let mut outcome = None;
+        for i in 0u32..1000 {
+            match nvs.set(
+                &Key::from_str("ns1"),
+                &Key::from_str(&format!("s{i:03}")),
+                value.as_str(),
+            ) {
+                Ok(()) => written += 1,
+                Err(e) => {
+                    outcome = Some(e);
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            written > 0,
+            "nothing was stored, the partition is too small to be meaningful"
+        );
+        assert_eq!(outcome, Some(Error::FlashFull), "an internal signal reached the caller");
+
+        // The failed write leaves the instance intact rather than dropping the page it was holding.
+        assert_eq!(nvs.keys().count(), written);
+        for i in 0..written {
+            assert_eq!(
+                nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str(&format!("s{i:03}")))
+                    .unwrap(),
+                value
+            );
+        }
+    }
+
+    /// Creating a namespace can fill the page it lands on, which sends the write to the next one.
+    /// The page left behind still holds live entries and has been popped out of the page list, so
+    /// it has to be put back: dropping it took every key on it out of the running instance and
+    /// leaked the sector, since neither the page list nor the reserve knows about it any more.
+    #[test]
+    fn a_namespace_that_fills_its_page_does_not_drop_it() {
+        let mut flash = common::Flash::new(4);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+        // One entry left on page 0, which the new namespace's record takes.
+        fill_active_page(&mut nvs, &Key::from_str("ns1"), 1);
+        let filled = nvs.keys().count();
+        let pages = nvs.statistics().unwrap().entries_per_page.len();
+
+        nvs.set(&Key::from_str("ns2"), &Key::from_str("k"), 42u8).unwrap();
+
+        assert_eq!(
+            nvs.statistics().unwrap().entries_per_page.len(),
+            pages,
+            "a page went missing from the instance"
+        );
+        assert_eq!(nvs.keys().count(), filled + 1, "the filled page's keys are gone");
+        assert_eq!(nvs.get::<u8>(&Key::from_str("ns2"), &Key::from_str("k")).unwrap(), 42);
+        assert_eq!(
+            nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("filler000"))
+                .unwrap(),
+            0
+        );
+    }
+
     /// A string is stored as one item on one page, with a null terminator appended, so the longest
     /// one that fits is `MAX_BLOB_DATA_PER_PAGE - 1` bytes. Unlike a blob it is never split into
     /// chunks, so there is no growing the partition out of this: one byte more is rejected however
