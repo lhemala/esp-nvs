@@ -286,6 +286,11 @@ const BLOB_INDEX_CHUNK_COUNT_OFFSET: usize = ITEM_DATA_OFFSET + 4;
 /// `ItemDataBlobIndex.chunk_start` is a single byte following `chunk_count`.
 const BLOB_INDEX_CHUNK_START_OFFSET: usize = ITEM_DATA_OFFSET + 5;
 
+/// `ItemDataSized` is `{ size: u16, _reserved: u16, crc: u32 }`, laid out over the 8 byte data
+/// union.
+const SIZED_SIZE_OFFSET: usize = ITEM_DATA_OFFSET;
+const SIZED_CRC_OFFSET: usize = ITEM_DATA_OFFSET + 4;
+
 /// `EntryMapState::Written` as stored in the two-bit-per-entry entry state bitmap.
 const ENTRY_STATE_WRITTEN: u8 = 0b10;
 
@@ -527,5 +532,65 @@ fn legacy_single_page_blob_with_corrupt_data_is_reported_as_corrupted() {
     assert_eq!(
         nvs.get::<Vec<u8>>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
         Err(Error::CorruptedData)
+    );
+}
+
+/// A stored string always carries a null terminator, so a `size` of zero is corrupt. Reading one
+/// used to panic rather than report it: `data.len() - 1` underflows, which traps in debug and wraps
+/// to `usize::MAX` in release, where the slice panics instead. There is no build profile where it
+/// degrades gracefully, and for a `no_std` library on a device a panic is a reboot.
+///
+/// The data CRC is repaired alongside the size so the check above it passes and the read actually
+/// reaches the slice, rather than bailing out early and passing for the wrong reason.
+#[test]
+fn string_with_a_zero_size_is_reported_as_corrupted() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        TYPE_SIZED,
+        &Key::from_str("example_s_short"),
+    )
+    .unwrap();
+
+    let size_at = entry + SIZED_SIZE_OFFSET;
+    flash.buf[size_at..size_at + 2].copy_from_slice(&0u16.to_le_bytes());
+
+    // The CRC of the now empty payload, so `get_string`'s data check passes.
+    let crc_at = entry + SIZED_CRC_OFFSET;
+    let empty_crc = esp_nvs::platform::software_crc32(u32::MAX, &[]);
+    flash.buf[crc_at..crc_at + 4].copy_from_slice(&empty_crc.to_le_bytes());
+
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
+        Err(Error::CorruptedData)
+    );
+}
+
+/// The guard above must not reject a legitimately empty string, which is stored as its lone null
+/// terminator and so has a `size` of one rather than zero.
+#[test]
+fn empty_string_roundtrips() {
+    let mut flash = common::Flash::new(2);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    nvs.set(&Key::from_str("ns1"), &Key::from_str("empty"), "").unwrap();
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("empty"))
+            .unwrap(),
+        ""
+    );
+
+    drop(nvs);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("empty"))
+            .unwrap(),
+        ""
     );
 }

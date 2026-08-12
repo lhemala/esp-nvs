@@ -105,6 +105,14 @@ where
             return Err(Error::KeyNotFound);
         }
 
+        // A stored string always carries its null terminator, so an empty payload means the size on
+        // flash is corrupt. Without this the slice below underflows: a panic in debug, and in
+        // release a wrapped `usize::MAX` length that panics on the slice instead. Neither is
+        // something a `get` should do to the caller.
+        if data.is_empty() {
+            return Err(Error::CorruptedData);
+        }
+
         let str = core::str::from_utf8(&data[..data.len() - 1]).map_err(|_| Error::CorruptedData)?; // we don't want the null terminator
         Ok(str.to_string())
     }
