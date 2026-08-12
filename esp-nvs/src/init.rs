@@ -30,6 +30,7 @@ use crate::platform::Platform;
 #[cfg(feature = "debug-logs")]
 use crate::raw::slice_with_nullbytes_to_str;
 use crate::raw::{
+    ENTRIES_PER_PAGE,
     EntryMapState,
     FLASH_SECTOR_SIZE,
     ItemType,
@@ -167,6 +168,17 @@ where
         let mut item_iter = unsafe { items.entries.iter().zip(u8::MIN..u8::MAX) };
         'item_iter: while let Some((item, item_index)) = item_iter.next() {
             let state = page.get_entry_state(item_index);
+
+            // `span` is an unvalidated u8 straight from flash, and everything below uses it to walk
+            // entries, mark ranges of the entry map and add to the page's u8 entry counters. All of
+            // that assumes the span's entries are on this page. A span of zero, or one reaching
+            // past the last entry, is corrupt and has to be recognised before it is
+            // trusted: summing it into `used_entry_count` overflowed, which is a panic
+            // in debug and a wrong count in release, and it happens during `Nvs::new`,
+            // so a single bad byte took the partition down at startup before anything
+            // could be read.
+            let span_fits_page = item.span >= 1 && item_index as usize + item.span as usize <= ENTRIES_PER_PAGE;
+
             match state {
                 EntryMapState::Illegal => {
                     page.erased_entry_count += 1;
@@ -179,7 +191,7 @@ where
                 EntryMapState::Empty => {
                     // maybe data was written but the map was not updated yet
                     let calculated_crc = item.calculate_crc32(T::crc32);
-                    if item.crc == calculated_crc && item.type_ != ItemType::Any && item.span != u8::MAX {
+                    if item.crc == calculated_crc && item.type_ != ItemType::Any && span_fits_page {
                         match item.type_ {
                             ItemType::U8
                             | ItemType::I8
@@ -232,6 +244,15 @@ where
                     }
                 }
                 EntryMapState::Written => {
+                    // A span that cannot fit the page makes the item unusable: its data is not
+                    // where the header says it is, and no range covering it can be marked. Count
+                    // the header's own entry as unusable, the way an illegal entry is counted, and
+                    // leave the rest of the page to be scanned normally.
+                    if !span_fits_page {
+                        page.erased_entry_count += 1;
+                        continue 'item_iter;
+                    }
+
                     let calculated_crc = item.calculate_crc32(T::crc32);
                     if item.crc != calculated_crc {
                         #[cfg(feature = "debug-logs")]
@@ -239,12 +260,14 @@ where
                             "CRC mismatch for item '{}', marking as erased",
                             slice_with_nullbytes_to_str(&item.key.0)
                         );
-                        page.set_entry_state_range(
-                            &mut self.hal,
-                            item_index..(item_index + item.span),
-                            EntryMapState::Erased,
-                        )?;
-                        page.erased_entry_count += item.span;
+                        // The span was read from a header whose CRC just failed, so it says nothing
+                        // trustworthy about how many entries this item covers. Erasing a range on
+                        // its word takes out whatever happens to follow, valid items included.
+                        // Erase the header alone: the entries behind it are scanned like any other
+                        // and reach this same check one at a time, which ends in the same place for
+                        // a genuinely half written item without reaching past it.
+                        page.set_entry_state_range(&mut self.hal, item_index..(item_index + 1), EntryMapState::Erased)?;
+                        page.erased_entry_count += 1;
                         continue 'item_iter;
                     }
                     page.used_entry_count += item.span;

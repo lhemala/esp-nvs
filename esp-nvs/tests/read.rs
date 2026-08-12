@@ -633,6 +633,60 @@ fn item_with_a_span_past_the_page_end_is_reported_as_corrupted() {
     assert_eq!(nvs.get::<String>(&namespace, &key), Err(Error::CorruptedData));
 }
 
+/// A span that cannot fit the page must not take the partition down while it is being scanned.
+///
+/// `span` is an unvalidated u8 from flash and the scan adds it to the page's `used_entry_count`,
+/// which is a u8: 255 overflowed it, panicking in debug and leaving a wrong count in release. It
+/// happened inside `Nvs::new`, so one corrupt byte was enough to make opening the partition fail
+/// before anything could be read - and on a device that is a panic at boot.
+///
+/// The rest of the partition has to survive, which is the point of scanning defensively at all.
+#[test]
+fn item_with_an_impossible_span_does_not_break_startup() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        TYPE_SIZED,
+        &Key::from_str("example_s_short"),
+    )
+    .unwrap();
+
+    // Byte 2 of the header is `span`. The CRC is repaired so the item is not simply rejected as a
+    // bad entry before its span is ever looked at.
+    flash.buf[entry + 2] = u8::MAX;
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    // The item itself is unusable, but everything else on the partition still reads.
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
+        Err(Error::KeyNotFound)
+    );
+    assert_eq!(
+        nvs.get::<u8>(&Key::from_str("namespace_one"), &Key::from_str("example_u8"))
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_long"))
+            .unwrap(),
+        "long string spanning multiple entries whereas each entry is 32 bytes in total"
+    );
+    assert_eq!(
+        nvs.get::<Vec<u8>>(&Key::from_str("namespace_one"), &Key::from_str("example_b_long"))
+            .unwrap(),
+        std::fs::read("tests/assets/multi_page_blob.bin").unwrap()
+    );
+    assert_eq!(
+        nvs.get::<u8>(&Key::from_str("namespace_two"), &Key::from_str("only_in_two"))
+            .unwrap(),
+        1
+    );
+}
+
 /// The guard above must not reject a legitimately empty string, which is stored as its lone null
 /// terminator and so has a `size` of one rather than zero.
 #[test]
