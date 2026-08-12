@@ -310,7 +310,25 @@ impl ThinPage {
             _ => return Err(ItemTypeMismatch(item.type_)),
         }
 
+        // `span` and `size` both come from flash and the read below is relative to this page, so
+        // neither can be trusted to stay inside it. `size` is a u16, which reaches far past a
+        // 4k page on its own. Reading past the page would splice whatever follows it into the
+        // returned value - on the far side of the partition that is unrelated flash, and past its
+        // end it is out of bounds entirely.
+        //
+        // An item's data lives in the entries its span covers, minus the one holding the header, so
+        // that is the tightest bound available here. It is checked before the read rather than left
+        // to the data CRC afterwards, which cannot prevent a read that has already happened.
+        let data_entries = (item.span as usize).checked_sub(1).ok_or(Error::CorruptedData)?;
+        if item_index as usize + item.span as usize > ENTRIES_PER_PAGE {
+            return Err(Error::CorruptedData);
+        }
+
         let size = unsafe { item.data.sized.size } as usize;
+        if size > data_entries * size_of::<Item>() {
+            return Err(Error::CorruptedData);
+        }
+
         let aligned_size = T::align_read(size);
 
         let mut buf = Vec::with_capacity(aligned_size);

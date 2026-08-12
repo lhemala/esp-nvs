@@ -572,6 +572,67 @@ fn string_with_a_zero_size_is_reported_as_corrupted() {
     );
 }
 
+/// A `size` larger than the entries the item's span reserves is corrupt, and must be caught before
+/// the read rather than by the data CRC afterwards.
+///
+/// `size` is a u16, so it reaches far beyond a 4k page. The read is relative to the page, so it
+/// used to run off the end of it: on hardware that splices unrelated flash into the returned value,
+/// and past the end of the partition it is out of bounds entirely - in the test double, a slice
+/// panic. The data CRC cannot help, since it is only checked once the read has already happened.
+#[test]
+fn string_with_a_size_past_its_span_is_reported_as_corrupted() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        TYPE_SIZED,
+        &Key::from_str("example_s_short"),
+    )
+    .unwrap();
+
+    // Far past the page, and past the end of the four page partition as well.
+    let size_at = entry + SIZED_SIZE_OFFSET;
+    flash.buf[size_at..size_at + 2].copy_from_slice(&60_000u16.to_le_bytes());
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
+        Err(Error::CorruptedData)
+    );
+}
+
+/// The same for a span reaching past the last entry of the page. `span` is a u8 taken from flash,
+/// so it can claim more entries than a page has.
+///
+/// The corruption is applied to a live `Nvs` rather than to the image, because a span this large
+/// panics `Nvs::new` itself: it is summed into a u8 entry count during the initial scan. That is a
+/// separate defect on the init path and is tracked separately; here the read path is what is under
+/// test, and it re-reads the item from flash on every call.
+#[test]
+fn item_with_a_span_past_the_page_end_is_reported_as_corrupted() {
+    let namespace = Key::from_str("ns1");
+    let key = Key::from_str("s");
+
+    let flash = common::SharedFlash::new(4);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    nvs.set(&namespace, &key, "a string long enough to span a few entries")
+        .unwrap();
+
+    flash.with_buf(|buf| {
+        let entry = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_SIZED, &key).unwrap();
+        // Byte 2 of the header is `span`; 255 entries cannot fit in a 126 entry page.
+        buf[entry + 2] = u8::MAX;
+        let size_at = entry + SIZED_SIZE_OFFSET;
+        buf[size_at..size_at + 2].copy_from_slice(&8_000u16.to_le_bytes());
+        fix_item_crc(buf, entry);
+    });
+
+    assert_eq!(nvs.get::<String>(&namespace, &key), Err(Error::CorruptedData));
+}
+
 /// The guard above must not reject a legitimately empty string, which is stored as its lone null
 /// terminator and so has a `size` of one rather than zero.
 #[test]
