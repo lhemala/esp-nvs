@@ -26,6 +26,39 @@ pub const ENTRY_STATE_MAP_ENTRY_SIZE: usize = 1;
 pub const ITEM_OFFSET: usize = PAGE_HEADER_SIZE + ENTRY_STATE_MAP_SIZE;
 // 1 byte is the minimum that can be written
 
+// Byte offsets within a 32 byte entry, mirroring `raw::Item`:
+// namespace_index(1) type_(1) span(1) chunk_index(1) crc(4) key(16) data(8).
+pub const ITEM_CRC_OFFSET: usize = 4;
+pub const ITEM_KEY_OFFSET: usize = 8;
+pub const ITEM_DATA_OFFSET: usize = 24;
+
+/// `EntryMapState::Written` as stored in the two-bit-per-entry entry state bitmap.
+pub const ENTRY_STATE_WRITTEN: u8 = 0b10;
+
+/// Reads an entry's two-bit state out of its page's entry state bitmap.
+pub fn entry_state(buf: &[u8], page_start: usize, entry: usize) -> u8 {
+    let byte = buf[page_start + ENTRY_STATE_MAP_OFFSET + entry / 4];
+    (byte >> ((entry % 4) * 2)) & 0b11
+}
+
+/// Recomputes the CRC an item header stores in bytes 4..8: it covers the first four header bytes,
+/// the 16 byte key and the 8 byte data union, but not the CRC itself.
+///
+/// This is also what tells an item header apart from a payload entry, which carries no CRC of its
+/// own and so is very unlikely to match: without it, a raw data byte that happens to look like an
+/// item type is picked up as an item.
+pub fn item_crc(entry: &[u8]) -> u32 {
+    let crc = esp_nvs::platform::software_crc32(u32::MAX, &entry[0..ITEM_CRC_OFFSET]);
+    let crc = esp_nvs::platform::software_crc32(crc, &entry[ITEM_KEY_OFFSET..ITEM_DATA_OFFSET]);
+    esp_nvs::platform::software_crc32(crc, &entry[ITEM_DATA_OFFSET..esp_nvs::ITEM_SIZE])
+}
+
+/// Whether the entry at `offset` is a real item header rather than a payload entry.
+pub fn is_item_header(buf: &[u8], offset: usize) -> bool {
+    let entry = &buf[offset..offset + esp_nvs::ITEM_SIZE];
+    u32::from_le_bytes(entry[ITEM_CRC_OFFSET..ITEM_KEY_OFFSET].try_into().unwrap()) == item_crc(entry)
+}
+
 #[derive(Default)]
 pub struct Flash {
     pub buf: Vec<u8>,

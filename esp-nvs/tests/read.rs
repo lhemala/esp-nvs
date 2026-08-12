@@ -11,7 +11,6 @@ use esp_nvs::{
     MAX_BLOB_DATA_PER_PAGE,
     MAX_BLOB_SIZE,
     NvsStatistics,
-    PAGE_HEADER_SIZE,
     PageStatistics,
 };
 use pretty_assertions::assert_eq;
@@ -274,11 +273,16 @@ const TYPE_BLOB_LEGACY: u8 = 0x41;
 const TYPE_BLOB_DATA: u8 = 0x42;
 const TYPE_BLOB_INDEX: u8 = 0x48;
 
-// Byte offsets within a 32 byte entry, mirroring `raw::Item`:
-// namespace_index(1) type_(1) span(1) chunk_index(1) crc(4) key(16) data(8).
-const ITEM_CRC_OFFSET: usize = 4;
-const ITEM_KEY_OFFSET: usize = 8;
-const ITEM_DATA_OFFSET: usize = 24;
+// The item layout constants, the entry state helper and the item CRC live in `common` so the write
+// tests can use them too.
+use common::{
+    ENTRY_STATE_WRITTEN,
+    ITEM_CRC_OFFSET,
+    ITEM_DATA_OFFSET,
+    ITEM_KEY_OFFSET,
+    entry_state,
+    item_crc,
+};
 /// `ItemDataBlobIndex.size` is the first field of the 8 byte data union: a u32 little endian.
 const BLOB_INDEX_SIZE_OFFSET: usize = ITEM_DATA_OFFSET;
 /// `ItemDataBlobIndex.chunk_count` is a single byte following `size`.
@@ -290,23 +294,6 @@ const BLOB_INDEX_CHUNK_START_OFFSET: usize = ITEM_DATA_OFFSET + 5;
 /// union.
 const SIZED_SIZE_OFFSET: usize = ITEM_DATA_OFFSET;
 const SIZED_CRC_OFFSET: usize = ITEM_DATA_OFFSET + 4;
-
-/// `EntryMapState::Written` as stored in the two-bit-per-entry entry state bitmap.
-const ENTRY_STATE_WRITTEN: u8 = 0b10;
-
-/// Reads an entry's two-bit state out of its page's entry state bitmap.
-fn entry_state(buf: &[u8], page_start: usize, entry: usize) -> u8 {
-    let byte = buf[page_start + PAGE_HEADER_SIZE + entry / 4];
-    (byte >> ((entry % 4) * 2)) & 0b11
-}
-
-/// Recomputes the CRC an [`esp_nvs`] item header stores in bytes 4..8: it covers the first
-/// four header bytes, the 16 byte key and the 8 byte data union, but not the CRC itself.
-fn item_crc(entry: &[u8]) -> u32 {
-    let mut crc = esp_nvs::platform::software_crc32(u32::MAX, &entry[0..ITEM_CRC_OFFSET]);
-    crc = esp_nvs::platform::software_crc32(crc, &entry[ITEM_KEY_OFFSET..ITEM_DATA_OFFSET]);
-    esp_nvs::platform::software_crc32(crc, &entry[ITEM_DATA_OFFSET..ITEM_SIZE])
-}
 
 /// Repairs the entry CRC after a field of the item header was modified. Without this the item
 /// would be rejected as a bad entry before the code under test ever sees it.

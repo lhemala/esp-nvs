@@ -3274,3 +3274,101 @@ mod purge {
         assert_eq!(nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k")).unwrap(), 1);
     }
 }
+
+/// A blob version owns one half of the chunk index space, picked by the `chunk_start` recorded in
+/// its index: 0x00 or 0x80. Successive versions have to take turns, because the old version's
+/// chunks are only deleted once the new index has been written - if a new version reused the base
+/// its chunks would be written over the indices the old ones still occupy, and a crash in between
+/// would leave a blob assembled from both.
+mod blob_versions {
+    use esp_nvs::{
+        ENTRIES_PER_PAGE,
+        FLASH_SECTOR_SIZE,
+        ITEM_SIZE,
+        Key,
+    };
+    use pretty_assertions::assert_eq;
+
+    use crate::common;
+
+    const TYPE_BLOB_INDEX: u8 = 0x48;
+    /// `ItemDataBlobIndex` is `{ size: u32, chunk_count: u8, chunk_start: u8 }` over the data
+    /// union.
+    const BLOB_INDEX_CHUNK_START_OFFSET: usize = common::ITEM_DATA_OFFSET + 5;
+
+    /// The `chunk_start` of every live blob index on flash.
+    ///
+    /// Both filters matter. Without the entry state check an erased index from a previous version
+    /// is picked up alongside the live one, and without the item CRC check a blob payload byte
+    /// that happens to sit where a type byte would go is mistaken for an index - which is
+    /// exactly what this returned before the CRC check was added, a `chunk_start` of 100.
+    fn live_blob_index_chunk_starts(buf: &[u8]) -> Vec<u8> {
+        let mut found = vec![];
+        for page_start in (0..buf.len()).step_by(FLASH_SECTOR_SIZE) {
+            for entry in 0..ENTRIES_PER_PAGE {
+                if common::entry_state(buf, page_start, entry) != common::ENTRY_STATE_WRITTEN {
+                    continue;
+                }
+                let offset = page_start + common::ITEM_OFFSET + entry * ITEM_SIZE;
+                if buf[offset + 1] == TYPE_BLOB_INDEX && common::is_item_header(buf, offset) {
+                    found.push(buf[offset + BLOB_INDEX_CHUNK_START_OFFSET]);
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn successive_blob_versions_alternate_their_chunk_base() {
+        let mut flash = common::Flash::new(8);
+
+        // Large enough to need several chunks, so the base is what keeps the two versions apart
+        // rather than there being room for both at different indices anyway.
+        let versions: Vec<Vec<u8>> = (0u8..6).map(|i| (i..=255).cycle().take(9000).collect()).collect();
+
+        let mut seen = vec![];
+        for (i, value) in versions.iter().enumerate() {
+            {
+                let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+                nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), value.as_slice())
+                    .unwrap();
+                assert_eq!(
+                    nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("b")).unwrap(),
+                    *value,
+                    "version {i} did not read back"
+                );
+            }
+
+            let starts = live_blob_index_chunk_starts(&flash.buf);
+            assert_eq!(
+                starts.len(),
+                1,
+                "version {i}: expected exactly one live blob index, got {starts:?}"
+            );
+            seen.push(starts[0]);
+        }
+
+        // The first version starts at 0x00 and every one after it flips.
+        assert_eq!(seen, vec![0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
+    }
+
+    /// A blob written fresh after its predecessor was deleted starts over at the first base, since
+    /// there is no live version left to differ from.
+    #[test]
+    fn a_blob_written_after_a_delete_starts_at_the_first_base() {
+        let mut flash = common::Flash::new(8);
+        let payload: Vec<u8> = (0u8..=255).cycle().take(9000).collect();
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), payload.as_slice())
+            .unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), payload.as_slice())
+            .unwrap();
+        nvs.delete(&Key::from_str("ns1"), &Key::from_str("b")).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), payload.as_slice())
+            .unwrap();
+        drop(nvs);
+
+        assert_eq!(live_blob_index_chunk_starts(&flash.buf), vec![0x00]);
+    }
+}
