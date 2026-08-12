@@ -272,6 +272,23 @@ where
     }
 
     /// Try to find and reclaim pages that can be recycled
+    /// Reclaims one page, chosen by erased entries weighted against age so that old pages are
+    /// recycled too and the wear spreads.
+    ///
+    /// `Ok(())` does not mean the caller is better off than before, and no caller may assume it
+    /// does. Reclaiming a page moves its live entries into the reserve page and pushes the erased
+    /// source back, so the free page count is the same afterwards, and the copy has exactly as many
+    /// free entries as the source had. Handed a page with a single erased entry, this reproduces an
+    /// equally unusable page indefinitely, one sector erase per call.
+    ///
+    /// Two loops in `set_blob` were written on the assumption that a successful call means
+    /// progress, and both spun forever, wearing a sector out in under a minute. A caller that
+    /// retries after this has to carry its own proof of progress - `set_blob` counts retires
+    /// against the chunks it has written. Making the progress observable here instead would
+    /// suit callers better, but note that simply refusing to reclaim a page with no erased
+    /// entries is not the answer: that copy is the only way the unused tail of a prematurely
+    /// retired page ever becomes reachable again, and removing it costs writes that currently
+    /// succeed.
     pub(crate) fn defragment(&mut self) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("defragment");
