@@ -3086,6 +3086,87 @@ mod purge {
         );
     }
 
+    /// A blob whose chunks are spread over several pages has to be scrubbed in full. The
+    /// single-page test above cannot tell whether the sweep reaches past the page holding the blob
+    /// index, and a chunk left behind on another page is exactly what purge mode exists to prevent.
+    ///
+    /// The payload is checked by searching the whole partition for it rather than by naming entry
+    /// offsets, since the chunks do not sit at a fixed place once they cross a page boundary.
+    #[test]
+    fn continuous_purge_zeroes_a_multi_page_blob() {
+        // A pattern that does not occur in a page header, an entry state bitmap or an item header,
+        // so finding it anywhere means finding blob payload.
+        let payload: Vec<u8> = [0xA5u8, 0x5A].iter().copied().cycle().take(9000).collect();
+
+        let mut flash = common::Flash::new(8);
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set_purge_mode(true);
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("secret"), payload.as_slice())
+                .unwrap();
+
+            // The blob really does span pages, otherwise this repeats the test above.
+            let per_page = &nvs.statistics().unwrap().entries_per_page;
+            let pages_with_data = per_page.iter().filter(|p| p.written > 0).count();
+            assert!(
+                pages_with_data >= 3,
+                "expected the blob to span pages, got {pages_with_data}"
+            );
+        }
+
+        assert!(
+            contains(&flash.buf, &payload[..64]),
+            "the payload should be on flash before it is deleted"
+        );
+
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set_purge_mode(true);
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("secret")).unwrap();
+        }
+
+        // Not one chunk of it is left anywhere in the partition, on any page.
+        assert!(
+            !contains(&flash.buf, &payload[..64]),
+            "a chunk of the purged blob is still on flash"
+        );
+        // Nor a single entry's worth of it, which a partial sweep would leave.
+        assert!(!contains(&flash.buf, &payload[..ITEM_SIZE]));
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("secret"))
+                .err()
+                .unwrap(),
+            KeyNotFound
+        );
+    }
+
+    /// The counterpart, so the search above is known to be capable of finding something: without
+    /// purge mode the payload stays on flash after the delete.
+    #[test]
+    fn default_mode_leaves_a_multi_page_blob_in_flash() {
+        let payload: Vec<u8> = [0xA5u8, 0x5A].iter().copied().cycle().take(9000).collect();
+
+        let mut flash = common::Flash::new(8);
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            assert!(!nvs.purge_mode());
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("secret"), payload.as_slice())
+                .unwrap();
+            nvs.delete(&Key::from_str("ns1"), &Key::from_str("secret")).unwrap();
+        }
+
+        assert!(
+            contains(&flash.buf, &payload[..64]),
+            "deleting without purge mode should only flip the entry state"
+        );
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
     #[test]
     fn default_mode_leaves_deleted_value_in_flash() {
         let mut flash = common::Flash::new(2);
