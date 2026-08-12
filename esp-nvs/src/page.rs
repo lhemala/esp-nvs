@@ -226,6 +226,14 @@ impl ThinPage {
         };
         let span = data_entries + 1;
 
+        // No current caller can reach this: `set_str` caps its value at `MAX_BLOB_DATA_PER_PAGE`, a
+        // blob chunk is cut to what the active page has free, and `copy_items` rewrites an item
+        // that already fit a page, so all three arrive with `span <= ENTRIES_PER_PAGE`.
+        //
+        // It is what catches them being wrong, though, rather than dead weight: relaxing
+        // `set_str`'s limit by a single byte lands here instead of writing an item whose
+        // span runs off the end of its page. That is also why it is not a `debug_assert!`,
+        // which would leave a release build doing exactly that.
         if span > ENTRIES_PER_PAGE {
             return Err(Error::ValueTooLong);
         }

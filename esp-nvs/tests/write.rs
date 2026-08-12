@@ -27,6 +27,52 @@ mod set {
 
     // TODO: test for writing namespace fails + cleanup
 
+    /// A string is stored as one item on one page, with a null terminator appended, so the longest
+    /// one that fits is `MAX_BLOB_DATA_PER_PAGE - 1` bytes. Unlike a blob it is never split into
+    /// chunks, so there is no growing the partition out of this: one byte more is rejected however
+    /// much room is free.
+    #[test]
+    fn string_at_the_length_limit_is_accepted_and_one_past_it_is_rejected() {
+        // Plenty of free pages, so a rejection cannot be confused with running out of room.
+        let mut flash = common::Flash::new(8);
+
+        let longest = "x".repeat(MAX_BLOB_DATA_PER_PAGE - 1);
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("s"), longest.as_str())
+                .unwrap();
+            assert_eq!(
+                nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("s")).unwrap(),
+                longest
+            );
+
+            // One byte more, with the same partition and the same free space.
+            let too_long = "x".repeat(MAX_BLOB_DATA_PER_PAGE);
+            assert_eq!(
+                nvs.set(&Key::from_str("ns1"), &Key::from_str("t"), too_long.as_str()),
+                Err(Error::ValueTooLong)
+            );
+            // The rejected write leaves nothing behind and the accepted one is untouched.
+            assert_eq!(
+                nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("t")),
+                Err(Error::KeyNotFound)
+            );
+        }
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert_eq!(
+            nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("s")).unwrap(),
+            longest
+        );
+        // The longest string fills a page exactly, header plus every data entry, which means it
+        // cannot share one with the namespace record: page 0 keeps just that record and the string
+        // goes to the next page.
+        let per_page = nvs.statistics().unwrap().entries_per_page;
+        assert_eq!(per_page[0].written, 1);
+        assert_eq!(per_page[1].written, ENTRIES_PER_PAGE as u32);
+    }
+
     /// Writes single entry items to `namespace` until the first page has `leave_free` entries left.
     ///
     /// Only meaningful on a partition that is still fresh, where everything lands on page 0 and
