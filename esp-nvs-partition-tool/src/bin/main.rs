@@ -7,6 +7,7 @@ use clap::{
 };
 use esp_nvs_partition_tool::{
     EntryContent,
+    NVS_KEY_SIZE,
     NvsPartition,
 };
 
@@ -31,6 +32,10 @@ enum Commands {
         /// Partition size in bytes (must be multiple of 4096)
         #[arg(short, long, value_parser = parse_size)]
         size: usize,
+
+        /// Encrypt the partition with the keys in this file (`eky || tky`, 64 byte)
+        #[arg(short, long)]
+        keyfile: Option<PathBuf>,
     },
     /// Parse NVS partition binary to CSV file
     Parse {
@@ -39,7 +44,20 @@ enum Commands {
 
         /// Output CSV file path
         output: PathBuf,
+
+        /// Decrypt the partition with the keys in this file (`eky || tky`, 64 byte)
+        #[arg(short, long)]
+        keyfile: Option<PathBuf>,
     },
+}
+
+/// Reads `eky || tky` from the start of a key file, as written by `nvs_partition_gen.py`.
+fn read_keyfile(path: &PathBuf) -> Result<[u8; NVS_KEY_SIZE], Box<dyn std::error::Error>> {
+    let keys = fs::read(path)?;
+
+    keys.get(..NVS_KEY_SIZE)
+        .and_then(|keys| keys.try_into().ok())
+        .ok_or_else(|| format!("{} is shorter than {NVS_KEY_SIZE} byte", path.display()).into())
 }
 
 fn parse_size(s: &str) -> Result<usize, String> {
@@ -54,7 +72,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Generate { input, output, size } => {
+        Commands::Generate {
+            input,
+            output,
+            size,
+            keyfile,
+        } => {
             println!("Parsing CSV file: {}", input.display());
             let content = fs::read_to_string(&input)?;
             let mut partition = NvsPartition::try_from_str(&content)?;
@@ -74,7 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Found {} entries", partition.entries.len());
 
             println!("Generating partition binary...");
-            let data = partition.generate_partition(size)?;
+            let data = match &keyfile {
+                Some(path) => partition.generate_encrypted_partition(size, &read_keyfile(path)?)?,
+                None => partition.generate_partition(size)?,
+            };
             fs::write(&output, &data)?;
 
             println!("Successfully generated NVS partition: {}", output.display());
@@ -82,10 +108,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Ok(())
         }
-        Commands::Parse { input, output } => {
+        Commands::Parse { input, output, keyfile } => {
             println!("Parsing binary file: {}", input.display());
             let data = fs::read(&input)?;
-            let partition = NvsPartition::try_from_bytes(data)?;
+            let partition = match &keyfile {
+                Some(path) => NvsPartition::try_from_encrypted_bytes(data, &read_keyfile(path)?)?,
+                None => NvsPartition::try_from_bytes(data)?,
+            };
             println!("Found {} entries", partition.entries.len());
 
             println!("Writing CSV file...");

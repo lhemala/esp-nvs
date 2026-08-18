@@ -4,8 +4,13 @@ _default:
 fix:
     cargo clippy --fix --allow-dirty --allow-staged --release -p esp-nvs --features=defmt
 
-lint:
+lint: check-device
     cargo clippy --release -p esp-nvs --features=defmt -- -D warnings
+    cargo clippy --release -p esp-nvs --features=encryption -- -D warnings
+
+check-device:
+    cargo check --release -p esp-nvs --target riscv32imac-unknown-none-elf \
+        --features esp32c6,encryption,hmac-keys,hardware-aes
 
 update-changelog:
     git-cliff --bump --include-path "esp-nvs/**" -o CHANGELOG.md
@@ -16,6 +21,14 @@ publish-dry-run:
 publish:
     cargo publish --registry crates-io
 
-[working-directory: 'tests/assets/']
+[working-directory('tests/assets/')]
 generate_test_nvs_bin:
     esp-nvs-partition-tool generate test_nvs_data.csv test_nvs_data.bin --size 0x4000
+
+# Reference image straight from ESP-IDF. Needs `pip install esp-idf-nvs-partition-gen`.
+
+# test_nvs_key.bin is a fixed dummy key (bytes 0x00..0x3f), test data only.
+[working-directory('tests/assets/')]
+generate_encrypted_test_nvs_bin:
+    python -m esp_idf_nvs_partition_gen encrypt test_nvs_data.csv test_nvs_data_encrypted.bin 0x4000 \
+        --inputkey test_nvs_key.bin

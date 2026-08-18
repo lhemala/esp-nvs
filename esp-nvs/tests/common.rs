@@ -11,8 +11,17 @@ use embedded_storage::nor_flash::{
 use esp_nvs::ENTRY_STATE_BITMAP_SIZE;
 pub use esp_nvs::{
     FLASH_SECTOR_SIZE,
+    ITEM_SIZE,
     PAGE_HEADER_SIZE,
 };
+
+/// `eky || tky` as stored at the start of an ESP-IDF `nvs_keys` partition.
+#[cfg(feature = "encryption")]
+pub fn nvs_key(path: &str) -> [u8; esp_nvs::NVS_KEY_SIZE] {
+    std::fs::read(path).unwrap()[..esp_nvs::NVS_KEY_SIZE]
+        .try_into()
+        .unwrap()
+}
 
 // Taken from https://github.com/esp-rs/esp-hal/blob/main/esp-storage/src/stub.rs
 pub const WORD_SIZE: usize = 4;
@@ -65,6 +74,11 @@ impl Flash {
 
     pub fn len(&self) -> usize {
         self.buf.len()
+    }
+
+    pub fn entry(&self, page: usize, index: usize) -> &[u8] {
+        let offset = page * FLASH_SECTOR_SIZE + ITEM_OFFSET + index * ITEM_SIZE;
+        &self.buf[offset..offset + ITEM_SIZE]
     }
 
     pub fn disable_faults(&mut self) {

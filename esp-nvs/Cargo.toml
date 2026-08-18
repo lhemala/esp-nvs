@@ -12,6 +12,9 @@ categories = ["embedded", "no-std", "hardware-support"]
 [features]
 debug-logs = []
 defmt = ["dep:defmt"]
+encryption = ["dep:aes", "dep:xts-mode"]
+hmac-keys = ["encryption", "dep:nb", "esp-hal?/unstable"]
+hardware-aes = ["encryption", "esp-hal?/unstable"]
 esp32 = ["dep:esp-storage", "esp-storage/esp32", "dep:esp-hal", "esp-hal/esp32"]
 esp32s2 = ["dep:esp-storage", "esp-storage/esp32s2", "dep:esp-hal", "esp-hal/esp32s2"]
 esp32s3 = ["dep:esp-storage", "esp-storage/esp32s3", "dep:esp-hal", "esp-hal/esp32s3"]
@@ -27,6 +30,9 @@ defmt = { version = "1.0.1", optional = true }
 esp-storage = { version = ">=0.8.1, <0.10", optional = true }
 esp-hal = { version = ">=1.0.0, <2", optional = true }
 thiserror = { version = "2.0.0", default-features = false }
+aes = { version = "0.9.2", default-features = false, optional = true }
+xts-mode = { version = "0.6.0", default-features = false, optional = true }
+nb = { version = "1.1.0", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

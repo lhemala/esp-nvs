@@ -30,6 +30,7 @@ use crate::platform::Platform;
 #[cfg(feature = "debug-logs")]
 use crate::raw::slice_with_nullbytes_to_str;
 use crate::raw::{
+    ENTRIES_PER_PAGE,
     EntryMapState,
     FLASH_SECTOR_SIZE,
     ItemType,
@@ -239,12 +240,17 @@ where
                             "CRC mismatch for item '{}', marking as erased",
                             slice_with_nullbytes_to_str(&item.key.0)
                         );
+
+                        // The span belongs to an entry that just failed its CRC32, so it can be
+                        // anything - only the entry itself is known to be there.
+                        let span = item.span.clamp(1, ENTRIES_PER_PAGE as u8 - item_index);
+
                         page.set_entry_state_range(
                             &mut self.hal,
-                            item_index..(item_index + item.span),
+                            item_index..(item_index + span),
                             EntryMapState::Erased,
                         )?;
-                        page.erased_entry_count += item.span;
+                        page.erased_entry_count += span;
                         continue 'item_iter;
                     }
                     page.used_entry_count += item.span;

@@ -51,6 +51,28 @@ pub struct Nvs<T: Platform> {
     pub(crate) pages: Vec<ThinPage>,
 }
 
+#[cfg(feature = "encryption")]
+impl<F> Nvs<crate::encryption::EncryptedFlash<F>>
+where
+    crate::encryption::EncryptedFlash<F>: Platform,
+{
+    /// Same as [`Nvs::new`], but for a partition encrypted the way ESP-IDF does it.
+    ///
+    /// `keys` is `eky || tky`, the first 64 byte of an `nvs_keys` partition.
+    pub fn new_encrypted(
+        partition_offset: usize,
+        partition_size: usize,
+        flash: F,
+        keys: &[u8; crate::encryption::NVS_KEY_SIZE],
+    ) -> Result<Self, Error> {
+        Nvs::new(
+            partition_offset,
+            partition_size,
+            crate::encryption::EncryptedFlash::new(flash, partition_offset, keys),
+        )
+    }
+}
+
 impl<T: Platform> Nvs<T> {
     /// Mimics the original C++ driver behavior and reads all sectors of the given partition to
     /// 1. Resolve all existing namespaces

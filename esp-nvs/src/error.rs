@@ -23,6 +23,10 @@ pub enum Error {
     #[error("internal flash error")]
     FlashError,
 
+    /// The contents of an `nvs_keys` partition are too short or their CRC32 doesn't match.
+    #[error("invalid nvs keys")]
+    InvalidKeys,
+
     /// Namespace not found. Either the flash was corrupted and silently fixed on
     /// startup or no value has been written yet.
     #[error("namespace not found")]

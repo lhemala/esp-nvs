@@ -1,0 +1,441 @@
+//! ESP-IDF compatible NVS encryption.
+//!
+//! ESP-IDF encrypts the entries of a page with AES-XTS-256, one 32 byte entry at a time, using the
+//! offset of the entry relative to the start of the partition as the tweak. Page headers and the
+//! entry state bitmap are stored in plain text, and entries that were never written stay erased.
+//!
+//! [`EncryptedFlash`] wraps any [`NorFlash`] and applies exactly that transformation, so the rest
+//! of the driver keeps working on plain text. It reports a read and write size of one entry, which
+//! is the smallest unit that can be encrypted, so the alignment logic of the driver pads partial
+//! writes to whole entries by itself.
+//!
+//! The AES itself comes from a [`Xts`] implementation: [`SoftwareXts`] by default, or
+//! [`HardwareXts`] on chips with an AES peripheral.
+
+use alloc::vec::Vec;
+
+use aes::Aes256;
+use aes::cipher::KeyInit;
+use aes::cipher::array::Array;
+use aes::cipher::consts::U16;
+use embedded_storage::nor_flash::{
+    ErrorType,
+    NorFlash,
+    ReadNorFlash,
+};
+use xts_mode::{
+    Xts128,
+    get_tweak_default,
+};
+
+use crate::platform::Crc;
+use crate::raw::{
+    ENTRY_STATE_BITMAP_SIZE,
+    FLASH_SECTOR_SIZE,
+    ITEM_SIZE,
+    PAGE_HEADER_SIZE,
+};
+
+/// Everything before the first entry of a page is stored in plain text.
+const FIRST_ENTRY_OFFSET: usize = PAGE_HEADER_SIZE + ENTRY_STATE_BITMAP_SIZE;
+
+const ERASED_ENTRY: [u8; ITEM_SIZE] = [0xFF; ITEM_SIZE];
+
+#[cfg(any(feature = "hardware-aes", test))]
+const BLOCK_SIZE: usize = 16;
+#[cfg(any(feature = "hardware-aes", test))]
+const BLOCKS_PER_ENTRY: usize = ITEM_SIZE / BLOCK_SIZE;
+
+/// Size of the key material used by ESP-IDF: the encryption key followed by the tweak key, as
+/// stored at the beginning of an `nvs_keys` partition.
+pub const NVS_KEY_SIZE: usize = 64;
+
+/// AES-XTS over a single NVS entry.
+///
+/// `data_unit` is the offset of the entry relative to the start of the partition, which is what
+/// ESP-IDF uses as the tweak.
+pub trait Xts {
+    fn encrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32);
+    fn decrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32);
+}
+
+/// AES-XTS in software, through the `aes` and `xts-mode` crates.
+pub struct SoftwareXts(Xts128<Aes256>);
+
+impl SoftwareXts {
+    /// `keys` is `eky || tky`, the first 64 byte of an ESP-IDF `nvs_keys` partition.
+    pub fn new(keys: &[u8; NVS_KEY_SIZE]) -> Self {
+        let (encryption_key, tweak_key) = keys.split_at(NVS_KEY_SIZE / 2);
+
+        // The key schedule is expanded once here, not per entry.
+        Self(Xts128::new(
+            Aes256::new(encryption_key.try_into().unwrap()),
+            Aes256::new(tweak_key.try_into().unwrap()),
+        ))
+    }
+}
+
+impl Xts for SoftwareXts {
+    fn encrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32) {
+        self.0.encrypt_sector(entry, tweak(data_unit));
+    }
+
+    fn decrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32) {
+        self.0.decrypt_sector(entry, tweak(data_unit));
+    }
+}
+
+fn tweak(data_unit: u32) -> Array<u8, U16> {
+    get_tweak_default(data_unit as u128)
+}
+
+/// Multiplication by the primitive element of GF(2^128), as XTS advances the tweak from one block
+/// to the next.
+#[cfg(any(feature = "hardware-aes", test))]
+fn double(block: &mut [u8; BLOCK_SIZE]) {
+    let mut carry = 0;
+    for byte in block.iter_mut() {
+        let next_carry = *byte >> 7;
+        *byte = (*byte << 1) | carry;
+        carry = next_carry;
+    }
+
+    if carry != 0 {
+        block[0] ^= 0x87;
+    }
+}
+
+/// XTS around a raw ECB block cipher: XOR the tweak in, run the cipher over the whole entry, XOR
+/// the tweak out again. Encryption and decryption only differ in `cipher`, which has to be the
+/// matching direction; the tweak is always encrypted.
+///
+/// Used by the hardware backed implementations, where handing a whole entry to the peripheral in
+/// one go keeps the key loaded across both of its blocks.
+#[cfg(any(feature = "hardware-aes", test))]
+fn xts_entry(
+    entry: &mut [u8; ITEM_SIZE],
+    data_unit: u32,
+    encrypt_tweak: impl FnOnce(&mut [u8; BLOCK_SIZE]),
+    cipher: impl FnOnce(&mut [u8; ITEM_SIZE]),
+) {
+    let mut current = [0u8; BLOCK_SIZE];
+    current[..4].copy_from_slice(&data_unit.to_le_bytes());
+    encrypt_tweak(&mut current);
+
+    let mut tweaks = [[0u8; BLOCK_SIZE]; BLOCKS_PER_ENTRY];
+    for tweak in tweaks.iter_mut() {
+        *tweak = current;
+        double(&mut current);
+    }
+
+    xor_tweaks(entry, &tweaks);
+    cipher(entry);
+    xor_tweaks(entry, &tweaks);
+}
+
+#[cfg(any(feature = "hardware-aes", test))]
+fn xor_tweaks(entry: &mut [u8; ITEM_SIZE], tweaks: &[[u8; BLOCK_SIZE]; BLOCKS_PER_ENTRY]) {
+    for (block, tweak) in entry.chunks_exact_mut(BLOCK_SIZE).zip(tweaks) {
+        for (byte, tweak_byte) in block.iter_mut().zip(tweak) {
+            *byte ^= tweak_byte;
+        }
+    }
+}
+
+/// A [`NorFlash`] that transparently encrypts NVS entries, compatible with partitions generated by
+/// `nvs_partition_gen.py encrypt` and with `nvs_flash_secure_init()` on device.
+///
+/// Usually constructed through [`Nvs::new_encrypted`](crate::Nvs::new_encrypted), which uses
+/// [`SoftwareXts`]. For the AES peripheral, build it with [`EncryptedFlash::with_cipher`] and pass
+/// the wrapper to [`Nvs::new`](crate::Nvs::new).
+pub struct EncryptedFlash<F, X = SoftwareXts> {
+    flash: F,
+    xts: X,
+    partition_offset: u32,
+}
+
+impl<F> EncryptedFlash<F, SoftwareXts> {
+    /// `keys` is `eky || tky`, the first 64 byte of an ESP-IDF `nvs_keys` partition.
+    ///
+    /// `partition_offset` has to be the offset the NVS partition is later opened with, because the
+    /// tweak of an entry is its offset relative to the start of the partition.
+    pub fn new(flash: F, partition_offset: usize, keys: &[u8; NVS_KEY_SIZE]) -> Self {
+        Self::with_cipher(flash, partition_offset, SoftwareXts::new(keys))
+    }
+}
+
+impl<F, X> EncryptedFlash<F, X> {
+    /// Same as [`EncryptedFlash::new`], with the AES implementation of your choice.
+    pub fn with_cipher(flash: F, partition_offset: usize, xts: X) -> Self {
+        debug_assert!(
+            partition_offset.is_multiple_of(FLASH_SECTOR_SIZE),
+            "partition offset has to be sector aligned"
+        );
+
+        Self {
+            flash,
+            xts,
+            partition_offset: partition_offset as u32,
+        }
+    }
+
+    pub fn into_inner(self) -> F {
+        self.flash
+    }
+
+    /// Addresses inside a page header or an entry state bitmap are not encrypted.
+    fn is_entry(&self, address: u32) -> bool {
+        (address - self.partition_offset) as usize % FLASH_SECTOR_SIZE >= FIRST_ENTRY_OFFSET
+    }
+
+    fn data_unit(&self, entry_address: u32) -> u32 {
+        entry_address - self.partition_offset
+    }
+}
+
+impl<F: ErrorType, X> ErrorType for EncryptedFlash<F, X> {
+    type Error = F::Error;
+}
+
+impl<F: Crc, X> Crc for EncryptedFlash<F, X> {
+    fn crc32(init: u32, data: &[u8]) -> u32 {
+        F::crc32(init, data)
+    }
+}
+
+impl<F: ReadNorFlash, X: Xts> ReadNorFlash for EncryptedFlash<F, X> {
+    const READ_SIZE: usize = ITEM_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.flash.read(offset, bytes)?;
+
+        let end = offset + bytes.len() as u32;
+        let mut entry = [0u8; ITEM_SIZE];
+        let mut address = offset - offset % ITEM_SIZE as u32;
+
+        while address < end {
+            if !self.is_entry(address) {
+                address += ITEM_SIZE as u32;
+                continue;
+            }
+
+            let from = offset.max(address);
+            let to = end.min(address + ITEM_SIZE as u32);
+            let target = &mut bytes[(from - offset) as usize..(to - offset) as usize];
+
+            if target.len() == ITEM_SIZE {
+                entry.copy_from_slice(target);
+            } else {
+                // decryption needs the whole entry, the caller only asked for a part of it
+                self.flash.read(address, &mut entry)?;
+            }
+
+            // entries that were never written are erased, decrypting them would yield garbage
+            if entry != ERASED_ENTRY {
+                self.xts.decrypt_entry(&mut entry, self.data_unit(address));
+                target.copy_from_slice(&entry[(from - address) as usize..(to - address) as usize]);
+            }
+
+            address += ITEM_SIZE as u32;
+        }
+
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        self.flash.capacity()
+    }
+}
+
+impl<F: NorFlash, X: Xts> NorFlash for EncryptedFlash<F, X> {
+    /// One entry - the smallest amount of data that can be encrypted on its own.
+    const WRITE_SIZE: usize = ITEM_SIZE;
+
+    const ERASE_SIZE: usize = F::ERASE_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        self.flash.erase(from, to)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        debug_assert!(
+            !self.is_entry(offset) || offset.is_multiple_of(ITEM_SIZE as u32),
+            "entries can only be written as a whole"
+        );
+
+        let mut buf: Vec<u8> = bytes.into();
+
+        // Writes never cross the boundary between the plain text part of a page and its entries,
+        // but they can be shorter than an entry when the page header or the bitmap is written -
+        // chunks_exact_mut leaves those untouched.
+        for (index, entry) in buf.chunks_exact_mut(ITEM_SIZE).enumerate() {
+            let address = offset + (index * ITEM_SIZE) as u32;
+            if self.is_entry(address) {
+                let entry = entry.try_into().unwrap();
+                self.xts.encrypt_entry(entry, self.data_unit(address));
+            }
+        }
+
+        self.flash.write(offset, &buf)
+    }
+}
+
+/// AES-XTS on the AES peripheral.
+///
+/// Each entry is handed to the peripheral as a whole, so its key stays loaded across both blocks;
+/// only the tweak needs a separate single block operation, which is what ESP-IDF's mbedTLS port
+/// does as well.
+///
+/// An [`AesBackend`](esp_hal::aes::AesBackend) (or its DMA variant) has to be started and kept
+/// alive for as long as this is used, otherwise the operations never complete.
+#[cfg(feature = "hardware-aes")]
+pub struct HardwareXts {
+    encrypt: esp_hal::aes::AesContext,
+    decrypt: esp_hal::aes::AesContext,
+    tweak: esp_hal::aes::AesContext,
+}
+
+#[cfg(feature = "hardware-aes")]
+impl HardwareXts {
+    /// `keys` is `eky || tky`, the first 64 byte of an ESP-IDF `nvs_keys` partition.
+    pub fn new(keys: &[u8; NVS_KEY_SIZE]) -> Self {
+        use esp_hal::aes::cipher_modes::Ecb;
+        use esp_hal::aes::{
+            AesContext,
+            Operation,
+        };
+
+        let encryption_key: [u8; 32] = keys[..NVS_KEY_SIZE / 2].try_into().unwrap();
+        let tweak_key: [u8; 32] = keys[NVS_KEY_SIZE / 2..].try_into().unwrap();
+
+        Self {
+            encrypt: AesContext::new(Ecb, Operation::Encrypt, encryption_key),
+            decrypt: AesContext::new(Ecb, Operation::Decrypt, encryption_key),
+            // The tweak is encrypted in both directions.
+            tweak: AesContext::new(Ecb, Operation::Encrypt, tweak_key),
+        }
+    }
+
+    fn process(context: &mut esp_hal::aes::AesContext, buffer: &mut [u8]) {
+        context
+            .process_in_place(buffer)
+            .expect("buffer is a multiple of the AES block size")
+            .wait_blocking();
+    }
+}
+
+#[cfg(feature = "hardware-aes")]
+impl Xts for HardwareXts {
+    fn encrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32) {
+        let (tweak, encrypt) = (&mut self.tweak, &mut self.encrypt);
+
+        xts_entry(
+            entry,
+            data_unit,
+            |block| Self::process(tweak, block),
+            |entry| Self::process(encrypt, entry),
+        );
+    }
+
+    fn decrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32) {
+        let (tweak, decrypt) = (&mut self.tweak, &mut self.decrypt);
+
+        xts_entry(
+            entry,
+            data_unit,
+            |block| Self::process(tweak, block),
+            |entry| Self::process(decrypt, entry),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use aes::cipher::{
+        BlockCipherDecrypt,
+        BlockCipherEncrypt,
+    };
+
+    use super::*;
+
+    /// Stands in for [`HardwareXts`]: same `xts_entry` core, with the AES peripheral replaced by
+    /// the software block cipher. If this matches [`SoftwareXts`], the only thing left unchecked
+    /// on device is the call into the peripheral itself.
+    struct EcbXts {
+        cipher: Aes256,
+        tweak: Aes256,
+    }
+
+    impl Xts for EcbXts {
+        fn encrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32) {
+            xts_entry(
+                entry,
+                data_unit,
+                |block| self.tweak.encrypt_block(block.into()),
+                |entry| {
+                    for block in entry.chunks_exact_mut(BLOCK_SIZE) {
+                        self.cipher.encrypt_block(block.try_into().unwrap());
+                    }
+                },
+            );
+        }
+
+        fn decrypt_entry(&mut self, entry: &mut [u8; ITEM_SIZE], data_unit: u32) {
+            xts_entry(
+                entry,
+                data_unit,
+                |block| self.tweak.encrypt_block(block.into()),
+                |entry| {
+                    for block in entry.chunks_exact_mut(BLOCK_SIZE) {
+                        self.cipher.decrypt_block(block.try_into().unwrap());
+                    }
+                },
+            );
+        }
+    }
+
+    fn keys() -> [u8; NVS_KEY_SIZE] {
+        let mut keys = [0u8; NVS_KEY_SIZE];
+        for (index, byte) in keys.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        keys
+    }
+
+    #[test]
+    fn ecb_based_xts_matches_the_reference() {
+        let mut reference = SoftwareXts::new(&keys());
+        let mut ecb = EcbXts {
+            cipher: Aes256::new(keys()[..32].try_into().unwrap()),
+            tweak: Aes256::new(keys()[32..].try_into().unwrap()),
+        };
+
+        // The data units NVS actually uses are entry offsets, but the tweak has to keep matching
+        // once a partition is big enough for the carry in the GF multiplication to show up.
+        for data_unit in [0, 64, 96, 4096 + 64, 0x7F_FFE0, u32::MAX - 31] {
+            let plain: [u8; ITEM_SIZE] = core::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ data_unit as u8);
+
+            let mut expected = plain;
+            reference.encrypt_entry(&mut expected, data_unit);
+
+            let mut actual = plain;
+            ecb.encrypt_entry(&mut actual, data_unit);
+            assert_eq!(actual, expected, "encryption differs at data unit {data_unit}");
+
+            ecb.decrypt_entry(&mut actual, data_unit);
+            assert_eq!(actual, plain, "decryption is not the inverse at data unit {data_unit}");
+        }
+    }
+
+    /// The carry has to fold back in as 0x87, otherwise only tweaks with a high bit set differ.
+    #[test]
+    fn doubling_reduces_the_carry() {
+        let mut block = [0u8; BLOCK_SIZE];
+        block[BLOCK_SIZE - 1] = 0x80;
+        double(&mut block);
+
+        let mut expected = [0u8; BLOCK_SIZE];
+        expected[0] = 0x87;
+        assert_eq!(block, expected);
+    }
+}

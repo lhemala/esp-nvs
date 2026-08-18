@@ -1,7 +1,9 @@
 use std::fs::read;
 
 use base64::Engine;
+use esp_nvs::encryption::NVS_KEY_SIZE;
 use esp_nvs::mem_flash::MemFlash;
+use esp_nvs::platform::Platform;
 use esp_nvs::{
     Key,
     Nvs,
@@ -19,16 +21,43 @@ use crate::error::Error;
 ///
 /// `size` must be a multiple of 4096 (the ESP-IDF flash sector size).
 pub(crate) fn generate_partition_data(partition: &NvsPartition, size: usize) -> Result<Vec<u8>, Error> {
+    let flash = new_flash(size)?;
+    let mut nvs = Nvs::new(0, size, flash)?;
+
+    write_entries(&mut nvs, partition)?;
+
+    Ok(nvs.into_inner().into_inner())
+}
+
+/// Generate an NVS partition binary in memory and return it as a `Vec<u8>`.
+///
+/// `size` must be a multiple of 4096 (the ESP-IDF flash sector size).
+/// 
+/// `keys` is `eky || tky`, the first 64 byte of an `nvs_keys` partition.
+pub(crate) fn generate_encrypted_partition_data(
+    partition: &NvsPartition,
+    size: usize,
+    keys: &[u8; NVS_KEY_SIZE],
+) -> Result<Vec<u8>, Error> {
+    let flash = new_flash(size)?;
+    let mut nvs = Nvs::new_encrypted(0, size, flash, keys)?;
+
+    write_entries(&mut nvs, partition)?;
+
+    Ok(nvs.into_inner().into_inner().into_inner())
+}
+
+fn new_flash(size: usize) -> Result<MemFlash, Error> {
     if size < esp_nvs::FLASH_SECTOR_SIZE {
         return Err(Error::PartitionTooSmall(size));
     } else if !size.is_multiple_of(esp_nvs::FLASH_SECTOR_SIZE) {
         return Err(Error::InvalidPartitionSize(size));
     }
 
-    let pages = size / esp_nvs::FLASH_SECTOR_SIZE;
-    let flash = MemFlash::new(pages);
-    let mut nvs = Nvs::new(0, size, flash)?;
+    Ok(MemFlash::new(size / esp_nvs::FLASH_SECTOR_SIZE))
+}
 
+fn write_entries<T: Platform>(nvs: &mut Nvs<T>, partition: &NvsPartition) -> Result<(), Error> {
     for entry in &partition.entries {
         let namespace = Key::from_str(&entry.namespace);
         let key = Key::from_str(&entry.key);
@@ -60,7 +89,7 @@ pub(crate) fn generate_partition_data(partition: &NvsPartition, size: usize) -> 
         }
     }
 
-    Ok(nvs.into_inner().into_inner())
+    Ok(())
 }
 
 fn parse_file_content(content: &[u8], encoding: &FileEncoding) -> Result<DataValue, Error> {

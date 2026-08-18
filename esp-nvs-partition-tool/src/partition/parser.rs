@@ -1,4 +1,6 @@
+use esp_nvs::encryption::NVS_KEY_SIZE;
 use esp_nvs::mem_flash::MemFlash;
+use esp_nvs::platform::Platform;
 use esp_nvs::{
     ItemType,
     Key,
@@ -14,6 +16,21 @@ use crate::error::Error;
 
 /// Parse an NVS partition binary from an in-memory byte slice.
 pub(crate) fn parse_binary_data(data: &[u8]) -> Result<NvsPartition, Error> {
+    let size = check_size(data)?;
+    let flash = MemFlash::from_bytes(data.to_vec());
+
+    read_entries(&mut Nvs::new(0, size, flash)?)
+}
+
+/// Parse an NVS partition binary from an in-memory encryptped byte slice.
+pub(crate) fn parse_encrypted_binary_data(data: &[u8], keys: &[u8; NVS_KEY_SIZE]) -> Result<NvsPartition, Error> {
+    let size = check_size(data)?;
+    let flash = MemFlash::from_bytes(data.to_vec());
+
+    read_entries(&mut Nvs::new_encrypted(0, size, flash, keys)?)
+}
+
+fn check_size(data: &[u8]) -> Result<usize, Error> {
     if data.is_empty() {
         return Err(Error::InvalidValue(
             "binary data is empty; an NVS partition requires at least one page (4096 bytes)".to_string(),
@@ -28,10 +45,10 @@ pub(crate) fn parse_binary_data(data: &[u8]) -> Result<NvsPartition, Error> {
         )));
     }
 
-    let size = data.len();
-    let flash = MemFlash::from_bytes(data.to_vec());
-    let mut nvs = Nvs::new(0, size, flash)?;
+    Ok(data.len())
+}
 
+fn read_entries<T: Platform>(nvs: &mut Nvs<T>) -> Result<NvsPartition, Error> {
     let mut entries = Vec::new();
 
     // Collect all typed entries first, then read values by type
