@@ -226,3 +226,50 @@ fn assert_entry_content(partition: &NvsPartition, index: usize, expected: &Entry
         index, partition.entries[index].key
     );
 }
+
+/// `multiple_namespaces.csv` needs six pages.
+const PARTITION_SIZE: usize = 0x6000;
+
+/// A fixed dummy key - the test data is not secret.
+const KEYS: [u8; esp_nvs_partition_tool::NVS_KEY_SIZE] = {
+    let mut keys = [0u8; esp_nvs_partition_tool::NVS_KEY_SIZE];
+    let mut i = 0;
+    while i < keys.len() {
+        keys[i] = i as u8;
+        i += 1;
+    }
+    keys
+};
+
+#[test]
+fn encrypted_roundtrip() {
+    let original = common::read_csv_file("tests/assets/multiple_namespaces.csv");
+
+    let plain = original.generate_partition(PARTITION_SIZE).unwrap();
+    let encrypted = original.generate_encrypted_partition(PARTITION_SIZE, &KEYS).unwrap();
+
+    assert_eq!(
+        NvsPartition::try_from_encrypted_bytes(encrypted.clone(), &KEYS).unwrap(),
+        NvsPartition::try_from_bytes(plain.clone()).unwrap()
+    );
+
+    // The page header and the entry state bitmap stay readable, the entries do not.
+    assert_eq!(encrypted[..64], plain[..64]);
+    assert_ne!(encrypted[64..96], plain[64..96]);
+}
+
+#[test]
+fn encrypted_partition_needs_the_right_key() {
+    let original = common::read_csv_file("tests/assets/multiple_namespaces.csv");
+    let encrypted = original.generate_encrypted_partition(PARTITION_SIZE, &KEYS).unwrap();
+
+    let mut wrong = KEYS;
+    wrong[0] ^= 1;
+
+    // Entries fail their CRC32 with the wrong key, so nothing is found.
+    let parsed = NvsPartition::try_from_encrypted_bytes(encrypted.clone(), &wrong).unwrap();
+    assert!(parsed.entries.is_empty());
+
+    let parsed = NvsPartition::try_from_bytes(encrypted).unwrap();
+    assert!(parsed.entries.is_empty());
+}

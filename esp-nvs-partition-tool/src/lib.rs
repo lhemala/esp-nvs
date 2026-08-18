@@ -7,6 +7,7 @@ pub mod partition;
 mod csv;
 
 pub use error::Error;
+pub use esp_nvs::encryption::NVS_KEY_SIZE;
 pub use partition::{
     DataValue,
     EntryContent,
@@ -71,6 +72,16 @@ impl NvsPartition {
         partition::parser::parse_binary_data(&bytes.into())
     }
 
+    /// Attempt to parse a binary NVS partition encrypted the way ESP-IDF does it.
+    ///
+    /// `keys` is `eky || tky`, the first 64 byte of an `nvs_keys` partition.
+    pub fn try_from_encrypted_bytes<B>(bytes: B, keys: &[u8; NVS_KEY_SIZE]) -> Result<Self, Error>
+    where
+        B: Into<Vec<u8>>,
+    {
+        partition::parser::parse_encrypted_binary_data(&bytes.into(), keys)
+    }
+
     /// Serialize this partition to CSV and return the content as a `String`.
     ///
     /// Entries are written in their original insertion order. A namespace
@@ -86,6 +97,14 @@ impl NvsPartition {
     /// `size` must be a multiple of 4096 (the ESP-IDF flash sector size).
     pub fn generate_partition(&self, size: usize) -> Result<Vec<u8>, Error> {
         partition::generator::generate_partition_data(self, size)
+    }
+
+    /// Generate an NVS partition binary encrypted the way ESP-IDF does it, interchangeable with
+    /// `nvs_partition_gen.py encrypt`.
+    ///
+    /// `keys` is `eky || tky`, the first 64 byte of an `nvs_keys` partition.
+    pub fn generate_encrypted_partition(&self, size: usize, keys: &[u8; NVS_KEY_SIZE]) -> Result<Vec<u8>, Error> {
+        partition::generator::generate_encrypted_partition_data(self, size, keys)
     }
 
     /// Find an entry with the given name in the NVS partition.

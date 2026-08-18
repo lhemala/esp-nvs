@@ -75,6 +75,17 @@ Example:
 esp-nvs-partition-tool parse partition.bin recovered_data.csv
 ```
 
+### Encrypted Partitions
+
+Pass `--keyfile` to either command to generate or read a partition encrypted the way ESP-IDF does
+it. The key file is the same one `nvs_partition_gen.py` uses - `eky || tky` in its first 64 bytes -
+so partitions are interchangeable between the two tools.
+
+```bash
+esp-nvs-partition-tool generate nvs_data.csv partition.bin --size 0x4000 --keyfile nvs_keys.bin
+esp-nvs-partition-tool parse partition.bin recovered_data.csv --keyfile nvs_keys.bin
+```
+
 ## Library Usage
 
 Add to your `Cargo.toml`:

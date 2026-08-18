@@ -7,46 +7,20 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 #[cfg(feature = "debug-logs")]
-use core::fmt::{
-    Debug,
-    Formatter,
-};
-use core::mem::{
-    offset_of,
-    size_of,
-};
+use core::fmt::{Debug, Formatter};
+use core::mem::{offset_of, size_of};
 use core::ops::Range;
 
 #[cfg(feature = "defmt")]
-use defmt::{
-    trace,
-    warn,
-};
+use defmt::{trace, warn};
 
 use crate::Key;
 use crate::error::Error;
-use crate::error::Error::{
-    ItemTypeMismatch,
-    KeyNotFound,
-    PageFull,
-};
-use crate::platform::{
-    AlignedOps,
-    Platform,
-};
+use crate::error::Error::{ItemTypeMismatch, KeyNotFound, PageFull};
+use crate::platform::{AlignedOps, Platform};
 use crate::raw::{
-    ENTRIES_PER_PAGE,
-    ENTRY_STATE_BITMAP_SIZE,
-    EntryMapState,
-    Item,
-    ItemData,
-    ItemType,
-    PageHeader,
-    PageHeaderRaw,
-    PageState,
-    RawItem,
-    RawPage,
-    write_aligned,
+    ENTRIES_PER_PAGE, ENTRY_STATE_BITMAP_SIZE, EntryMapState, Item, ItemData, ItemType, PageHeader, PageHeaderRaw,
+    PageState, RawItem, RawPage, write_aligned,
 };
 use crate::u24::u24;
 
@@ -373,6 +347,13 @@ impl ThinPage {
         indices: Range<u8>,
         state: EntryMapState,
     ) -> Result<(), Error> {
+        // Clamped to the page, because a range derived from the span of a corrupt entry can reach
+        // past its end
+        let indices = indices.start..indices.end.min(ENTRIES_PER_PAGE as u8);
+        if indices.is_empty() {
+            return Ok(());
+        }
+
         #[cfg(feature = "defmt")]
         trace!(
             "set_entry_state_range: @{:#08x}[{}-{}]: {}",
@@ -469,6 +450,10 @@ impl ThinPage {
 
     /// Physically overwrites the flash bytes of `span` entries starting at `item_index` with
     /// zeros.
+    ///
+    /// On an encrypted partition the zeros are encrypted like any other entry, so the bytes left
+    /// behind are not zeros but the old cipher text with about half of its bits cleared - which is
+    /// just as unrecoverable, the entry can no longer be decrypted.
     pub(crate) fn purge_entries<T: Platform>(&mut self, hal: &mut T, item_index: u8, span: u8) -> Result<(), Error> {
         let max_span = (ENTRIES_PER_PAGE as u8).saturating_sub(item_index);
         if max_span == 0 {

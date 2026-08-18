@@ -3,7 +3,11 @@
 
 extern crate alloc;
 
+#[cfg(feature = "encryption")]
+pub mod encryption;
 pub mod error;
+#[cfg(feature = "encryption")]
+pub mod keys;
 pub mod mem_flash;
 pub mod platform;
 pub mod raw;
@@ -20,6 +24,11 @@ mod statistics;
 mod types;
 mod u24;
 
+#[cfg(feature = "encryption")]
+pub use encryption::{
+    EncryptedFlash,
+    NVS_KEY_SIZE,
+};
 pub use get::Get;
 pub use nvs::Nvs;
 pub use raw::{

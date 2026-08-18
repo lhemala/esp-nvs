@@ -1861,3 +1861,89 @@ mod purge {
         assert_eq!(nvs.get::<u8>(&Key::from_str("ns1"), &Key::from_str("k")).unwrap(), 1);
     }
 }
+
+#[cfg(feature = "encryption")]
+mod encrypted {
+    use esp_nvs::{
+        ITEM_SIZE,
+        Key,
+    };
+    use pretty_assertions::assert_eq;
+
+    use crate::common;
+
+    const KEY_FILE: &str = "tests/assets/test_nvs_key.bin";
+
+    #[test]
+    fn round_trip() {
+        let keys = common::nvs_key(KEY_FILE);
+        let mut flash = common::Flash::new(2);
+        let len = flash.len();
+        let namespace = Key::from_str("secrets");
+
+        // The length is not a multiple of an entry and the padded tail is all 0xFF, which is the
+        // case that must not be left erased.
+        let mut blob = vec![0xAAu8; 40];
+        blob[32..].fill(0xFF);
+
+        {
+            let mut nvs = esp_nvs::Nvs::new_encrypted(0, len, &mut flash, &keys).unwrap();
+            nvs.set(&namespace, &Key::from_str("u32"), 0xDEADBEEFu32).unwrap();
+            nvs.set(&namespace, &Key::from_str("blob"), blob.as_slice()).unwrap();
+        }
+
+        // The page header is readable without the key, the entries are not.
+        assert_eq!(flash.buf[..4], (esp_nvs::PageState::Active as u32).to_le_bytes());
+        assert!(!flash.buf.windows(7).any(|w| w == b"secrets"));
+
+        // namespace, u32, blob header and both blob data entries - including the one that is
+        // nothing but 0xFF padding.
+        for index in 0..5 {
+            assert_ne!(
+                flash.entry(0, index),
+                [0xFF; ITEM_SIZE],
+                "entry {index} was left erased"
+            );
+        }
+
+        // Reload from flash so nothing can come from memory.
+        let mut nvs = esp_nvs::Nvs::new_encrypted(0, len, &mut flash, &keys).unwrap();
+        assert_eq!(nvs.get::<u32>(&namespace, &Key::from_str("u32")).unwrap(), 0xDEADBEEF);
+        assert_eq!(nvs.get::<Vec<u8>>(&namespace, &Key::from_str("blob")).unwrap(), blob);
+    }
+
+    /// Freeing a page moves entries to a different address, and the address is the tweak - so
+    /// everything that survives a compaction has to be re-encrypted on the way.
+    #[test]
+    fn page_freeing_re_encrypts() {
+        let keys = common::nvs_key(KEY_FILE);
+        let mut flash = common::Flash::new(2);
+        let len = flash.len();
+        let namespace = Key::from_str("ns1");
+
+        {
+            let mut nvs = esp_nvs::Nvs::new_encrypted(0, len, &mut flash, &keys).unwrap();
+
+            // Half the page holds data that has to survive, the other half becomes erased entries.
+            for i in 0u8..62 {
+                nvs.set(&namespace, &Key::from_str(&format!("unique_{i}")), i).unwrap();
+            }
+            for i in 0u8..63 {
+                nvs.set(&namespace, &Key::from_str("duplicate"), i).unwrap();
+            }
+
+            // Triggers the defragmentation.
+            nvs.set(&namespace, &Key::from_str("trigger"), 0xFFu8).unwrap();
+        }
+
+        let mut nvs = esp_nvs::Nvs::new_encrypted(0, len, &mut flash, &keys).unwrap();
+        for i in 0u8..62 {
+            assert_eq!(
+                nvs.get::<u8>(&namespace, &Key::from_str(&format!("unique_{i}")))
+                    .unwrap(),
+                i
+            );
+        }
+        assert_eq!(nvs.get::<u8>(&namespace, &Key::from_str("duplicate")).unwrap(), 62);
+    }
+}

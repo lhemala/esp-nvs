@@ -391,13 +391,12 @@ pub(crate) fn write_aligned<T: Platform>(hal: &mut T, offset: u32, bytes: &[u8])
             hal.write(offset, header)?;
         }
 
-        // no need to write the trailer if remaining data is all ones - this the default state of
-        // the flash
-        if bytes[pivot..].iter().any(|&e| e != 0xFF) {
-            let mut buf = vec![0xFFu8; T::WRITE_SIZE];
-            buf[..trailer.len()].copy_from_slice(trailer);
-            hal.write(offset + (pivot as u32), &buf)?
-        }
+        // The trailer is always written, even when it is all ones and therefore a no-op on plain
+        // flash: with encryption the padding turns into cipher text, and leaving the entry erased
+        // would make ESP-IDF decrypt garbage and reject the item.
+        let mut buf = vec![0xFFu8; T::WRITE_SIZE];
+        buf[..trailer.len()].copy_from_slice(trailer);
+        hal.write(offset + (pivot as u32), &buf)?;
 
         Ok(())
     }

@@ -18,6 +18,7 @@ lint: _nightly-fmt-check nvs::lint partition_tool::lint
 
 test:
     cargo test --all
+    cargo test -p esp-nvs --features encryption
     cargo test --doc
 
 update-changelog: nvs::update-changelog partition_tool::update-changelog
