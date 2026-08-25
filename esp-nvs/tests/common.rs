@@ -103,6 +103,10 @@ impl Flash {
         self.buf.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     pub fn disable_faults(&mut self) {
         self.fail_after_operation = usize::MAX;
     }
@@ -254,7 +258,6 @@ impl esp_nvs::platform::Crc for Flash {
 #[derive(Clone, Default)]
 pub struct SharedFlash(Rc<RefCell<Flash>>);
 
-#[allow(clippy::len_without_is_empty)]
 impl SharedFlash {
     pub fn new(pages: usize) -> Self {
         Self(Rc::new(RefCell::new(Flash::new(pages))))
@@ -262,6 +265,10 @@ impl SharedFlash {
 
     pub fn len(&self) -> usize {
         self.0.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
     }
 
     /// Gives temporary mutable access to the raw partition image.

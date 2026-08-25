@@ -267,12 +267,6 @@ fn corrupt_entry() {
 // file builds at runtime, so it always gets namespace index 1.
 const NAMESPACE_ONE_INDEX: u8 = 1;
 
-// Raw item type bytes as they are stored in byte 1 of an entry.
-const TYPE_SIZED: u8 = 0x21;
-const TYPE_BLOB_LEGACY: u8 = 0x41;
-const TYPE_BLOB_DATA: u8 = 0x42;
-const TYPE_BLOB_INDEX: u8 = 0x48;
-
 // The item layout constants, the entry state helper and the item CRC live in `common` so the write
 // tests can use them too.
 use common::{
@@ -302,10 +296,10 @@ fn fix_item_crc(buf: &mut [u8], offset: usize) {
     buf[offset + ITEM_CRC_OFFSET..offset + ITEM_KEY_OFFSET].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// Finds the byte offset of the item header identified by namespace index, raw type byte and
-/// key. Payload entries are excluded by also requiring a valid entry CRC, and entries that are
-/// not `WRITTEN` are skipped so a stale duplicate can never be selected over the live item.
-fn find_item_entry(buf: &[u8], namespace_index: u8, type_byte: u8, key: &Key) -> Option<usize> {
+/// Finds the byte offset of the item header identified by namespace index, item type and key.
+/// Payload entries are excluded by also requiring a valid entry CRC, and entries that are not
+/// `WRITTEN` are skipped so a stale duplicate can never be selected over the live item.
+fn find_item_entry(buf: &[u8], namespace_index: u8, type_: ItemType, key: &Key) -> Option<usize> {
     for page_start in (0..buf.len()).step_by(FLASH_SECTOR_SIZE) {
         for entry in 0..ENTRIES_PER_PAGE {
             if entry_state(buf, page_start, entry) != ENTRY_STATE_WRITTEN {
@@ -316,7 +310,7 @@ fn find_item_entry(buf: &[u8], namespace_index: u8, type_byte: u8, key: &Key) ->
             let candidate = &buf[offset..offset + ITEM_SIZE];
 
             if candidate[0] == namespace_index
-                && candidate[1] == type_byte
+                && candidate[1] == type_ as u8
                 && candidate[ITEM_KEY_OFFSET..ITEM_DATA_OFFSET] == key.as_bytes()[..]
                 && u32::from_le_bytes(candidate[ITEM_CRC_OFFSET..ITEM_KEY_OFFSET].try_into().unwrap())
                     == item_crc(candidate)
@@ -350,7 +344,7 @@ fn multi_chunk_blob_partition(namespace: &Key, key: &Key) -> (esp_nvs::Nvs<commo
 /// Rewrites the `size` field of a live BLOB_IDX and repairs the entry CRC.
 fn patch_blob_index_size(flash: &common::SharedFlash, key: &Key, size: u32) {
     flash.with_buf(|buf| {
-        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_BLOB_INDEX, key).unwrap();
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::BlobIndex, key).unwrap();
         let offset = index + BLOB_INDEX_SIZE_OFFSET;
         buf[offset..offset + 4].copy_from_slice(&size.to_le_bytes());
         fix_item_crc(buf, index);
@@ -367,7 +361,7 @@ fn multi_page_blob_with_corrupt_chunk_data_is_reported_as_corrupted() {
     let chunk = find_item_entry(
         &flash.buf,
         NAMESPACE_ONE_INDEX,
-        TYPE_BLOB_DATA,
+        ItemType::BlobData,
         &Key::from_str("example_b_long"),
     )
     .unwrap();
@@ -466,7 +460,7 @@ fn multi_page_blob_with_missing_chunk_is_reported_as_corrupted() {
     // exists. Only reachable on a live instance: at init the chunk count is compared against
     // the chunks found on flash and a blob that disagrees is deleted outright.
     flash.with_buf(|buf| {
-        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_BLOB_INDEX, &key).unwrap();
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::BlobIndex, &key).unwrap();
         let size = index + BLOB_INDEX_SIZE_OFFSET;
         buf[size..size + 4].copy_from_slice(&((blob_len + 100) as u32).to_le_bytes());
         buf[index + BLOB_INDEX_CHUNK_COUNT_OFFSET] += 1;
@@ -487,7 +481,7 @@ fn multi_page_blob_index_with_overflowing_chunk_range_is_reported_as_corrupted()
     // and the overflowing range is really evaluated. Live instance again, since an index this
     // far off its chunks would not survive a rescan.
     flash.with_buf(|buf| {
-        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_BLOB_INDEX, &key).unwrap();
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::BlobIndex, &key).unwrap();
         buf[index + BLOB_INDEX_CHUNK_START_OFFSET] = 200;
         buf[index + BLOB_INDEX_CHUNK_COUNT_OFFSET] = 100;
         fix_item_crc(buf, index);
@@ -506,11 +500,11 @@ fn legacy_single_page_blob_with_corrupt_data_is_reported_as_corrupted() {
     let entry = find_item_entry(
         &flash.buf,
         NAMESPACE_ONE_INDEX,
-        TYPE_SIZED,
+        ItemType::Sized,
         &Key::from_str("example_s_short"),
     )
     .unwrap();
-    flash.buf[entry + 1] = TYPE_BLOB_LEGACY;
+    flash.buf[entry + 1] = ItemType::Blob as u8;
     fix_item_crc(&mut flash.buf, entry);
     flash.buf[entry + ITEM_SIZE] ^= 0xFF;
 
@@ -536,7 +530,7 @@ fn string_with_a_zero_size_is_reported_as_corrupted() {
     let entry = find_item_entry(
         &flash.buf,
         NAMESPACE_ONE_INDEX,
-        TYPE_SIZED,
+        ItemType::Sized,
         &Key::from_str("example_s_short"),
     )
     .unwrap();
@@ -573,7 +567,7 @@ fn string_with_a_size_past_its_span_is_reported_as_corrupted() {
     let entry = find_item_entry(
         &flash.buf,
         NAMESPACE_ONE_INDEX,
-        TYPE_SIZED,
+        ItemType::Sized,
         &Key::from_str("example_s_short"),
     )
     .unwrap();
@@ -609,7 +603,7 @@ fn item_with_a_span_past_the_page_end_is_reported_as_corrupted() {
         .unwrap();
 
     flash.with_buf(|buf| {
-        let entry = find_item_entry(buf, NAMESPACE_ONE_INDEX, TYPE_SIZED, &key).unwrap();
+        let entry = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::Sized, &key).unwrap();
         // Byte 2 of the header is `span`; 255 entries cannot fit in a 126 entry page.
         buf[entry + 2] = u8::MAX;
         let size_at = entry + SIZED_SIZE_OFFSET;
@@ -635,7 +629,7 @@ fn item_with_an_impossible_span_does_not_break_startup() {
     let entry = find_item_entry(
         &flash.buf,
         NAMESPACE_ONE_INDEX,
-        TYPE_SIZED,
+        ItemType::Sized,
         &Key::from_str("example_s_short"),
     )
     .unwrap();
