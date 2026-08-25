@@ -2919,7 +2919,7 @@ mod defrag {
         // The defragmentation starts around operation 380 relative to this point.
         // Copying happens from operations 384-575 (192 operations).
         // We inject fault halfway through copying at operation 480.
-        flash.fail_after_operation = flash.operations.len() + 99;
+        flash.arm_fault(99);
 
         {
             // set() will trigger defragmentation and fail during the copy phase
@@ -3018,7 +3018,7 @@ mod defrag {
         // From test output: erase happens at operation #576 (196 operations after initial setup at
         // #380) Inject fault at operation 195 to fail at operation 575 (just before erase
         // at 576)
-        flash.fail_after_operation = flash.operations.len() + 195;
+        flash.arm_fault(195);
 
         {
             let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
