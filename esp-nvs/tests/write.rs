@@ -3410,13 +3410,13 @@ mod blob_versions {
         ENTRIES_PER_PAGE,
         FLASH_SECTOR_SIZE,
         ITEM_SIZE,
+        ItemType,
         Key,
     };
     use pretty_assertions::assert_eq;
 
     use crate::common;
 
-    const TYPE_BLOB_INDEX: u8 = 0x48;
     /// `ItemDataBlobIndex` is `{ size: u32, chunk_count: u8, chunk_start: u8 }` over the data
     /// union.
     const BLOB_INDEX_CHUNK_START_OFFSET: usize = common::ITEM_DATA_OFFSET + 5;
@@ -3435,7 +3435,7 @@ mod blob_versions {
                     continue;
                 }
                 let offset = page_start + common::ITEM_OFFSET + entry * ITEM_SIZE;
-                if buf[offset + 1] == TYPE_BLOB_INDEX && common::is_item_header(buf, offset) {
+                if buf[offset + 1] == ItemType::BlobIndex as u8 && common::is_item_header(buf, offset) {
                     found.push(buf[offset + BLOB_INDEX_CHUNK_START_OFFSET]);
                 }
             }
