@@ -783,3 +783,40 @@ fn an_item_with_an_unknown_type_is_treated_as_corrupt() {
     nvs.set(&namespace, &Key::from_str("odd"), 3u8).unwrap();
     assert_eq!(nvs.get::<u8>(&namespace, &Key::from_str("odd")), Ok(3));
 }
+
+/// `keys()` has to list every blob `get` can read. It went by a blob's first chunk, which an empty
+/// blob does not have and a legacy single-page blob is not made of.
+#[test]
+fn keys_lists_empty_and_legacy_blobs() {
+    let namespace = Key::from_str("ns1");
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace, &Key::from_str("legacy"), "hello").unwrap();
+        nvs.set(&namespace, &Key::from_str("empty"), &[][..]).unwrap();
+    }
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        ItemType::Sized,
+        &Key::from_str("legacy"),
+    )
+    .unwrap();
+    flash.buf[entry + 1] = ItemType::Blob as u8;
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(
+        nvs.get::<Vec<u8>>(&namespace, &Key::from_str("legacy")),
+        Ok(b"hello\0".to_vec())
+    );
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &Key::from_str("empty")), Ok(vec![]));
+    let keys: Vec<_> = nvs.keys().collect::<Result<_, _>>().unwrap();
+    assert_eq!(
+        keys,
+        vec![
+            (namespace, Key::from_str("legacy")),
+            (namespace, Key::from_str("empty"))
+        ]
+    );
+}

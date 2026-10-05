@@ -24,10 +24,7 @@ use crate::raw::{
     ItemType,
 };
 use crate::set::Set;
-use crate::types::{
-    ChunkIndex,
-    VersionOffset,
-};
+use crate::types::ChunkIndex;
 use crate::{
     EntryStatistics,
     Key,
@@ -167,7 +164,7 @@ impl<T: Platform> Nvs<T> {
     ///
     /// Each item yields `(namespace_key, entry_key, item_type)`. Namespace
     /// definition entries are skipped. For multi-chunk blobs, only a single
-    /// representative entry is returned (with type [`ItemType::BlobData`]).
+    /// representative entry is returned (with type [`ItemType::BlobIndex`]).
     /// Legacy single-page blobs are returned with type [`ItemType::Blob`].
     ///
     /// # Errors
@@ -409,16 +406,11 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
         loop {
             return match self.items.next()? {
                 Ok(item) => {
-                    // Skip namespace entries (namespace_index == 0), and blobs (they are
-                    // represented by their BlobData)
-                    if item.namespace_index == 0 || item.type_ == ItemType::Blob || item.type_ == ItemType::BlobIndex {
-                        continue;
-                    }
-
-                    if item.type_ == ItemType::BlobData
-                        && item.chunk_index != VersionOffset::V0 as u8
-                        && item.chunk_index != VersionOffset::V1 as u8
-                    {
+                    // Skip namespace entries (namespace_index == 0) and blob chunks. A blob is
+                    // represented by its index, as in `typed_entries`: going by its first chunk
+                    // instead left out empty blobs, which have none, and legacy blobs, which are a
+                    // single item.
+                    if item.namespace_index == 0 || item.type_ == ItemType::BlobData {
                         continue;
                     }
 
