@@ -916,8 +916,13 @@ where
         let namespace_index = match self.namespaces.get(namespace) {
             Some(ns_idx) => *ns_idx,
             None => {
-                let namespace_index = match self.namespaces.iter().max_by_key(|(_, idx)| **idx) {
-                    Some((_, idx)) => idx.checked_add(1).ok_or(Error::FlashFull)?,
+                // 0 marks namespace entries and 255 is ESP-IDF's "any namespace": a namespace given
+                // 255 would match the keys of every other one there. Gaps are not filled, as the
+                // items of a namespace whose own entry was lost to corruption still carry its
+                // index, and a new namespace there would inherit them.
+                let namespace_index = match self.namespaces.values().max() {
+                    Some(&idx) if idx >= 254 => return Err(Error::TooManyNamespaces),
+                    Some(&idx) => idx + 1,
                     None => 1,
                 };
 

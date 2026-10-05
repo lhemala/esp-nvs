@@ -3621,3 +3621,33 @@ mod blob_versions {
         assert_eq!(live_blob_index_chunk_starts(&flash.buf), vec![0x00]);
     }
 }
+
+mod namespaces {
+    use esp_nvs::Key;
+    use esp_nvs::error::Error;
+    use pretty_assertions::assert_eq;
+
+    use crate::common;
+
+    /// ESP-IDF reserves namespace index 255 to match any namespace, so a partition can hold 254.
+    /// The 255th used to be given index 255, which ESP-IDF then reads as a wildcard.
+    #[test]
+    fn at_most_254_namespaces_are_created() {
+        let mut flash = common::Flash::new(6);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        for i in 0..254u32 {
+            nvs.set(&Key::from_str(&format!("n{i}")), &Key::from_str("k"), i)
+                .unwrap();
+        }
+        assert_eq!(
+            nvs.set(&Key::from_str("one_too_many"), &Key::from_str("k"), 1u32),
+            Err(Error::TooManyNamespaces)
+        );
+        for i in 0..254u32 {
+            assert_eq!(
+                nvs.get::<u32>(&Key::from_str(&format!("n{i}")), &Key::from_str("k")),
+                Ok(i)
+            );
+        }
+    }
+}

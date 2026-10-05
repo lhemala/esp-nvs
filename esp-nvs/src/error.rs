@@ -81,6 +81,11 @@ pub enum Error {
     #[error("flash full")]
     FlashFull,
 
+    /// All 254 namespaces are in use. Index 0 is taken by namespace entries themselves, and 255 is
+    /// what ESP-IDF looks up to match any namespace.
+    #[error("too many namespaces")]
+    TooManyNamespaces,
+
     /// Used internally to indicate that we have to allocate a new page.
     #[error("page full")]
     PageFull,
