@@ -571,3 +571,62 @@ fn a_failed_write_keeps_the_values_it_did_not_touch() {
         }
     }
 }
+
+/// Fills a partition of `pages` pages with u32 keys `k0..` until it reports `FlashFull`, returning
+/// how many fit.
+fn fill_until_full(pages: usize) -> (common::SharedFlash, u32) {
+    let flash = common::SharedFlash::new(pages);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    let mut count = 0u32;
+    loop {
+        match nvs.set(&namespace(), &Key::from_str(&format!("k{count}")), count) {
+            Ok(()) => count += 1,
+            Err(Error::FlashFull) => break,
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+    (flash, count)
+}
+
+/// A write to a partition full of live values fails, and it must fail without touching the flash.
+/// It used to copy a page with nothing erased on it to the reserve page and erase the source, one
+/// sector erase per attempt, for a firmware retrying the write a quick way to wear the flash out.
+#[test]
+fn a_write_to_a_full_partition_erases_nothing() {
+    let (flash, _) = fill_until_full(3);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    let erases = flash.erases();
+    for _ in 0..100 {
+        assert_eq!(
+            nvs.set(&namespace(), &Key::from_str("new"), 1u32),
+            Err(Error::FlashFull)
+        );
+    }
+    assert_eq!(flash.erases(), erases);
+}
+
+/// Power lost during a write to a full partition, at every flash operation it takes.
+///
+/// While such a write still copied a full page, a power loss after the copy but before the source
+/// was erased left a `Freeing` page, a complete copy of it and no free page to resume into, and
+/// `Nvs::new` reported `FlashFull` on every boot.
+#[test]
+fn power_loss_while_writing_to_a_full_partition() {
+    let (flash, count) = fill_until_full(3);
+    let image = flash.snapshot();
+    for budget in 0..400 {
+        let flash = common::SharedFlash::from_buf(image.clone());
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+            flash.arm_fault(budget);
+            let _ = nvs.set(&namespace(), &Key::from_str("new"), 1u32);
+        }
+        flash.disable_faults();
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone())
+            .unwrap_or_else(|e| panic!("Nvs::new after a power loss at operation {budget}: {e:?}"));
+        for i in 0..count {
+            assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str(&format!("k{i}"))), Ok(i));
+        }
+    }
+}

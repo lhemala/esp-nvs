@@ -420,10 +420,15 @@ where
         // Find the next page to reclaim
         // By incorporating the sequence number, we will also reclaim older pages even if they are
         // pretty full. This helps with more even wear leveling.
+        //
+        // A page whose every entry is in use is left out: copying it reproduces it exactly, so all
+        // that would come of it is a sector erase. With only such pages left the partition is full,
+        // and a caller retrying a write on it would otherwise wear out a sector per attempt.
         let next_page = self
             .pages
             .iter()
             .enumerate()
+            .filter(|(_, page)| (page.used_entry_count as usize) < ENTRIES_PER_PAGE)
             .map(|(idx, page)| {
                 let points = if page.erased_entry_count == 0 {
                     0
