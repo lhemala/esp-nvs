@@ -166,6 +166,13 @@ impl ThinPage {
         };
         item.crc = item.calculate_crc32(T::crc32);
 
+        // The entry counts come from scanning flash, and a page can be left `Active` with no room
+        // when the power goes between filling it and marking it full. Writing regardless would put
+        // the item into the next sector, on top of its header.
+        if span as usize > self.get_free_entry_count() {
+            return Err(PageFull);
+        }
+
         let item_index = self.get_next_free_entry();
         let target_addr = self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index;
 
@@ -191,7 +198,7 @@ impl ThinPage {
         }
 
         // Check if page is now full by trying to find the next free entry
-        if self.get_next_free_entry() == ENTRIES_PER_PAGE {
+        if self.is_full() {
             self.mark_as_full::<T>(hal)?;
         }
 
@@ -443,11 +450,11 @@ impl ThinPage {
     }
 
     pub(crate) fn get_free_entry_count(&self) -> usize {
-        ENTRIES_PER_PAGE - self.get_next_free_entry()
+        ENTRIES_PER_PAGE.saturating_sub(self.get_next_free_entry())
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.get_next_free_entry() == ENTRIES_PER_PAGE
+        self.get_next_free_entry() >= ENTRIES_PER_PAGE
     }
 
     pub(crate) fn get_state(&self) -> &ThinPageState {

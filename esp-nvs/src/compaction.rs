@@ -152,6 +152,14 @@ where
                     }
                 }
             }
+
+            // Power lost between the write that filled the active page and the one marking it full
+            // leaves it `Active` with no free entry. Retire it now, so the next write takes a fresh
+            // page instead of finding no room on this one.
+            let active_page = &mut self.pages[last_page_idx];
+            if active_page.is_full() {
+                active_page.mark_as_full(&mut self.hal)?;
+            }
         }
 
         Ok(())

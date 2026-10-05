@@ -58,3 +58,35 @@ fn power_loss_while_writing_a_string_leaves_a_writable_partition() {
         reboot_and_check(&mut flash, 99);
     }
 }
+
+/// Power lost after the write that filled the active page but before the page was marked full.
+///
+/// The page comes back `Active` with every entry used. A `set` into a new namespace then wrote the
+/// namespace entry at index 126 and the value at 127, which is the header of the next sector, so
+/// the value was gone on the next boot. Had that sector held a page, it would have gone with it.
+#[test]
+fn a_full_page_left_active_is_not_written_past_its_end() {
+    let mut flash = common::Flash::new(4);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        // The namespace entry and 125 values fill the first page exactly.
+        for i in 0..125u8 {
+            nvs.set(&namespace(), &Key::from_str(&format!("k{i}")), i).unwrap();
+        }
+    }
+
+    // Set the first page's state word back from FULL to ACTIVE, as if marking it had not happened.
+    // The state is not covered by the page header CRC.
+    flash.buf[..4].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("other"), &Key::from_str("x"), 1u8).unwrap();
+    }
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    for i in 0..125u8 {
+        assert_eq!(nvs.get::<u8>(&namespace(), &Key::from_str(&format!("k{i}"))), Ok(i));
+    }
+    assert_eq!(nvs.get::<u8>(&Key::from_str("other"), &Key::from_str("x")), Ok(1));
+}
