@@ -535,3 +535,39 @@ fn power_loss_while_changing_the_type_of_a_value() {
         }
     }
 }
+
+/// A write that fails must not take the active page out of the instance.
+///
+/// `set` pops the active page out of the instance's page list to write to it, and several error
+/// paths returned without putting it back. Everything on it then read as missing until a reboot.
+#[test]
+fn a_failed_write_keeps_the_values_it_did_not_touch() {
+    let writes: [(&str, fn(&mut esp_nvs::Nvs<common::SharedFlash>) -> Result<(), Error>); 4] = [
+        ("u8", |nvs| nvs.set(&namespace(), &Key::from_str("b"), 2u8)),
+        ("blob", |nvs| {
+            nvs.set(&namespace(), &Key::from_str("b"), [1u8; 10].as_slice())
+        }),
+        ("blob in a new namespace", |nvs| {
+            nvs.set(&Key::from_str("other"), &Key::from_str("b"), [1u8; 10].as_slice())
+        }),
+        ("string", |nvs| nvs.set(&namespace(), &Key::from_str("b"), "x")),
+    ];
+
+    for (what, write) in writes {
+        for budget in 0..4 {
+            let flash = common::SharedFlash::new(4);
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+            nvs.set(&namespace(), &Key::from_str("a"), 1u8).unwrap();
+
+            flash.arm_fault(budget);
+            let _ = write(&mut nvs);
+            flash.disable_faults();
+
+            assert_eq!(
+                nvs.get::<u8>(&namespace(), &Key::from_str("a")),
+                Ok(1),
+                "after a {what} write failing at operation {budget}"
+            );
+        }
+    }
+}

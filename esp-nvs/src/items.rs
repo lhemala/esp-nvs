@@ -413,7 +413,7 @@ where
         // safe since we just pushed before
         page = self.pages.pop().unwrap();
 
-        page.write_item::<T>(
+        let written = page.write_item::<T>(
             &mut self.hal,
             namespace_index,
             key,
@@ -421,11 +421,13 @@ where
             None,
             1,
             ItemData { raw: raw_value },
-        )?;
+        );
 
         // the page index of the old page might point to this one, so we just push it here already
-        // just in case
+        // just in case. That goes for a failed write too: returning without the page would drop its
+        // live items from this instance.
         self.pages.push(page);
+        written?;
 
         // The old item is whatever the key held before, which is not necessarily another primitive.
         // Erasing a single entry would leave the tail of a longer item behind, and erasing a blob
@@ -601,8 +603,9 @@ where
 
         // Get namespace index
         let mut page = self.get_active_page()?;
-        let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
+        let namespace_index = self.get_or_create_namespace(namespace, &mut page);
         self.pages.push(page);
+        let namespace_index = namespace_index?;
 
         // Determine the version offset for the new blob
         let new_version_offset = match &old_blob_version {
@@ -721,8 +724,9 @@ where
                     return Err(Error::FlashFull);
                 }
                 retired_a_page = true;
-                page.mark_as_full::<T>(&mut self.hal)?;
+                let retired = page.mark_as_full::<T>(&mut self.hal);
                 self.pages.push(page);
+                retired?;
                 continue;
             }
 
@@ -752,8 +756,9 @@ where
             let fits_in_remaining_chunks = (MAX_BLOB_CHUNK_COUNT - 1 - chunk_count as usize) * MAX_BLOB_DATA_PER_PAGE;
             if !retired_a_page && remaining > fits_here + fits_in_remaining_chunks {
                 retired_a_page = true;
-                page.mark_as_full::<T>(&mut self.hal)?;
+                let retired = page.mark_as_full::<T>(&mut self.hal);
                 self.pages.push(page);
+                retired?;
                 continue;
             }
 
@@ -785,11 +790,15 @@ where
                         return Err(Error::FlashFull);
                     }
                     retired_a_page = true;
-                    page.mark_as_full::<T>(&mut self.hal)?;
+                    let retired = page.mark_as_full::<T>(&mut self.hal);
                     self.pages.push(page);
+                    retired?;
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.pages.push(page);
+                    return Err(e);
+                }
             }
         }
 
@@ -802,7 +811,7 @@ where
                 chunk_start: version_base,
             },
         };
-        page.write_item::<T>(
+        let written = page.write_item::<T>(
             &mut self.hal,
             namespace_index,
             key,
@@ -810,8 +819,9 @@ where
             None,
             1,
             item_data,
-        )?;
+        );
         self.pages.push(page);
+        written?;
 
         Ok(())
     }
@@ -847,16 +857,27 @@ where
         }
 
         // at this point we have at least 2 free pages
-        let mut page = self.free_pages.pop().ok_or(Error::FlashFull)?;
+        let page = self.free_pages.pop().ok_or(Error::FlashFull)?;
 
-        if page.header.state != ThinPageState::Uninitialized {
-            self.hal
+        // On failure the page goes back to the free pages, which it has not left on flash.
+        if page.header.state != ThinPageState::Uninitialized
+            && self
+                .hal
                 .erase(page.address as _, (page.address + raw::FLASH_SECTOR_SIZE) as _)
-                .map_err(|_| Error::FlashError)?;
+                .is_err()
+        {
+            self.free_pages.push(page);
+            return Err(Error::FlashError);
         }
+        let mut page = ThinPage::uninitialized(page.address);
 
         let next_sequence = self.get_next_sequence();
-        page.initialize(&mut self.hal, next_sequence)?;
+        if let Err(e) = page.initialize(&mut self.hal, next_sequence) {
+            // A header may have been partly written, so it needs an erase before its next use.
+            page.header.state = ThinPageState::Corrupt;
+            self.free_pages.push(page);
+            return Err(e);
+        }
 
         Ok(page)
     }
