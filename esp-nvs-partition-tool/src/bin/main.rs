@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::{
     Parser,
@@ -50,13 +51,29 @@ fn parse_size(s: &str) -> Result<usize, String> {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
+    // Returning the error from `main` prints its `Debug` form, which is not meant for users.
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Adds the path to an error from accessing a file.
+fn with_path(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> String + '_ {
+    move |e| format!("{}: {e}", path.display())
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Generate { input, output, size } => {
             println!("Parsing CSV file: {}", input.display());
-            let content = fs::read_to_string(&input)?;
+            let content = fs::read_to_string(&input).map_err(with_path(&input))?;
             let mut partition = NvsPartition::try_from_str(&content)?;
 
             // Resolve relative file paths against the CSV file's parent
@@ -75,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Generating partition binary...");
             let data = partition.generate_partition(size)?;
-            fs::write(&output, &data)?;
+            fs::write(&output, &data).map_err(with_path(&output))?;
 
             println!("Successfully generated NVS partition: {}", output.display());
             println!("Size: {} bytes ({} pages)", size, size / esp_nvs::FLASH_SECTOR_SIZE);
@@ -84,13 +101,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Parse { input, output } => {
             println!("Parsing binary file: {}", input.display());
-            let data = fs::read(&input)?;
+            let data = fs::read(&input).map_err(with_path(&input))?;
             let partition = NvsPartition::try_from_bytes(data)?;
             println!("Found {} entries", partition.entries.len());
 
             println!("Writing CSV file...");
             let csv_content = partition.to_csv()?;
-            fs::write(&output, &csv_content)?;
+            fs::write(&output, &csv_content).map_err(with_path(&output))?;
 
             println!("Successfully parsed NVS partition to: {}", output.display());
 

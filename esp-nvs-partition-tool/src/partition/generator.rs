@@ -52,7 +52,9 @@ pub(crate) fn generate_partition_data(partition: &NvsPartition, size: usize) -> 
         let value = match &entry.content {
             EntryContent::Data(val) => val,
             EntryContent::File { encoding, file_path } => {
-                let content = read(file_path)?;
+                // The bare I/O error does not say which of the files it is about.
+                let content = read(file_path)
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", file_path.display())))?;
                 resolved_value = parse_file_content(&content, encoding)?;
                 &resolved_value
             }

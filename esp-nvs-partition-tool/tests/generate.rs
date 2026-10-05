@@ -182,3 +182,18 @@ fn test_generate_rejects_a_huge_size() {
         Err(esp_nvs_partition_tool::Error::InvalidPartitionSize(s)) if s == size
     ));
 }
+
+/// A file entry that cannot be read reports which file it is.
+#[test]
+fn test_generate_reports_the_path_of_a_missing_file() {
+    let partition = NvsPartition {
+        entries: vec![NvsEntry::new_file(
+            "ns".to_string(),
+            "k".to_string(),
+            FileEncoding::Binary,
+            PathBuf::from("does/not/exist.bin"),
+        )],
+    };
+    let error = partition.generate_partition(0x3000).unwrap_err();
+    assert!(error.to_string().contains("does/not/exist.bin"), "{error}");
+}
