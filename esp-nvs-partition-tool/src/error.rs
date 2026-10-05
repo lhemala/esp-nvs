@@ -37,7 +37,7 @@ pub enum Error {
     #[error("invalid partition size {0}: must be a multiple of 4096 bytes")]
     InvalidPartitionSize(usize),
 
-    #[error("too many namespaces (max 255)")]
+    #[error("too many namespaces (max 254)")]
     TooManyNamespaces,
 
     #[error("nvs error: {0}")]

@@ -143,3 +143,17 @@ fn test_csv_rejects_non_ascii_keys() {
         Err(esp_nvs_partition_tool::Error::InvalidKey(_))
     ));
 }
+
+/// ESP-IDF reserves namespace index 255 to match any namespace, so a partition holds at most 254.
+/// The 255th was accepted and given that index.
+#[test]
+fn test_generate_rejects_a_255th_namespace() {
+    let entries = (0..255)
+        .map(|i| NvsEntry::new_data(format!("n{i}"), "k".to_string(), DataValue::U8(1)))
+        .collect();
+    let partition = NvsPartition { entries };
+    assert!(matches!(
+        partition.generate_partition(0x6000),
+        Err(esp_nvs_partition_tool::Error::TooManyNamespaces)
+    ));
+}

@@ -54,20 +54,28 @@ pub(crate) fn generate_partition_data(partition: &NvsPartition, size: usize) -> 
         };
 
         match value {
-            DataValue::U8(v) => nvs.set(&namespace, &key, *v)?,
-            DataValue::I8(v) => nvs.set(&namespace, &key, *v)?,
-            DataValue::U16(v) => nvs.set(&namespace, &key, *v)?,
-            DataValue::I16(v) => nvs.set(&namespace, &key, *v)?,
-            DataValue::U32(v) => nvs.set(&namespace, &key, *v)?,
-            DataValue::I32(v) => nvs.set(&namespace, &key, *v)?,
-            DataValue::U64(v) => nvs.set(&namespace, &key, *v)?,
-            DataValue::I64(v) => nvs.set(&namespace, &key, *v)?,
+            DataValue::U8(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
+            DataValue::I8(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
+            DataValue::U16(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
+            DataValue::I16(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
+            DataValue::U32(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
+            DataValue::I32(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
+            DataValue::U64(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
+            DataValue::I64(v) => nvs.set(&namespace, &key, *v).map_err(map_nvs_error)?,
             DataValue::String(s) => nvs.set(&namespace, &key, s.as_str())?,
             DataValue::Binary(b) => nvs.set(&namespace, &key, b.as_slice())?,
         }
     }
 
     Ok(nvs.into_inner().into_inner())
+}
+
+/// Reports what the library says about namespaces as this crate's own error.
+fn map_nvs_error(e: esp_nvs::error::Error) -> Error {
+    match e {
+        esp_nvs::error::Error::TooManyNamespaces => Error::TooManyNamespaces,
+        e => Error::NvsError(e),
+    }
 }
 
 fn parse_file_content(content: &[u8], encoding: &FileEncoding) -> Result<DataValue, Error> {
