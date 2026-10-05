@@ -226,6 +226,13 @@ where
                                         EntryMapState::Erased,
                                     )?;
                                     page.erased_entry_count += item.span;
+                                    // The whole span is counted above, so its payload entries must
+                                    // not be visited again: they now read as erased and would each
+                                    // be counted a second time, pushing the next free entry past
+                                    // the end of the page.
+                                    if item.span >= 2 {
+                                        item_iter.nth((item.span - 2) as usize);
+                                    }
                                     continue 'item_iter;
                                 }
                                 page.set_entry_state_range(
