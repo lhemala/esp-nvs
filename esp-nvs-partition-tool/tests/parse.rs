@@ -98,3 +98,19 @@ fn test_binary_with_a_key_that_is_not_utf8() {
         Err(esp_nvs_partition_tool::Error::InvalidKey(_))
     ));
 }
+
+/// More encodings ESP-IDF's generator takes for data rows: `binary` stores the value text itself as
+/// a blob, and base64 may contain whitespace, as when wrapped over lines. Both were rejected.
+#[test]
+fn test_binary_encoding_and_wrapped_base64() {
+    let csv = "key,type,encoding,value\nns,namespace,,\nraw,data,binary,abc\nb64,data,base64,\"aGVs\nbG8=\"\n";
+    let partition = NvsPartition::try_from_str(csv).unwrap();
+    assert_eq!(
+        partition.entries[0].content,
+        EntryContent::Data(DataValue::Binary(b"abc".to_vec()))
+    );
+    assert_eq!(
+        partition.entries[1].content,
+        EntryContent::Data(DataValue::Binary(b"hello".to_vec()))
+    );
+}

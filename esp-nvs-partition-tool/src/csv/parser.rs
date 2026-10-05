@@ -123,9 +123,14 @@ fn parse_value(value: &str, encoding: &str) -> Result<DataValue, Error> {
             Ok(DataValue::Binary(bytes))
         }
         "base64" => {
-            let bytes = base64::engine::general_purpose::STANDARD.decode(value.trim())?;
+            // Python's `a2b_base64`, which ESP-IDF uses, skips whitespace anywhere in the value, as
+            // in base64 wrapped over several lines.
+            let value: String = value.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+            let bytes = base64::engine::general_purpose::STANDARD.decode(value)?;
             Ok(DataValue::Binary(bytes))
         }
+        // ESP-IDF stores the value text itself as a blob.
+        "binary" => Ok(DataValue::Binary(value.as_bytes().to_vec())),
         _ => Err(Error::InvalidEncoding(encoding.to_string())),
     }
 }
