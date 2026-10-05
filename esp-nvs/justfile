@@ -18,4 +18,4 @@ publish:
 
 [working-directory: 'tests/assets/']
 generate_test_nvs_bin:
-    esp-nvs-partition-tool generate test_nvs_data.csv test_nvs_data.bin --size 0x4000
+    cargo run --release -p esp-nvs-partition-tool -- generate test_nvs_data.csv test_nvs_data.bin --size 0x4000

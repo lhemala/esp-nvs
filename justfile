@@ -10,7 +10,6 @@ fix: nvs::fix partition_tool::fix
 fmt-all: fmt
     just --unstable --format
     nixfmt devenv.nix
-    nixfmt .nix/esp-nvs-partition-tool.nix
 
 fmt: _nightly-fmt
 

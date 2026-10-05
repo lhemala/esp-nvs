@@ -7,17 +7,10 @@
   # https://devenv.sh/basics/
   env.GREET = "devenv";
 
-  overlays = [
-    (final: prev: {
-      esp-nvs-partition-tool = final.callPackage ./.nix/esp-nvs-partition-tool.nix { };
-    })
-  ];
-
   # https://devenv.sh/packages/
   packages = with pkgs; [
     actionlint
     cargo-edit
-    esp-nvs-partition-tool
     git
     just
     nixfmt
