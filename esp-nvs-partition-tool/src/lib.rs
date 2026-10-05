@@ -44,7 +44,11 @@ impl NvsPartition {
         // all have their first byte well above 0x80, while CSV text is always
         // valid ASCII (< 0x80). We use 0x80 as the threshold to reliably
         // distinguish the two formats.
-        if input.first().is_some_and(|&b| b >= 0x80) {
+        //
+        // The one exception is a byte order mark, which editors on Windows like to put in front of
+        // a CSV file, and which starts with 0xEF.
+        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        if input.first().is_some_and(|&b| b >= 0x80) && !input.starts_with(UTF8_BOM) {
             Self::try_from_bytes(input)
         } else {
             Self::try_from_str(

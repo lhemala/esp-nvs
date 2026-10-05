@@ -56,3 +56,13 @@ name,data,string, spaced out
         EntryContent::Data(DataValue::String(" spaced out".to_string()))
     );
 }
+
+/// A CSV file starting with a UTF-8 byte order mark is still CSV. Its first byte is above 0x80, so
+/// it was taken for a binary partition and rejected for its size.
+#[test]
+fn test_csv_with_byte_order_mark() {
+    let csv = "\u{feff}key,type,encoding,value\nns,namespace,,\nk,data,u8,1\n";
+    let partition = NvsPartition::try_from(csv.as_bytes()).unwrap();
+    assert_eq!(partition.entries.len(), 1);
+    assert_eq!(partition.entries[0].key, "k");
+}
