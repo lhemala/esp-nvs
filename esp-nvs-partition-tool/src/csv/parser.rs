@@ -11,10 +11,9 @@ use crate::partition::{
     validate_key,
 };
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug)]
 struct CsvRow {
     key: String,
-    #[serde(rename = "type")]
     entry_type: String,
     encoding: String,
     value: String,
@@ -23,11 +22,38 @@ struct CsvRow {
 /// Parse NVS CSV content from a string into an [`NvsPartition`].
 pub(crate) fn parse_csv(content: &str) -> Result<NvsPartition, Error> {
     let mut partition = NvsPartition { entries: vec![] };
-    let mut reader = csv::Reader::from_reader(content.as_bytes());
+    // Like ESP-IDF's generator: lines starting with `#` are comments, and rows may be shorter than
+    // the header.
+    let mut reader = csv::ReaderBuilder::new()
+        .comment(Some(b'#'))
+        .flexible(true)
+        .from_reader(content.as_bytes());
     let mut current_namespace: Option<String> = None;
 
-    for result in reader.deserialize() {
-        let row: CsvRow = result?;
+    // Columns are looked up by name, as ESP-IDF does, and a field a row stops short of is empty: a
+    // namespace row may end after its type, as `ns,namespace`.
+    let headers = reader.headers()?.clone();
+    let column = |name: &str| headers.iter().position(|header| header == name);
+    let (key, entry_type, encoding, value) = (column("key"), column("type"), column("encoding"), column("value"));
+    if key.is_none() || entry_type.is_none() {
+        return Err(Error::InvalidValue(
+            "the CSV header has to name at least the columns key and type".to_string(),
+        ));
+    }
+
+    for result in reader.records() {
+        let record = result?;
+        let field = |index: Option<usize>| index.and_then(|index| record.get(index)).unwrap_or("").to_string();
+        let mut row = CsvRow {
+            key: field(key),
+            entry_type: field(entry_type),
+            encoding: field(encoding),
+            value: field(value),
+        };
+        // ESP-IDF tolerates spaces around the type and encoding, and encodings in any case. Keys
+        // and values are taken as written, spaces included, apart from numbers below.
+        row.entry_type = row.entry_type.trim().to_string();
+        row.encoding = row.encoding.trim().to_ascii_lowercase();
 
         if row.entry_type == "namespace" {
             validate_key(&row.key)?;
@@ -74,6 +100,7 @@ fn parse_row(row: CsvRow, namespace: String) -> Result<NvsEntry, Error> {
 macro_rules! parse_numeric {
     ($value:expr, $ty:ty, $variant:ident) => {
         $value
+            .trim()
             .parse::<$ty>()
             .map(DataValue::$variant)
             .map_err(|e| Error::InvalidValue(format!("invalid {} value: {}", stringify!($ty), e)))

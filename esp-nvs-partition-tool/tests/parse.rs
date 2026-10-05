@@ -31,3 +31,28 @@ fn test_key_length_validation() {
     let result = NvsPartition::try_from_str(&content);
     assert!(result.is_err());
 }
+
+/// CSV files written for ESP-IDF's generator have to parse here too. These all failed: comment
+/// lines, namespace rows without the trailing empty fields, spaces around type and encoding, an
+/// encoding in upper case, and spaces around a number.
+#[test]
+fn test_csv_accepted_by_esp_idf() {
+    let csv = "\
+# settings of the device
+key,type,encoding,value
+config,namespace
+# the version
+version, data , U8 , 5
+name,data,string, spaced out
+";
+    let partition = NvsPartition::try_from_str(csv).unwrap();
+    assert_eq!(partition.entries.len(), 2);
+    assert_eq!(partition.entries[0].namespace, "config");
+    assert_eq!(partition.entries[0].key, "version");
+    assert_eq!(partition.entries[0].content, EntryContent::Data(DataValue::U8(5)));
+    // String values are taken as written.
+    assert_eq!(
+        partition.entries[1].content,
+        EntryContent::Data(DataValue::String(" spaced out".to_string()))
+    );
+}
