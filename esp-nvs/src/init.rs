@@ -53,6 +53,31 @@ where
         #[cfg(feature = "debug-logs")]
         println!("internal: load_sectors");
 
+        let mut blob_index = self.scan_sectors()?;
+
+        // Finishing an interrupted defragmentation erases pages the scan above has already
+        // accounted for. The blob index in particular would count each chunk on both the source
+        // and its partial copy, find twice the data its index claims, and delete a blob that is
+        // perfectly intact. So start over from what is on flash once the recovery is done.
+        if self.continue_free_page()? {
+            self.pages.clear();
+            self.free_pages.clear();
+            self.namespaces.clear();
+            blob_index = self.scan_sectors()?;
+        }
+
+        // After loading all pages, check for duplicate primitive/string entries and mark older ones
+        // as erased This handles cases where deletion failed after a successful write
+        self.cleanup_duplicate_entries()?;
+
+        self.cleanup_dirty_blobs(blob_index)?;
+
+        Ok(())
+    }
+
+    /// Loads every sector into `self.pages` and `self.free_pages`, and the namespaces into
+    /// `self.namespaces`, returning what was found about blobs.
+    fn scan_sectors(&mut self) -> Result<BlobIndex, Error> {
         let mut blob_index = BlobIndex::new();
         let sectors = self.sectors as usize;
         for sector_idx in 0..sectors {
@@ -87,15 +112,7 @@ where
 
         self.ensure_active_page_order()?;
 
-        self.continue_free_page()?;
-
-        // After loading all pages, check for duplicate primitive/string entries and mark older ones
-        // as erased This handles cases where deletion failed after a successful write
-        self.cleanup_duplicate_entries()?;
-
-        self.cleanup_dirty_blobs(blob_index)?;
-
-        Ok(())
+        Ok(blob_index)
     }
 
     pub(crate) fn load_sector(&mut self, sector_address: usize) -> Result<LoadPageResult, Error> {

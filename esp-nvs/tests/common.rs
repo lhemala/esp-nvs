@@ -271,6 +271,35 @@ impl SharedFlash {
         self.0.borrow().is_empty()
     }
 
+    /// Wraps an existing partition image.
+    pub fn from_buf(buf: Vec<u8>) -> Self {
+        Self(Rc::new(RefCell::new(Flash {
+            buf,
+            fail_after_operation: usize::MAX,
+            ..Default::default()
+        })))
+    }
+
+    /// A copy of the raw partition image.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.0.borrow().buf.clone()
+    }
+
+    /// See [`Flash::arm_fault`].
+    pub fn arm_fault(&self, budget: usize) {
+        self.0.borrow_mut().arm_fault(budget)
+    }
+
+    /// See [`Flash::disable_faults`].
+    pub fn disable_faults(&self) {
+        self.0.borrow_mut().disable_faults()
+    }
+
+    /// See [`Flash::erases`].
+    pub fn erases(&self) -> usize {
+        self.0.borrow_mut().erases()
+    }
+
     /// Gives temporary mutable access to the raw partition image.
     pub fn with_buf<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
         f(&mut self.0.borrow_mut().buf)

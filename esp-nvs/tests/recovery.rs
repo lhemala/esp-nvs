@@ -147,3 +147,150 @@ fn a_partition_without_a_free_page_reports_flash_full() {
         Err(esp_nvs::error::Error::FlashFull)
     );
 }
+
+fn small_blob() -> Vec<u8> {
+    (0..1500u32).map(|i| (i * 7) as u8).collect()
+}
+
+fn large_blob() -> Vec<u8> {
+    (0..6000u32).map(|i| (i * 13 + 1) as u8).collect()
+}
+
+/// A partition holding blobs on several pages, a string and a few primitives, with some erased
+/// entries so defragmentation has something to reclaim.
+fn partition_with_values(pages: usize) -> Vec<u8> {
+    let flash = common::SharedFlash::new(pages);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    nvs.set(&namespace(), &Key::from_str("blob"), small_blob().as_slice())
+        .unwrap();
+    for i in 0..20u8 {
+        nvs.set(&namespace(), &Key::from_str(&format!("j{i}")), i).unwrap();
+    }
+    for i in 0..20u8 {
+        nvs.delete(&namespace(), &Key::from_str(&format!("j{i}"))).unwrap();
+    }
+    nvs.set(&namespace(), &Key::from_str("str"), "a string that has to survive")
+        .unwrap();
+    for i in 0..5u8 {
+        nvs.set(&namespace(), &Key::from_str(&format!("p{i}")), i).unwrap();
+    }
+    nvs.set(&namespace(), &Key::from_str("big"), large_blob().as_slice())
+        .unwrap();
+    for value in 0..60u32 {
+        nvs.set(&namespace(), &Key::from_str("counter"), value).unwrap();
+    }
+    drop(nvs);
+    flash.snapshot()
+}
+
+fn check_values(nvs: &mut esp_nvs::Nvs<common::SharedFlash>, context: &str) {
+    assert!(
+        nvs.get::<Vec<u8>>(&namespace(), &Key::from_str("blob")) == Ok(small_blob()),
+        "blob {context}"
+    );
+    assert!(
+        nvs.get::<Vec<u8>>(&namespace(), &Key::from_str("big")) == Ok(large_blob()),
+        "big {context}"
+    );
+    assert_eq!(
+        nvs.get::<String>(&namespace(), &Key::from_str("str")).as_deref(),
+        Ok("a string that has to survive"),
+        "str {context}"
+    );
+    for i in 0..5u8 {
+        assert_eq!(
+            nvs.get::<u8>(&namespace(), &Key::from_str(&format!("p{i}"))),
+            Ok(i),
+            "p{i} {context}"
+        );
+    }
+}
+
+/// Cuts the power once, at every flash operation in turn, while a counter is overwritten often
+/// enough to take every page through defragmentation, then boots twice and checks that nothing
+/// else was lost and that the partition can still be written.
+///
+/// This found that an interrupted defragmentation could fail `Nvs::new` on every boot (the resumed
+/// copy no longer fitting its partly used target, or no page left to resume into), copy into an
+/// erased page that never got a header, and delete intact blobs at boot because the chunks on the
+/// source and on its partial copy were both counted against the blob's index.
+fn power_loss_sweep(pages: usize) {
+    let image = partition_with_values(pages);
+    let counter = Key::from_str("counter");
+
+    // A counter overwrite takes about three operations, so this covers several defragmentations.
+    for budget in 0..1_200 {
+        let flash = common::SharedFlash::from_buf(image.clone());
+        let mut last_written = None;
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+            flash.arm_fault(budget);
+            for value in 0..500u32 {
+                if nvs.set(&namespace(), &counter, value).is_err() {
+                    break;
+                }
+                last_written = Some(value);
+            }
+        }
+        flash.disable_faults();
+
+        let context = format!("after a power loss at operation {budget}");
+        let mut nvs =
+            esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap_or_else(|e| panic!("Nvs::new {context}: {e:?}"));
+        check_values(&mut nvs, &context);
+        if let Some(value) = last_written {
+            // The write the power went out on may or may not have made it.
+            let read = nvs.get::<u32>(&namespace(), &counter);
+            assert!(read == Ok(value) || read == Ok(value + 1), "counter {read:?} {context}");
+        }
+        for value in 0..150u32 {
+            nvs.set(&namespace(), &counter, value)
+                .unwrap_or_else(|e| panic!("set {e:?} {context}"));
+        }
+        drop(nvs);
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        check_values(&mut nvs, &format!("{context}, one session later"));
+    }
+}
+
+#[test]
+fn power_loss_during_defragmentation_of_three_pages() {
+    power_loss_sweep(3);
+}
+
+#[test]
+fn power_loss_during_defragmentation_of_four_pages() {
+    power_loss_sweep(4);
+}
+
+/// An interrupted defragmentation with no copy target yet, where the only free pages are corrupt.
+///
+/// Resuming erased a free page but never initialized it, copied the items into the headerless page
+/// and erased the source. On the next boot the page read as blank and its items were gone.
+#[test]
+fn a_resumed_defragmentation_copies_into_an_initialized_page() {
+    let flash = common::SharedFlash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        for i in 0..10u8 {
+            nvs.set(&namespace(), &Key::from_str(&format!("k{i}")), i).unwrap();
+        }
+    }
+    flash.with_buf(|buf| {
+        let sector = esp_nvs::FLASH_SECTOR_SIZE;
+        // ACTIVE to FREEING. The state is not covered by the page header CRC.
+        buf[..4].copy_from_slice(&0xFFFF_FFF8u32.to_le_bytes());
+        // The other two pages carry a state but no CRC, as an interrupted header write leaves them.
+        for page in 1..3 {
+            buf[page * sector..page * sector + 4].copy_from_slice(&0xFFFF_FFFEu32.to_le_bytes());
+        }
+    });
+
+    for _boot in 0..2 {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        for i in 0..10u8 {
+            assert_eq!(nvs.get::<u8>(&namespace(), &Key::from_str(&format!("k{i}"))), Ok(i));
+        }
+    }
+}

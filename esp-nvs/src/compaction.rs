@@ -165,7 +165,22 @@ where
         Ok(())
     }
 
-    pub(crate) fn continue_free_page(&mut self) -> Result<(), Error> {
+    /// Finishes a defragmentation that was interrupted, returning whether there was one.
+    ///
+    /// A defragmentation only starts once no page is `Active`: it marks the source `Freeing`,
+    /// copies its live items into a freshly initialized reserve page, which is `Active` from
+    /// then on, and erases the source. So a `Freeing` page found here has to be finished, and
+    /// an `Active` page next to it holds nothing but a partial copy of it.
+    ///
+    /// That partial copy is thrown away and the copy restarted into a clean page, the way ESP-IDF
+    /// does it. Resuming it in place instead cannot be relied on: a write torn by the power loss
+    /// leaves erased entries in the target, and with those the rest of the source may no longer
+    /// fit, failing the same way on every boot.
+    ///
+    /// The one target worth keeping is a complete one. A copy that fills its target leaves it
+    /// `Full` rather than `Active`, and when the reserve was the only free page there is none left
+    /// to restart into, so that state would also fail on every boot.
+    pub(crate) fn continue_free_page(&mut self) -> Result<bool, Error> {
         #[cfg(feature = "defmt")]
         trace!("continue_free_page");
 
@@ -174,34 +189,76 @@ where
             .iter()
             .position(|it| it.header.state == ThinPageState::Freeing)
         {
-            None => return Ok(()),
+            None => return Ok(false),
             Some(idx) => self.pages.swap_remove(idx),
         };
 
-        let target_page = match self
+        if let Some(idx) = self
             .pages
             .iter()
             .position(|it| it.header.state == ThinPageState::Active)
         {
-            Some(idx) => self.pages.swap_remove(idx),
-            None => {
-                let mut page = self.free_pages.pop().ok_or(Error::FlashFull)?;
-                if page.header.state != ThinPageState::Uninitialized {
-                    self.erase_page(page)?;
-                    self.free_pages.pop().unwrap() // there is always a page after erasing
-                } else {
-                    let next_sequence = self.get_next_sequence();
-                    page.initialize(&mut self.hal, next_sequence)?;
-                    page
-                }
-            }
-        };
+            let partial_copy = self.pages.swap_remove(idx);
+            self.erase_page(partial_copy)?;
+        } else if self.newest_page_holds_all_items_of(&source_page)? {
+            self.erase_page(source_page)?;
+            return Ok(true);
+        }
 
-        self.copy_items(&source_page, target_page)?;
+        let mut target = self.free_pages.pop().ok_or(Error::FlashFull)?;
+        if target.header.state != ThinPageState::Uninitialized {
+            self.hal
+                .erase(target.address as _, (target.address + FLASH_SECTOR_SIZE) as _)
+                .map_err(|_| Error::FlashError)?;
+            target = ThinPage::uninitialized(target.address);
+        }
+        // The source is out of `self.pages` but its sequence counts all the same.
+        let next_sequence = self.get_next_sequence().max(source_page.header.sequence + 1);
+        target.initialize(&mut self.hal, next_sequence)?;
+
+        self.copy_items(&source_page, target)?;
 
         self.erase_page(source_page)?;
 
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether the newest page holds an item for every live item of `source`, meaning a copy of
+    /// `source` into it completed.
+    ///
+    /// Should that page instead be an ordinary one that happens to hold newer values for each of
+    /// those keys, the items on `source` are outdated duplicates, so dropping `source` is just as
+    /// right.
+    fn newest_page_holds_all_items_of(&mut self, source: &ThinPage) -> Result<bool, Error> {
+        let Some(newest) = self.pages.iter().max_by_key(|page| page.header.sequence) else {
+            return Ok(false);
+        };
+        if newest.header.sequence <= source.header.sequence {
+            return Ok(false);
+        }
+
+        for source_entry in &source.item_hash_list {
+            let Ok(item) = source.load_item(&mut self.hal, source_entry.index) else {
+                continue;
+            };
+
+            let mut found = false;
+            for entry in newest.item_hash_list.iter().filter(|it| it.hash == source_entry.hash) {
+                if let Ok(candidate) = newest.load_item(&mut self.hal, entry.index)
+                    && candidate.namespace_index == item.namespace_index
+                    && candidate.key == item.key
+                    && candidate.chunk_index == item.chunk_index
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     /// Clean up duplicate primitive/string entries by marking older versions as erased.
@@ -334,8 +391,13 @@ where
             ThinPageState::Uninitialized => unreachable!(),
             ThinPageState::Active => unreachable!(),
             ThinPageState::Full => {
-                if page.erased_entry_count != ENTRIES_PER_PAGE as _ {
-                    self.free_page(&page, next_sequence)?;
+                if page.erased_entry_count != ENTRIES_PER_PAGE as _
+                    && let Err(e) = self.free_page(&page, next_sequence)
+                {
+                    // The source still holds its items, so it stays in the instance. At the front,
+                    // where the oldest pages are, and away from the tail an active page belongs at.
+                    self.pages.insert(0, page);
+                    return Err(e);
                 }
 
                 self.erase_page(page)?;
@@ -377,13 +439,11 @@ where
         #[cfg(feature = "debug-logs")]
         println!("internal: copy_entries_to_reserve_page");
 
-        // Mark source page as FREEING
+        // Mark source page as FREEING before the reserve page is touched. The other way round, a
+        // power loss in between would leave the initialized reserve as an ordinary active page and
+        // the partition without a reserve. `continue_free_page` picks up from either point.
         let raw = (PageState::Freeing as u32).to_le_bytes();
         write_aligned(&mut self.hal, source.address as u32, &raw).map_err(|_| Error::FlashError)?;
-
-        // TODO: Check if the active page has still some space left, e.g. this might happen if we
-        //  wanted to write a string that can't be split over multiple pages or a chunk of blob_data
-        //  which requires at least 2 empty entries
 
         // When free_page is called, we should always we have on page in reserve.
         let mut target = self.free_pages.pop().ok_or(Error::FlashFull)?;
@@ -406,14 +466,6 @@ where
         #[cfg(feature = "defmt")]
         trace!("copy_items");
 
-        // in case the operation was disturbed in the middle, target might already contain some
-        // parts of the source page, so we first get the last copied item so we can ignor it
-        // and everything before in our copy loop
-        let mut last_copied_entry = match target.item_hash_list.iter().max_by_key(|it| it.index) {
-            Some(hash_entry) => Some(target.load_item(&mut self.hal, hash_entry.index)?),
-            None => None,
-        };
-
         let mut item_index = 0u8;
         while item_index < ENTRIES_PER_PAGE as u8 {
             if source.get_entry_state(item_index) != EntryMapState::Written {
@@ -422,20 +474,6 @@ where
             }
 
             let item = source.load_item(&mut self.hal, item_index)?;
-
-            // in case we were disrupted while copying, we want to ignore all entries that before we
-            // reached the last copied one
-            if let Some(last) = last_copied_entry {
-                if item == last {
-                    // We found our match, everything after this still needs to be copied
-                    last_copied_entry = None;
-                } else {
-                    // No match yet, keep searching
-                }
-
-                item_index += item.span;
-                continue;
-            }
 
             match item.type_ {
                 ItemType::U8
