@@ -134,8 +134,7 @@ impl ThinPage {
             return Err(KeyNotFound);
         }
 
-        // Safety: we check the crc afterwards
-        let item = unsafe { core::mem::transmute::<[u8; 32], Item>(buf) };
+        let item = Item::from_raw(buf);
 
         if item.crc != item.calculate_crc32(T::crc32) {
             return Err(KeyNotFound);

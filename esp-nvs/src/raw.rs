@@ -47,6 +47,14 @@ const _: () = assert!(
     "Page structure size must equal flash sector size"
 );
 
+/// Replaces a type byte that is not a known [`ItemType`] by `ItemType::Any`, see
+/// [`Item::from_raw`].
+pub(crate) fn sanitize_item_type(entry: &mut [u8; size_of::<Item>()]) {
+    if ItemType::from_repr(entry[1]).is_none() {
+        entry[1] = ItemType::Any as u8;
+    }
+}
+
 #[repr(C, packed)]
 pub(crate) struct RawPage {
     pub(crate) header: PageHeader,
@@ -238,6 +246,19 @@ pub(crate) union RawItem {
 }
 
 impl Item {
+    /// Reinterprets a raw entry read from flash as an item.
+    ///
+    /// `type_` is an enum, so a byte that is not one of its values must never end up in it: that is
+    /// undefined behaviour, and in practice a `match` on it executes an illegal instruction. Any
+    /// entry can hold such a byte - a payload entry, a torn write, a bit flip - so it is replaced
+    /// by `ItemType::Any` first. The CRC stored in the entry was computed over the original
+    /// byte, so the item fails its CRC check and is treated like any other corrupt entry.
+    pub(crate) fn from_raw(mut raw: [u8; size_of::<Item>()]) -> Item {
+        sanitize_item_type(&mut raw);
+        // Safety: every field is plain old data apart from `type_`, which was just made valid.
+        unsafe { transmute::<[u8; size_of::<Item>()], Item>(raw) }
+    }
+
     #[cfg(feature = "debug-logs")]
     fn get_primitive(&self) -> Result<u64, Error> {
         let width = match self.type_ {

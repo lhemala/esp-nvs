@@ -754,3 +754,32 @@ fn iterators_skip_items_whose_namespace_entry_is_lost() {
     let entries: Vec<_> = nvs.typed_entries().collect::<Result<_, _>>().unwrap();
     assert_eq!(entries, vec![(Key::from_str("kept"), Key::from_str("k"), ItemType::U8)]);
 }
+
+/// An entry whose type byte is not a known item type, with a CRC that matches it.
+///
+/// Raw flash was reinterpreted as an item with an enum field for the type, so an unknown byte was
+/// undefined behaviour, and the scan's `match` on it executed an illegal instruction. Such an item
+/// cannot be anything this crate knows how to read, so it is treated as corrupt.
+#[test]
+fn an_item_with_an_unknown_type_is_treated_as_corrupt() {
+    let namespace = Key::from_str("ns1");
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace, &Key::from_str("odd"), 1u8).unwrap();
+        nvs.set(&namespace, &Key::from_str("kept"), 2u8).unwrap();
+    }
+
+    let entry = find_item_entry(&flash.buf, NAMESPACE_ONE_INDEX, ItemType::U8, &Key::from_str("odd")).unwrap();
+    flash.buf[entry + 1] = 0x99;
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(
+        nvs.get::<u8>(&namespace, &Key::from_str("odd")),
+        Err(Error::KeyNotFound)
+    );
+    assert_eq!(nvs.get::<u8>(&namespace, &Key::from_str("kept")), Ok(2));
+    nvs.set(&namespace, &Key::from_str("odd"), 3u8).unwrap();
+    assert_eq!(nvs.get::<u8>(&namespace, &Key::from_str("odd")), Ok(3));
+}

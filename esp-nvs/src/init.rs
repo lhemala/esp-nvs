@@ -40,6 +40,7 @@ use crate::raw::{
     ItemType,
     PageHeader,
     RawPage,
+    sanitize_item_type,
 };
 use crate::types::{
     NamespaceIndex,
@@ -146,9 +147,18 @@ where
             return Ok(LoadPageResult::Empty(page));
         }
 
+        // The items are reinterpreted from raw flash, so their type bytes have to be valid first,
+        // see `Item::from_raw`. `buf` itself keeps the bytes as they are on flash.
+        let mut sanitized = buf;
+        sanitized[offset_of!(RawPage, items)..]
+            .as_chunks_mut::<{ size_of::<Item>() }>()
+            .0
+            .iter_mut()
+            .for_each(sanitize_item_type);
+
         // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc
         // afterwards
-        let raw_page: RawPage = unsafe { core::mem::transmute(buf) };
+        let raw_page: RawPage = unsafe { core::mem::transmute(sanitized) };
 
         #[cfg(feature = "debug-logs")]
         {
