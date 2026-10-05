@@ -157,8 +157,8 @@ fn corrupt_page() {
         NvsStatistics {
             pages: PageStatistics {
                 empty: 1,
-                active: 0,
-                full: 2,
+                active: 1,
+                full: 1,
                 erasing: 0,
                 corrupted: 1,
             },
@@ -217,8 +217,8 @@ fn corrupt_entry() {
         NvsStatistics {
             pages: PageStatistics {
                 empty: 1,
-                active: 0,
-                full: 3,
+                active: 1,
+                full: 2,
                 erasing: 0,
                 corrupted: 0,
             },
