@@ -729,3 +729,28 @@ fn item_with_a_corrupt_header_survives_defragmentation() {
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
     assert_eq!(nvs.get::<u32>(&namespace, &counter).unwrap(), 1_999);
 }
+
+/// An item whose namespace entry was lost to corruption must not take the iterators down.
+///
+/// The scan erases a namespace entry that fails its CRC but keeps the items in that namespace,
+/// and both iterators unwrapped the namespace lookup for every item they yielded.
+#[test]
+fn iterators_skip_items_whose_namespace_entry_is_lost() {
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("lost"), &Key::from_str("k"), 7u8).unwrap();
+        nvs.set(&Key::from_str("kept"), &Key::from_str("k"), 8u8).unwrap();
+    }
+
+    // Entry 0 of the first page defines the namespace `lost`. Flip a key bit so its CRC fails.
+    let entry = common::ITEM_OFFSET;
+    assert_eq!(flash.buf[entry], 0, "expected a namespace entry");
+    flash.buf[entry + ITEM_KEY_OFFSET] &= 0x0F;
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    let keys: Vec<_> = nvs.keys().collect::<Result<_, _>>().unwrap();
+    assert_eq!(keys, vec![(Key::from_str("kept"), Key::from_str("k"))]);
+    let entries: Vec<_> = nvs.typed_entries().collect::<Result<_, _>>().unwrap();
+    assert_eq!(entries, vec![(Key::from_str("kept"), Key::from_str("k"), ItemType::U8)]);
+}

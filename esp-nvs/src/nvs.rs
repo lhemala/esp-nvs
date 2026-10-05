@@ -392,15 +392,13 @@ impl<'a, T: Platform> IterKeys<'a, T> {
         }
     }
 
-    fn item_to_keys(&self, item: Item) -> (Key, Key) {
-        let (namespace_key, _) = self
-            .namespaces
-            .iter()
-            .find(|(_, idx)| **idx == item.namespace_index)
-            // a key should always have a namespace
-            .unwrap();
+    /// `None` for an item whose namespace is unknown. That is not supposed to exist, but it does
+    /// once the namespace's own entry is lost to corruption: the scan drops that entry and keeps
+    /// the items, which no `get` can reach any more.
+    fn item_to_keys(&self, item: Item) -> Option<(Key, Key)> {
+        let (namespace_key, _) = self.namespaces.iter().find(|(_, idx)| **idx == item.namespace_index)?;
 
-        (*namespace_key, item.key)
+        Some((*namespace_key, item.key))
     }
 }
 
@@ -424,7 +422,10 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
                         continue;
                     }
 
-                    Some(Ok(self.item_to_keys(item)))
+                    match self.item_to_keys(item) {
+                        Some(keys) => Some(Ok(keys)),
+                        None => continue,
+                    }
                 }
                 Err(err) => Some(Err(err)),
             };
@@ -446,14 +447,11 @@ impl<'a, T: Platform> IterTypedEntries<'a, T> {
         }
     }
 
-    fn item_to_entry(&self, item: Item) -> (Key, Key, ItemType) {
-        let (namespace_key, _) = self
-            .namespaces
-            .iter()
-            .find(|(_, idx)| **idx == item.namespace_index)
-            .unwrap();
+    /// `None` for an item whose namespace is unknown, see [`IterKeys::item_to_keys`].
+    fn item_to_entry(&self, item: Item) -> Option<(Key, Key, ItemType)> {
+        let (namespace_key, _) = self.namespaces.iter().find(|(_, idx)| **idx == item.namespace_index)?;
 
-        (*namespace_key, item.key, item.type_)
+        Some((*namespace_key, item.key, item.type_))
     }
 }
 
@@ -475,7 +473,10 @@ impl<'a, T: Platform> Iterator for IterTypedEntries<'a, T> {
                     }
 
                     // Include BlobIndex, legacy Blob (0x41), primitives, and Sized
-                    Some(Ok(self.item_to_entry(item)))
+                    match self.item_to_entry(item) {
+                        Some(entry) => Some(Ok(entry)),
+                        None => continue,
+                    }
                 }
                 Err(err) => Some(Err(err)),
             };
