@@ -73,6 +73,18 @@ impl MemFlash {
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
+
+    /// The range of `buf` an access of `len` bytes at `offset` covers, if it lies inside the flash
+    /// and is aligned to `alignment`. A real flash reports an error for anything else, and so does
+    /// this one rather than panicking on an out of bounds slice.
+    fn range(&self, offset: u32, len: usize, alignment: usize) -> Result<core::ops::Range<usize>, MemFlashError> {
+        let start = offset as usize;
+        let end = start.checked_add(len).ok_or(MemFlashError)?;
+        if end > self.buf.len() || !start.is_multiple_of(alignment) || !len.is_multiple_of(alignment) {
+            return Err(MemFlashError);
+        }
+        Ok(start..end)
+    }
 }
 
 #[derive(Debug)]
@@ -92,8 +104,8 @@ impl ReadNorFlash for MemFlash {
     const READ_SIZE: usize = WORD_SIZE;
 
     fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        let offset = offset as usize;
-        bytes.copy_from_slice(&self.buf[offset..offset + bytes.len()]);
+        let range = self.range(offset, bytes.len(), Self::READ_SIZE)?;
+        bytes.copy_from_slice(&self.buf[range]);
         Ok(())
     }
 
@@ -107,17 +119,17 @@ impl NorFlash for MemFlash {
     const ERASE_SIZE: usize = FLASH_SECTOR_SIZE;
 
     fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        for addr in from..to {
-            self.buf[addr as usize] = 0xFF;
-        }
+        let len = (to as usize).checked_sub(from as usize).ok_or(MemFlashError)?;
+        let range = self.range(from, len, Self::ERASE_SIZE)?;
+        self.buf[range].fill(0xFF);
         Ok(())
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
-        let offset = offset as usize;
-        for (i, &val) in bytes.iter().enumerate() {
+        let range = self.range(offset, bytes.len(), Self::WRITE_SIZE)?;
+        for (target, &val) in self.buf[range].iter_mut().zip(bytes) {
             // Real NOR flash can only flip bits from 1 to 0
-            self.buf[offset + i] &= val;
+            *target &= val;
         }
         Ok(())
     }
@@ -126,5 +138,28 @@ impl NorFlash for MemFlash {
 impl Crc for MemFlash {
     fn crc32(init: u32, data: &[u8]) -> u32 {
         software_crc32(init, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use embedded_storage::nor_flash::{
+        NorFlash,
+        ReadNorFlash,
+    };
+
+    use super::MemFlash;
+    use crate::FLASH_SECTOR_SIZE;
+
+    #[test]
+    fn out_of_bounds_access_is_an_error_not_a_panic() {
+        let mut flash = MemFlash::new(1);
+        let mut buf = [0u8; 8];
+        assert!(flash.read(FLASH_SECTOR_SIZE as u32 - 4, &mut buf).is_err());
+        assert!(flash.read(u32::MAX - 3, &mut buf).is_err());
+        assert!(flash.write(FLASH_SECTOR_SIZE as u32, &buf).is_err());
+        assert!(flash.erase(0, 2 * FLASH_SECTOR_SIZE as u32).is_err());
+        assert!(flash.erase(FLASH_SECTOR_SIZE as u32, 0).is_err());
+        assert!(flash.read(0, &mut buf).is_ok());
     }
 }
