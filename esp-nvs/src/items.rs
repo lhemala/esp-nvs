@@ -803,6 +803,12 @@ where
             return Ok(page);
         }
 
+        // Defragmentation copies into the reserve page, so without one there is nothing to try.
+        // This is reached by a partition loaded with every page in use.
+        if self.free_pages.is_empty() {
+            return Err(Error::FlashFull);
+        }
+
         // Only try reclamation if we have no free pages left
         if self.free_pages.len() == 1 {
             self.defragment()?;
@@ -819,7 +825,7 @@ where
         }
 
         // at this point we have at least 2 free pages
-        let mut page = self.free_pages.pop().unwrap();
+        let mut page = self.free_pages.pop().ok_or(Error::FlashFull)?;
 
         if page.header.state != ThinPageState::Uninitialized {
             self.hal

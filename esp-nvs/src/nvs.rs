@@ -69,9 +69,19 @@ impl<T: Platform> Nvs<T> {
             return Err(Error::InvalidPartitionSize);
         }
 
+        // A single page still makes sense for reading a read-only image, but an empty partition
+        // does not. Writing needs two, one to write to and one in reserve for
+        // defragmentation; with fewer `set` reports `FlashFull`.
         let sectors = partition_size / FLASH_SECTOR_SIZE;
-        if sectors > u16::MAX as usize {
+        if !(1..=u16::MAX as usize).contains(&sectors) {
             return Err(Error::InvalidPartitionSize);
+        }
+
+        // Flash addresses are u32, and the partition has to lie inside the flash it is read from:
+        // past either, reads and writes would wrap or run into whatever `hal` does out of range.
+        match partition_offset.checked_add(partition_size) {
+            Some(end) if end <= hal.capacity() && end <= u32::MAX as usize + 1 => {}
+            _ => return Err(Error::InvalidPartitionSize),
         }
 
         let mut nvs: Nvs<T> = Self {

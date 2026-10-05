@@ -90,3 +90,60 @@ fn a_full_page_left_active_is_not_written_past_its_end() {
     }
     assert_eq!(nvs.get::<u8>(&Key::from_str("other"), &Key::from_str("x")), Ok(1));
 }
+
+/// An empty partition is rejected. It was accepted, and the first `set` panicked looking for a free
+/// page.
+#[test]
+fn an_empty_partition_is_rejected() {
+    let flash = common::Flash::new(2);
+    let result = esp_nvs::Nvs::new(0, 0, flash);
+    assert!(matches!(result, Err(esp_nvs::error::Error::InvalidPartitionSize)));
+}
+
+/// A single page can be read, as a read-only image is, but has no reserve page to write with.
+#[test]
+fn a_single_page_partition_reports_flash_full_on_write() {
+    let mut flash = common::Flash::new(1);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(
+        nvs.set(&namespace(), &Key::from_str("a"), 1u8),
+        Err(esp_nvs::error::Error::FlashFull)
+    );
+}
+
+/// A partition reaching past the end of the flash is rejected rather than read out of bounds.
+#[test]
+fn a_partition_larger_than_the_flash_is_rejected() {
+    let flash = common::Flash::new(2);
+    let result = esp_nvs::Nvs::new(0, 3 * esp_nvs::FLASH_SECTOR_SIZE, flash);
+    assert!(matches!(result, Err(esp_nvs::error::Error::InvalidPartitionSize)));
+
+    let flash = common::Flash::new(3);
+    let result = esp_nvs::Nvs::new(2 * esp_nvs::FLASH_SECTOR_SIZE, 2 * esp_nvs::FLASH_SECTOR_SIZE, flash);
+    assert!(matches!(result, Err(esp_nvs::error::Error::InvalidPartitionSize)));
+}
+
+/// A partition with every page in use has no reserve page. `set` panicked unwrapping a free page
+/// instead of reporting that the partition is full.
+#[test]
+fn a_partition_without_a_free_page_reports_flash_full() {
+    let mut flash = common::Flash::new(2);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace(), &Key::from_str("a"), 1u8).unwrap();
+    }
+    // Give the second page a valid header too, as an image filling every page would.
+    let header: Vec<u8> = flash.buf[..32].to_vec();
+    flash.buf[esp_nvs::FLASH_SECTOR_SIZE..esp_nvs::FLASH_SECTOR_SIZE + 32].copy_from_slice(&header);
+    // FULL for both, so neither is the active page.
+    flash.buf[..4].copy_from_slice(&0xFFFF_FFFCu32.to_le_bytes());
+    let second = esp_nvs::FLASH_SECTOR_SIZE;
+    flash.buf[second..second + 4].copy_from_slice(&0xFFFF_FFFCu32.to_le_bytes());
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(nvs.get::<u8>(&namespace(), &Key::from_str("a")), Ok(1));
+    assert_eq!(
+        nvs.set(&namespace(), &Key::from_str("b"), 2u8),
+        Err(esp_nvs::error::Error::FlashFull)
+    );
+}

@@ -15,7 +15,8 @@ pub enum Error {
     #[error("invalid partition offset")]
     InvalidPartitionOffset,
 
-    /// The partition size has to be a multiple of the flash sector size (4k)
+    /// The partition size has to be a non-zero multiple of the flash sector size (4k), and the
+    /// partition has to fit the flash it is on
     #[error("invalid partition size")]
     InvalidPartitionSize,
 
