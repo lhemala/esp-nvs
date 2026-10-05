@@ -5,6 +5,66 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-05
+
+### Features
+
+- *(esp-nvs)* Migrate legacy single-page blobs when opening a partition
+
+### Bug Fixes
+
+- *(esp-nvs)* Reject inconsistent multi-page blobs
+- *(esp-nvs)* Refuse blobs needing a 128th chunk
+- *(esp-nvs)* Pin the largest storable blob to MAX_BLOB_SIZE - 1
+- *(esp-nvs)* Bound the retries when writing a blob
+- *(esp-nvs)* Replace a value whatever type the key held
+- *(esp-nvs)* Report a zero sized string instead of panicking
+- *(esp-nvs)* Bound a referenced data read to its own page
+- *(esp-nvs)* Survive an impossible span while scanning a page
+- *(esp-nvs)* Keep the active page when a write gives up
+- *(esp-nvs)* Mark an entry with an impossible span as erased
+- *(esp-nvs)* Count a torn variable sized item once while scanning
+- *(esp-nvs)* Never write an item past the end of its page
+- *(esp-nvs)* Report a partition without a reserve page instead of panicking
+- *(esp-nvs)* Skip items of an unknown namespace while iterating
+- *(esp-nvs)* Restart an interrupted defragmentation from scratch
+- *(esp-nvs)* Erase what a torn write leaves behind while scanning
+- *(esp-nvs)* Never reinterpret an unknown type byte as an item type
+- *(esp-nvs)* Keep the newer of two blob versions at boot
+- *(esp-nvs)* Resolve a key left holding a blob and another value
+- *(esp-nvs)* Remove the chunks of a blob write that failed
+- *(esp-nvs)* Put the active page back when a write fails
+- *(esp-nvs)* Let a corrupt blob be replaced by writing it again
+- *(esp-nvs)* Copy items byte for byte when defragmenting
+- *(esp-nvs)* Do not defragment a page that has nothing to reclaim
+- *(esp-nvs)* Stop at 254 namespaces
+- *(esp-nvs)* List every blob in keys()
+- *(esp-nvs)* Stop Key::as_str from building invalid UTF-8
+- *(esp-nvs)* Write a blob index without uninitialized bytes
+- *(esp-nvs)* Report an out of range MemFlash access as an error
+- *(esp-nvs)* Align by the alignment, not by the size
+- *(esp-nvs)* Erase an active page at boot only when it is a partial copy
+- *(esp-nvs)* Erase an item whose payload was never marked written
+
+### Other
+
+- Run the partition tool through cargo instead of devenv
+
+### Documentation
+
+- *(esp-nvs)* Record what a successful defragment does not promise
+- *(esp-nvs)* Update what a failed blob write leaves behind
+
+### Testing
+
+- *(esp-nvs)* Cover CorruptedData branches for blobs
+- *(esp-nvs)* Cover purging a blob that spans pages
+- *(esp-nvs)* Pin the chunk base alternation between blob versions
+- *(esp-nvs)* Cover the string length limit
+- *(esp-nvs)* Pin the support for legacy single-page blobs
+- *(esp-nvs)* Regenerate test_nvs_data.bin with the current generator
+
+
 ## [0.5.0] - 2026-07-10
 
 ### Features
