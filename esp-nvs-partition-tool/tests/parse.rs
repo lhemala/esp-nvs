@@ -66,3 +66,35 @@ fn test_csv_with_byte_order_mark() {
     assert_eq!(partition.entries.len(), 1);
     assert_eq!(partition.entries[0].key, "k");
 }
+
+/// A key in a binary partition that is not UTF-8 is reported, rather than written to the CSV cut
+/// short at its first invalid byte.
+#[test]
+fn test_binary_with_a_key_that_is_not_utf8() {
+    let partition = NvsPartition {
+        entries: vec![esp_nvs_partition_tool::NvsEntry::new_data(
+            "ns".to_string(),
+            "abc".to_string(),
+            DataValue::U8(1),
+        )],
+    };
+    let mut image = partition.generate_partition(0x3000).unwrap();
+
+    // Find the item header of `abc` and put an invalid UTF-8 sequence into its key.
+    let entry = (0..126)
+        .map(|entry| 64 + entry * 32)
+        .find(|&offset| &image[offset + 8..offset + 11] == b"abc")
+        .unwrap();
+    image[entry + 9] = 0xC3;
+    image[entry + 10] = 0x28;
+    // Fix the item CRC: it covers bytes 0..4, the key and the data.
+    let mut crc_input = image[entry..entry + 4].to_vec();
+    crc_input.extend_from_slice(&image[entry + 8..entry + 32]);
+    let crc = esp_nvs::platform::software_crc32(u32::MAX, &crc_input);
+    image[entry + 4..entry + 8].copy_from_slice(&crc.to_le_bytes());
+
+    assert!(matches!(
+        NvsPartition::try_from_bytes(image),
+        Err(esp_nvs_partition_tool::Error::InvalidKey(_))
+    ));
+}
