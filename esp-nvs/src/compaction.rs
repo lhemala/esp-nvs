@@ -516,67 +516,50 @@ where
         Ok(())
     }
 
+    /// Copies the live items of `source` into `target`, which then goes into `self.pages`.
+    ///
+    /// Items are copied byte for byte, header and payload, the way ESP-IDF does it. Rebuilding them
+    /// from what was read instead dropped every item type it had no case for, the legacy
+    /// single-page blob among them, and recomputed the data CRC of strings and chunks, so data that
+    /// had already failed its CRC came out of a defragmentation as a valid value.
+    ///
+    /// An entry that does not read back as an item, or whose span does not fit the page, is not
+    /// copied. It is not anything a read could return, and failing the copy over it would fail
+    /// every defragmentation of this page from now on.
     pub(crate) fn copy_items(&mut self, source: &ThinPage, mut target: ThinPage) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("copy_items");
 
-        let mut item_index = 0u8;
-        while item_index < ENTRIES_PER_PAGE as u8 {
-            if source.get_entry_state(item_index) != EntryMapState::Written {
+        let mut item_index = 0usize;
+        while item_index < ENTRIES_PER_PAGE {
+            if source.get_entry_state(item_index as u8) != EntryMapState::Written {
                 item_index += 1;
                 continue;
             }
 
-            let item = source.load_item(&mut self.hal, item_index)?;
-
-            match item.type_ {
-                ItemType::U8
-                | ItemType::I8
-                | ItemType::U16
-                | ItemType::I16
-                | ItemType::U32
-                | ItemType::I32
-                | ItemType::U64
-                | ItemType::I64
-                | ItemType::BlobIndex => {
-                    target.write_item::<T>(
-                        &mut self.hal,
-                        item.namespace_index,
-                        item.key,
-                        item.type_,
-                        if item.chunk_index == u8::MAX {
-                            None
-                        } else {
-                            Some(item.chunk_index)
-                        },
-                        item.span,
-                        item.data,
-                    )?;
+            let item = match source.load_item(&mut self.hal, item_index as u8) {
+                Ok(item) => item,
+                Err(Error::FlashError) => {
+                    self.pages.push(target);
+                    return Err(Error::FlashError);
                 }
-                ItemType::Sized | ItemType::BlobData => {
-                    let data = source.load_referenced_data(&mut self.hal, item_index, &item)?;
-                    target.write_variable_sized_item::<T>(
-                        &mut self.hal,
-                        item.namespace_index,
-                        item.key,
-                        item.type_,
-                        if item.chunk_index == u8::MAX {
-                            None
-                        } else {
-                            Some(item.chunk_index)
-                        },
-                        &data,
-                    )?;
+                Err(_) => {
+                    item_index += 1;
+                    continue;
                 }
-                ItemType::Blob => {
-                    // Old BLOB type - not supported, skip
-                }
-                ItemType::Any => {
-                    // Should not happen
-                }
+            };
+            let span = item.span as usize;
+            if span == 0 || item_index + span > ENTRIES_PER_PAGE {
+                item_index += 1;
+                continue;
             }
 
-            item_index += item.span;
+            if let Err(e) = target.copy_item_from::<T>(&mut self.hal, source, item_index as u8, &item) {
+                self.pages.push(target);
+                return Err(e);
+            }
+
+            item_index += span;
         }
 
         self.pages.push(target);

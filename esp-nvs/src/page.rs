@@ -232,9 +232,9 @@ impl ThinPage {
         };
         let span = data_entries + 1;
 
-        // No current caller can reach this: `set_str` caps its value at `MAX_BLOB_DATA_PER_PAGE`, a
-        // blob chunk is cut to what the active page has free, and `copy_items` rewrites an item
-        // that already fit a page, so all three arrive with `span <= ENTRIES_PER_PAGE`.
+        // No current caller can reach this: `set_str` caps its value at `MAX_BLOB_DATA_PER_PAGE`
+        // and a blob chunk is cut to what the active page has free, so both arrive with
+        // `span <= ENTRIES_PER_PAGE`.
         //
         // It is what catches them being wrong, though, rather than dead weight: relaxing
         // `set_str`'s limit by a single byte lands here instead of writing an item whose
@@ -295,6 +295,58 @@ impl ThinPage {
         self.used_entry_count += span as u8;
 
         if start_index + span == ENTRIES_PER_PAGE {
+            self.mark_as_full::<T>(hal)?;
+        }
+
+        Ok(())
+    }
+
+    /// Copies `item`, found at `item_index` of `source`, byte for byte - its header and every
+    /// payload entry its span covers - to the next free entries of this page.
+    ///
+    /// Like `write_variable_sized_item`, the entries are written before the entry map marks them
+    /// written, so a copy the power cuts short is recognised as torn by the next scan.
+    pub(crate) fn copy_item_from<T: Platform>(
+        &mut self,
+        hal: &mut T,
+        source: &ThinPage,
+        item_index: u8,
+        item: &Item,
+    ) -> Result<(), Error> {
+        let span = item.span as usize;
+        if span == 0 || item_index as usize + span > ENTRIES_PER_PAGE {
+            return Err(Error::CorruptedData);
+        }
+        if span > self.get_free_entry_count() {
+            return Err(PageFull);
+        }
+
+        let mut raw = vec![0u8; span * size_of::<Item>()];
+        hal.read(
+            (source.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index as usize) as _,
+            &mut raw,
+        )
+        .map_err(|_| Error::FlashError)?;
+
+        let start_index = self.get_next_free_entry();
+        let target_addr = self.address + offset_of!(RawPage, items) + size_of::<Item>() * start_index;
+        write_aligned(hal, target_addr as _, &raw).map_err(|_| Error::FlashError)?;
+
+        self.set_entry_state_range(
+            hal,
+            start_index as u8..(start_index + span) as u8,
+            EntryMapState::Written,
+        )?;
+        self.used_entry_count += span as u8;
+
+        if item.namespace_index != 0 {
+            self.item_hash_list.push(ItemHashListEntry {
+                hash: item.calculate_hash(T::crc32),
+                index: start_index as u8,
+            });
+        }
+
+        if self.is_full() {
             self.mark_as_full::<T>(hal)?;
         }
 

@@ -2580,6 +2580,62 @@ mod defrag {
     use crate::common;
     use crate::common::Operation;
 
+    /// Overwrites a counter often enough that even the oldest page of a three page partition goes
+    /// through defragmentation. That takes a while, since a page with fewer erased entries only
+    /// wins once it is old enough.
+    fn churn<T: esp_nvs::platform::Platform>(nvs: &mut esp_nvs::Nvs<T>) {
+        for value in 0..6_000u32 {
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("counter"), value)
+                .unwrap();
+        }
+    }
+
+    /// A legacy single-page blob, as older ESP-IDF versions wrote them, has to survive a
+    /// defragmentation of its page. Copying rebuilt each item by type and had no case for it, so
+    /// it was silently dropped while its source page was erased.
+    #[test]
+    fn a_legacy_blob_survives_defragmentation() {
+        let mut flash = common::Flash::new(3);
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("legacy"), "hello")
+                .unwrap();
+        }
+        // Entry 1 holds the string. Its layout is that of a legacy blob, only the type differs.
+        let entry = common::ITEM_OFFSET + esp_nvs::ITEM_SIZE;
+        assert_eq!(flash.buf[entry + 1], 0x21);
+        flash.buf[entry + 1] = 0x41;
+        let crc = common::item_crc(&flash.buf[entry..entry + esp_nvs::ITEM_SIZE]);
+        flash.buf[entry + common::ITEM_CRC_OFFSET..entry + common::ITEM_KEY_OFFSET].copy_from_slice(&crc.to_le_bytes());
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        churn(&mut nvs);
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("legacy")),
+            Ok(b"hello\0".to_vec())
+        );
+    }
+
+    /// A string whose data fails its CRC has to stay unreadable through a defragmentation.
+    /// Copying rewrote the data with a freshly computed CRC, so the corrupt value came out of it
+    /// as a valid one.
+    #[test]
+    fn a_corrupt_string_stays_corrupt_through_defragmentation() {
+        let mut flash = common::Flash::new(3);
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("s"), "hello hello hello")
+                .unwrap();
+        }
+        // Entry 1 is the string's header, entry 2 its data.
+        flash.buf[common::ITEM_OFFSET + 2 * esp_nvs::ITEM_SIZE] = 0x00;
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        assert!(nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("s")).is_err());
+        churn(&mut nvs);
+        assert!(nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("s")).is_err());
+    }
+
     #[test]
     fn defragmentation() {
         let mut flash = common::Flash::new(3);
@@ -2928,10 +2984,11 @@ mod defrag {
             assert_eq!(result, Err(FlashError));
         }
 
-        // the last successful operation was write an item to the new page
+        // the last successful operation was write an item to the new page (each copied item is a
+        // read from the source, a write to the target and an entry map update)
         assert_eq!(
             flash.operations.last().unwrap(),
-            &Operation::Write { offset: 5152, len: 32 }
+            &Operation::Write { offset: 4896, len: 32 }
         );
 
         // Disable faults and verify system recovers
