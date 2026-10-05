@@ -143,6 +143,21 @@ impl ThinPage {
         Ok(item)
     }
 
+    /// Reads the 32 raw bytes of the entry at `item_index`.
+    pub(crate) fn read_raw_entry<T: Platform>(
+        &self,
+        hal: &mut T,
+        item_index: u8,
+    ) -> Result<[u8; size_of::<Item>()], Error> {
+        let mut buf = [0u8; size_of::<Item>()];
+        hal.read(
+            (self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index as usize) as _,
+            &mut buf,
+        )
+        .map_err(|_| Error::FlashError)?;
+        Ok(buf)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn write_item<T: Platform>(
         &mut self,

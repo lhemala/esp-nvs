@@ -229,19 +229,32 @@ where
             Some(idx) => self.pages.swap_remove(idx),
         };
 
-        if let Some(idx) = self
+        // The `Active` page is only taken for a partial copy once it is shown to be one, every item
+        // on it identical to one on the source. Should it ever be anything else, erasing it would
+        // throw away values written after the defragmentation; the source is then copied into a
+        // free page instead.
+        let active = self
             .pages
             .iter()
-            .position(|it| it.header.state == ThinPageState::Active)
+            .position(|it| it.header.state == ThinPageState::Active);
+        if let Some(idx) = active
+            && Self::page_is_copy_of(&mut self.hal, &self.pages[idx], &source_page)?
         {
             let partial_copy = self.pages.swap_remove(idx);
             self.erase_page(partial_copy)?;
-        } else if self.newest_page_holds_all_items_of(&source_page)? {
+        } else if active.is_none() && self.newest_page_holds_all_items_of(&source_page)? {
             self.erase_page(source_page)?;
             return Ok(true);
         }
 
-        let mut target = self.free_pages.pop().ok_or(Error::FlashFull)?;
+        let Some(mut target) = self.free_pages.pop() else {
+            // Nowhere to copy to. The source still holds all of its items, so it simply stays, as
+            // the full page it was before the defragmentation started; the next one reclaims it.
+            let mut source_page = source_page;
+            source_page.header.state = ThinPageState::Full;
+            self.pages.insert(0, source_page);
+            return Ok(true);
+        };
         if target.header.state != ThinPageState::Uninitialized {
             self.hal
                 .erase(target.address as _, (target.address + FLASH_SECTOR_SIZE) as _)
@@ -249,13 +262,41 @@ where
             target = ThinPage::uninitialized(target.address);
         }
         // The source is out of `self.pages` but its sequence counts all the same.
-        let next_sequence = self.get_next_sequence().max(source_page.header.sequence + 1);
+        let next_sequence = self
+            .get_next_sequence()
+            .max(source_page.header.sequence.saturating_add(1));
         target.initialize(&mut self.hal, next_sequence)?;
 
         self.copy_items(&source_page, target)?;
 
         self.erase_page(source_page)?;
 
+        Ok(true)
+    }
+
+    /// Whether every item on `candidate` is a byte for byte copy of an item on `source`, as
+    /// `copy_items` makes them.
+    ///
+    /// The headers are compared whole, CRC included, and for strings and chunks the CRC of the
+    /// data is part of the header, so a newer value of the same key never passes for a copy.
+    fn page_is_copy_of(hal: &mut T, candidate: &ThinPage, source: &ThinPage) -> Result<bool, Error> {
+        for candidate_entry in &candidate.item_hash_list {
+            let header = candidate.read_raw_entry(hal, candidate_entry.index)?;
+            let mut found = false;
+            for source_entry in source
+                .item_hash_list
+                .iter()
+                .filter(|it| it.hash == candidate_entry.hash)
+            {
+                if source.read_raw_entry(hal, source_entry.index)? == header {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
 
@@ -449,7 +490,7 @@ where
         match page.header.state {
             ThinPageState::Uninitialized => unreachable!(),
             ThinPageState::Active => unreachable!(),
-            ThinPageState::Full => {
+            ThinPageState::Full | ThinPageState::Freeing => {
                 if page.erased_entry_count != ENTRIES_PER_PAGE as _
                     && let Err(e) = self.free_page(&page, next_sequence)
                 {
@@ -461,7 +502,8 @@ where
 
                 self.erase_page(page)?;
             }
-            ThinPageState::Freeing => unreachable!(), // TODO cleanup freeing pages on init
+            // `continue_free_page` leaves a `Freeing` page it had nowhere to copy from as `Full`, so
+            // none is expected here; it would be reclaimed like a full page all the same.
             ThinPageState::Corrupt => {
                 self.erase_page(page)?;
             }

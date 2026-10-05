@@ -64,7 +64,13 @@ where
         // accounted for. The blob index in particular would count each chunk on both the source
         // and its partial copy, find twice the data its index claims, and delete a blob that is
         // perfectly intact. So start over from what is on flash once the recovery is done.
-        if self.continue_free_page()? {
+        // ESP-IDF never leaves more than one page `Freeing`, but nothing stops flash from saying
+        // otherwise, so all of them are finished.
+        let mut recovered = false;
+        while self.continue_free_page()? {
+            recovered = true;
+        }
+        if recovered {
             self.pages.clear();
             self.free_pages.clear();
             self.namespaces.clear();

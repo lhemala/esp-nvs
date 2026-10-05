@@ -897,7 +897,8 @@ where
 
     pub(crate) fn get_next_sequence(&self) -> u32 {
         match self.pages.iter().map(|page| page.header.sequence).max() {
-            Some(current) => current + 1,
+            // Saturating, so that a corrupt header claiming the largest sequence cannot overflow.
+            Some(current) => current.saturating_add(1),
             None => 0,
         }
     }

@@ -630,3 +630,69 @@ fn power_loss_while_writing_to_a_full_partition() {
         }
     }
 }
+
+/// Sets the state word of the page starting at `page` to FREEING. Only clears bits, as flash can,
+/// and the state is not covered by the page header CRC.
+fn mark_freeing(buf: &mut [u8], page: usize) {
+    let state = u32::from_le_bytes(buf[page..page + 4].try_into().unwrap()) & 0xFFFF_FFF8;
+    buf[page..page + 4].copy_from_slice(&state.to_le_bytes());
+}
+
+fn check_keys(nvs: &mut esp_nvs::Nvs<common::SharedFlash>, count: u32) {
+    for i in 0..count {
+        assert_eq!(
+            nvs.get::<u32>(&namespace(), &Key::from_str(&format!("k{i}"))),
+            Ok(i),
+            "k{i}"
+        );
+    }
+}
+
+/// An `Active` page next to a `Freeing` one is taken for a partial copy of it and erased. That has
+/// to be shown rather than assumed: were it an ordinary active page, its values would be lost.
+#[test]
+fn an_active_page_that_is_no_copy_survives_finishing_a_defragmentation() {
+    let flash = common::SharedFlash::new(5);
+    let count = 125 + 126 + 50;
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        for i in 0..count {
+            nvs.set(&namespace(), &Key::from_str(&format!("k{i}")), i).unwrap();
+        }
+    }
+    // Pages 0 and 1 are full, page 2 is active and holds keys of its own.
+    flash.with_buf(|buf| mark_freeing(buf, 0));
+
+    for _boot in 0..2 {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        check_keys(&mut nvs, count);
+    }
+}
+
+/// More than one `Freeing` page is nothing ESP-IDF or this crate leaves behind, but flash can say
+/// so. Each has to be finished without losing anything, and `defragment` used to hit
+/// `unreachable!` on one.
+#[test]
+fn several_freeing_pages_are_all_finished() {
+    let flash = common::SharedFlash::new(5);
+    let count = 125 + 126 + 50;
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        for i in 0..count {
+            nvs.set(&namespace(), &Key::from_str(&format!("k{i}")), i).unwrap();
+        }
+    }
+    flash.with_buf(|buf| {
+        mark_freeing(buf, 0);
+        mark_freeing(buf, esp_nvs::FLASH_SECTOR_SIZE);
+    });
+
+    for _boot in 0..2 {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        check_keys(&mut nvs, count);
+        for value in 0..600u32 {
+            nvs.set(&namespace(), &Key::from_str("counter"), value).unwrap();
+        }
+        check_keys(&mut nvs, count);
+    }
+}
