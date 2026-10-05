@@ -5,6 +5,7 @@
 //! survived, and that it can still be written.
 
 use esp_nvs::Key;
+use esp_nvs::error::ItemType;
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -346,4 +347,76 @@ fn a_page_with_a_blank_header_and_leftover_data_is_erased_before_use() {
 
     let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
     assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str("a")), Ok(42));
+}
+
+/// Sets the entry map state of every entry the item at `entry` spans back to WRITTEN.
+fn unerase(buf: &mut [u8], page: usize, entry: usize) {
+    let span = buf[page + common::ITEM_OFFSET + entry * esp_nvs::ITEM_SIZE + 2] as usize;
+    for e in entry..entry + span {
+        let byte = page + common::ENTRY_STATE_MAP_OFFSET + e / 4;
+        let shift = (e % 4) * 2;
+        buf[byte] = (buf[byte] & !(0b11 << shift)) | (common::ENTRY_STATE_WRITTEN << shift);
+    }
+}
+
+/// Finds the item headers on flash with the given type byte and key, as (page start, entry).
+fn find_headers(buf: &[u8], type_: u8, key: &Key) -> Vec<(usize, usize)> {
+    let mut found = vec![];
+    for page in (0..buf.len()).step_by(esp_nvs::FLASH_SECTOR_SIZE) {
+        for entry in 0..esp_nvs::ENTRIES_PER_PAGE {
+            let offset = page + common::ITEM_OFFSET + entry * esp_nvs::ITEM_SIZE;
+            let candidate = &buf[offset..offset + esp_nvs::ITEM_SIZE];
+            if candidate[1] == type_ && candidate[8..24] == key.as_bytes()[..] && common::is_item_header(buf, offset) {
+                found.push((page, entry));
+            }
+        }
+    }
+    found
+}
+
+/// Power lost after a blob was overwritten but before its old version was erased, with the newer
+/// version on a page at a lower flash address than the older one.
+///
+/// The boot cleanup decided correctly which version was older, then deleted "the" blob index of the
+/// key, which is the first one found in page order - here the newer one. The blob rolled back.
+#[test]
+fn of_two_blob_versions_the_newer_one_is_kept() {
+    let key = Key::from_str("b");
+    let flash = common::SharedFlash::new(4);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        nvs.set(&namespace(), &key, [1u8; 100].as_slice()).unwrap();
+        // Move on to the next page, write the new version there, and fill that page as well.
+        for value in 0..130u32 {
+            nvs.set(&namespace(), &Key::from_str("c"), value).unwrap();
+        }
+        nvs.set(&namespace(), &key, [2u8; 100].as_slice()).unwrap();
+        for value in 0..130u32 {
+            nvs.set(&namespace(), &Key::from_str("d"), value).unwrap();
+        }
+    }
+
+    flash.with_buf(|buf| {
+        // Bring the old version's index and chunk back, as if they had never been erased.
+        let old_page = find_headers(buf, ItemType::BlobIndex as u8, &key)[0].0;
+        for (page, entry) in find_headers(buf, ItemType::BlobIndex as u8, &key)
+            .into_iter()
+            .chain(find_headers(buf, ItemType::BlobData as u8, &key))
+        {
+            if page == old_page {
+                unerase(buf, page, entry);
+            }
+        }
+
+        // Swap the two pages in flash, so the newer one comes first by address.
+        let sector = esp_nvs::FLASH_SECTOR_SIZE;
+        let new_page = old_page + sector;
+        let (low, high) = buf.split_at_mut(new_page);
+        low[old_page..old_page + sector].swap_with_slice(&mut high[..sector]);
+    });
+
+    for _boot in 0..2 {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        assert_eq!(nvs.get::<Vec<u8>>(&namespace(), &key), Ok(vec![2u8; 100]));
+    }
 }

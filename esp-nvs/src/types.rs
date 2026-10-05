@@ -162,7 +162,6 @@ impl From<PageIndex> for usize {
 #[cfg_attr(feature = "debug-logs", derive(Debug))]
 pub(crate) enum ChunkIndex {
     Any,
-    BlobIndex,
     BlobData(u8),
 }
 

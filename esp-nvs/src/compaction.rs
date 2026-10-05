@@ -11,8 +11,10 @@ use defmt::{
     warn,
 };
 
-use crate::Nvs;
-use crate::blob::BlobIndex;
+use crate::blob::{
+    BlobIndex,
+    BlobIndexEntryBlobIndexData,
+};
 use crate::error::Error;
 use crate::page::{
     ThinPage,
@@ -30,68 +32,32 @@ use crate::raw::{
     write_aligned,
 };
 use crate::types::{
-    ChunkIndex,
     ItemIndex,
     NamespaceIndex,
     PageIndex,
     PageSequence,
+    VersionOffset,
 };
 use crate::u24::u24;
+use crate::{
+    Key,
+    Nvs,
+};
 
 impl<T> Nvs<T>
 where
     T: Platform,
 {
-    pub(crate) fn cleanup_dirty_blobs(&mut self, mut blob_index: BlobIndex) -> Result<(), Error> {
+    pub(crate) fn cleanup_dirty_blobs(&mut self, blob_index: BlobIndex) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("cleanup_dirty_blobs");
 
-        while let Some(((namespace_index, chunk_start, key), (index, observed))) = blob_index.pop_first() {
-            if let Some(index) = index {
-                // Calculate total chunks and data size from all observed chunks
-                let (chunk_count, data_size) = observed
-                    .chunks_by_page
-                    .iter()
-                    .fold((0u8, 0u32), |(count, size), chunk_data| {
-                        (count + chunk_data.chunk_count, size + chunk_data.data_size)
-                    });
+        // Blob indices whose chunks add up, by (namespace, key), with the version they belong to.
+        let mut consistent =
+            BTreeMap::<(NamespaceIndex, Key), Vec<(VersionOffset, BlobIndexEntryBlobIndexData)>>::new();
 
-                if index.chunk_count != chunk_count || index.size != data_size {
-                    #[cfg(feature = "debug-logs")]
-                    println!(
-                        "internal: load_sectors: blob index data doesn't match observed data {index:?} (expected: chunk_count={}, data_size={}, got: chunk_count={}, data_size={})",
-                        index.chunk_count, index.size, chunk_count, data_size
-                    );
-                    self.delete_key(namespace_index.0, &key, ChunkIndex::BlobIndex)?;
-                    // Also delete the orphaned data chunks for this version
-                    self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
-                    continue;
-                } else if let Some(other) = blob_index.get(&(namespace_index, chunk_start.invert(), key))
-                    && let Some(other_index) = &other.0
-                {
-                    // We have both versions - keep the newer one, delete the older one
-                    // Compare by page_sequence first, then by item_index if on same page
-                    let other_is_newer = other_index.page_sequence > index.page_sequence
-                        || (index.page_sequence == other_index.page_sequence
-                            && other_index.item_index > index.item_index);
-
-                    if other_is_newer {
-                        #[cfg(feature = "debug-logs")]
-                        println!(
-                            "internal: load_sectors: found two blob indices for the same key, deleting the older current one (seq: {} vs {})",
-                            index.page_sequence, other_index.page_sequence
-                        );
-                        self.delete_key(namespace_index.0, &key, ChunkIndex::BlobIndex)?;
-                    } else {
-                        #[cfg(feature = "debug-logs")]
-                        println!(
-                            "internal: load_sectors: found two blob indices for the same key, deleting the older other one (seq: {} vs {})",
-                            other_index.page_sequence, index.page_sequence
-                        );
-                        self.delete_key(namespace_index.0, &key, ChunkIndex::BlobIndex)?;
-                    }
-                }
-            } else {
+        for ((namespace_index, chunk_start, key), (index, observed)) in blob_index {
+            let Some(index) = index else {
                 // Orphaned blob data (chunks without an index) can occur when:
                 // 1. Writing the blob index failed after data chunks were written
                 // 2. The index was deleted but data deletion failed
@@ -102,9 +68,79 @@ where
                     chunk_start.clone() as u8
                 );
                 self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
+                continue;
+            };
+
+            // Calculate total chunks and data size from all observed chunks. Summed wide, so that a
+            // corrupt count cannot overflow.
+            let (chunk_count, data_size) =
+                observed
+                    .chunks_by_page
+                    .iter()
+                    .fold((0u32, 0u64), |(count, size), chunk_data| {
+                        (
+                            count + chunk_data.chunk_count as u32,
+                            size + chunk_data.data_size as u64,
+                        )
+                    });
+
+            if index.chunk_count as u32 != chunk_count || index.size as u64 != data_size {
+                #[cfg(feature = "debug-logs")]
+                println!(
+                    "internal: load_sectors: blob index data doesn't match observed data {index:?} (expected: chunk_count={}, data_size={}, got: chunk_count={}, data_size={})",
+                    index.chunk_count, index.size, chunk_count, data_size
+                );
+                self.erase_blob_version(namespace_index, &key, chunk_start, &index)?;
+                continue;
+            }
+
+            consistent
+                .entry((namespace_index, key))
+                .or_default()
+                .push((chunk_start, index));
+        }
+
+        // Both versions of a blob survive a power loss between writing the new one and erasing the
+        // old one. Keep the newer, by page sequence first, then by position on the same page.
+        //
+        // The one to go is erased where it was found. Deleting "the" blob index of the key instead
+        // takes whichever one `load_item` comes across first, which follows the order of the pages
+        // in flash rather than their age, and so could just as well throw away the newer version.
+        for ((namespace_index, key), mut versions) in consistent {
+            if versions.len() < 2 {
+                continue;
+            }
+            versions.sort_by_key(|(_, index)| (index.page_sequence, index.item_index));
+            let newest = versions.len() - 1;
+            for (chunk_start, index) in versions.into_iter().take(newest) {
+                #[cfg(feature = "debug-logs")]
+                println!(
+                    "internal: load_sectors: found two blob indices for the same key, deleting the older one (seq: {})",
+                    index.page_sequence
+                );
+                self.erase_blob_version(namespace_index, &key, chunk_start, &index)?;
             }
         }
+
         Ok(())
+    }
+
+    /// Erases the blob index at the location given by `index`, and the chunks of its version.
+    fn erase_blob_version(
+        &mut self,
+        namespace_index: NamespaceIndex,
+        key: &Key,
+        chunk_start: VersionOffset,
+        index: &BlobIndexEntryBlobIndexData,
+    ) -> Result<(), Error> {
+        if let Some(page) = self
+            .pages
+            .iter_mut()
+            .find(|page| page.header.sequence == index.page_sequence)
+        {
+            page.erase_item::<T>(&mut self.hal, index.item_index, 1)?;
+        }
+        self.delete_blob_data(namespace_index.0, key, chunk_start)
     }
 
     /// The active page has to be the last page in `self.pages` as we use `pop_if` to fetch it.

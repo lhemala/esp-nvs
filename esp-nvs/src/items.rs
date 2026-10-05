@@ -785,8 +785,8 @@ where
         // two. The write then reported success while the value could never be read back.
         //
         // Which item is deleted is not passed in, because it is bound to be the first one found
-        // anyway as newer pages appear later in self.pages. `ChunkIndex::Any` hashes the same as
-        // `ChunkIndex::BlobIndex`, so this finds an old blob index just as well as a foreign item.
+        // anyway as newer pages appear later in self.pages. `ChunkIndex::Any` matches a blob index
+        // just as well as a foreign item.
         if had_old_item {
             self.delete_key(namespace_index, &key, ChunkIndex::Any)?;
         }
@@ -886,7 +886,6 @@ where
 
         let item_chunk_index = match chunk_index {
             ChunkIndex::Any => 0xFF,
-            ChunkIndex::BlobIndex => 0xFF,
             ChunkIndex::BlobData(idx) => idx,
         };
 
