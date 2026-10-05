@@ -3601,6 +3601,29 @@ mod blob_versions {
         );
     }
 
+    /// The data field of a blob index is 8 bytes, of which size, chunk count and chunk start take
+    /// 6. ESP-IDF leaves the last two unprogrammed. They were left uninitialized instead, so
+    /// whatever memory held went to flash and into the item CRC.
+    #[test]
+    fn a_blob_index_leaves_its_reserved_bytes_unprogrammed() {
+        let mut flash = common::Flash::new(3);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), [1u8; 100].as_slice())
+            .unwrap();
+        drop(nvs);
+
+        let index = (0..ENTRIES_PER_PAGE)
+            .map(|entry| common::ITEM_OFFSET + entry * ITEM_SIZE)
+            .find(|&offset| {
+                flash.buf[offset + 1] == ItemType::BlobIndex as u8 && common::is_item_header(&flash.buf, offset)
+            })
+            .unwrap();
+        assert_eq!(
+            flash.buf[index + common::ITEM_DATA_OFFSET + 6..index + ITEM_SIZE],
+            [0xFF, 0xFF]
+        );
+    }
+
     /// A blob written fresh after its predecessor was deleted starts over at the first base, since
     /// there is no live version left to differ from.
     #[test]

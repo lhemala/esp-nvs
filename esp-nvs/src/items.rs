@@ -822,11 +822,7 @@ where
         // Write the blob index
         let mut page = self.get_active_page()?;
         let item_data = raw::ItemData {
-            blob_index: ItemDataBlobIndex {
-                size: data.len() as u32,
-                chunk_count,
-                chunk_start: version_base,
-            },
+            blob_index: ItemDataBlobIndex::new(data.len() as u32, chunk_count, version_base),
         };
         let written = page.write_item::<T>(
             &mut self.hal,

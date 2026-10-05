@@ -323,6 +323,21 @@ pub(crate) struct ItemDataBlobIndex {
     pub(crate) size: u32,
     pub(crate) chunk_count: u8,
     pub(crate) chunk_start: u8,
+    // Fills the 8 byte data field. Without it, the last two bytes of the union were left
+    // uninitialized when an index was built, and whatever they held went to flash and into the CRC.
+    _reserved: u16,
+}
+
+impl ItemDataBlobIndex {
+    pub(crate) fn new(size: u32, chunk_count: u8, chunk_start: u8) -> Self {
+        Self {
+            size,
+            chunk_count,
+            chunk_start,
+            // As ESP-IDF writes it, unprogrammed.
+            _reserved: u16::MAX,
+        }
+    }
 }
 
 #[cfg(feature = "debug-logs")]
