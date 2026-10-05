@@ -492,8 +492,8 @@ impl ThinPage {
 
         self.set_entry_state_range(hal, item_index..(item_index + span), EntryMapState::Erased)?;
 
-        self.erased_entry_count += span;
-        self.used_entry_count -= span;
+        self.erased_entry_count = self.erased_entry_count.saturating_add(span);
+        self.used_entry_count = self.used_entry_count.saturating_sub(span);
         self.item_hash_list.retain(|entry| entry.index != item_index);
 
         Ok(())

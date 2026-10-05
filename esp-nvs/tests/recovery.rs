@@ -5,7 +5,10 @@
 //! survived, and that it can still be written.
 
 use esp_nvs::Key;
-use esp_nvs::error::ItemType;
+use esp_nvs::error::{
+    Error,
+    ItemType,
+};
 use pretty_assertions::assert_eq;
 
 mod common;
@@ -418,5 +421,117 @@ fn of_two_blob_versions_the_newer_one_is_kept() {
     for _boot in 0..2 {
         let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
         assert_eq!(nvs.get::<Vec<u8>>(&namespace(), &key), Ok(vec![2u8; 100]));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Primitive(u32),
+    Str(String),
+    Blob(Vec<u8>),
+}
+
+impl Value {
+    fn set<T: esp_nvs::platform::Platform>(&self, nvs: &mut esp_nvs::Nvs<T>, key: &Key) -> Result<(), Error> {
+        match self {
+            Value::Primitive(value) => nvs.set(&namespace(), key, *value),
+            Value::Str(value) => nvs.set(&namespace(), key, value.as_str()),
+            Value::Blob(value) => nvs.set(&namespace(), key, value.as_slice()),
+        }
+    }
+
+    /// Whether `key` currently reads back as this value.
+    fn is_stored<T: esp_nvs::platform::Platform>(&self, nvs: &mut esp_nvs::Nvs<T>, key: &Key) -> bool {
+        match self {
+            Value::Primitive(value) => nvs.get::<u32>(&namespace(), key) == Ok(*value),
+            Value::Str(value) => nvs.get::<String>(&namespace(), key).as_ref() == Ok(value),
+            Value::Blob(value) => nvs.get::<Vec<u8>>(&namespace(), key).as_ref() == Ok(value),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Value::Primitive(value) => format!("u32 {value}"),
+            Value::Str(value) => format!("a string of {} bytes", value.len()),
+            Value::Blob(value) => format!("a blob of {} bytes", value.len()),
+        }
+    }
+
+    /// Another value of the same type.
+    fn another(&self) -> Value {
+        match self {
+            Value::Primitive(_) => Value::Primitive(33),
+            Value::Str(_) => Value::Str("c".repeat(20)),
+            Value::Blob(_) => Value::Blob(vec![3u8; 200]),
+        }
+    }
+}
+
+/// Overwrites a key with a value of each type in turn, cutting the power at every flash operation
+/// of the overwrite. After a reboot the key has to read as either the old or the new value, and
+/// writing it once more has to stick.
+///
+/// Changing to or from a blob left both items on flash when the power went before the old one was
+/// erased, and nothing at boot compared a blob index with a primitive or a string. Reads kept
+/// returning the old value, and the next overwrite resolved the key against the wrong item: it
+/// reported success and was gone after the following reboot, or read back stale until then.
+#[test]
+fn power_loss_while_changing_the_type_of_a_value() {
+    let values = [
+        Value::Primitive(1),
+        Value::Str("a".repeat(40)),
+        Value::Blob(vec![1u8; 5000]),
+    ];
+    let replacements = [
+        Value::Primitive(2),
+        Value::Str("b".repeat(70)),
+        Value::Blob(vec![2u8; 300]),
+    ];
+    let key = Key::from_str("k");
+    let other = Key::from_str("other");
+
+    for old in &values {
+        for new in &replacements {
+            for budget in 0.. {
+                let mut flash = common::Flash::new(4);
+                {
+                    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+                    nvs.set(&namespace(), &other, 7u32).unwrap();
+                    old.set(&mut nvs, &key).unwrap();
+                }
+                flash.arm_fault(budget);
+                let written = match esp_nvs::Nvs::new(0, flash.len(), &mut flash) {
+                    Ok(mut nvs) => new.set(&mut nvs, &key),
+                    Err(e) => Err(e),
+                };
+                flash.disable_faults();
+
+                let context = format!(
+                    "{} to {}, power lost at operation {budget}",
+                    old.describe(),
+                    new.describe()
+                );
+                let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+                assert!(
+                    old.is_stored(&mut nvs, &key) != new.is_stored(&mut nvs, &key),
+                    "{context}"
+                );
+                assert_eq!(nvs.get::<u32>(&namespace(), &other), Ok(7), "{context}");
+
+                let next = new.another();
+                next.set(&mut nvs, &key).unwrap();
+                assert!(next.is_stored(&mut nvs, &key), "{context}, then overwritten");
+                drop(nvs);
+                let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+                assert!(
+                    next.is_stored(&mut nvs, &key),
+                    "{context}, then overwritten and rebooted"
+                );
+
+                if written.is_ok() {
+                    break;
+                }
+            }
+        }
     }
 }

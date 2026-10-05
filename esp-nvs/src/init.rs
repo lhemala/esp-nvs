@@ -71,11 +71,12 @@ where
             blob_index = self.scan_sectors()?;
         }
 
-        // After loading all pages, check for duplicate primitive/string entries and mark older ones
-        // as erased This handles cases where deletion failed after a successful write
-        self.cleanup_duplicate_entries()?;
-
+        // Settle the blobs first, so at most one version of each is left, then check for duplicate
+        // entries and mark older ones as erased. This handles cases where deletion failed after a
+        // successful write.
         self.cleanup_dirty_blobs(blob_index)?;
+
+        self.cleanup_duplicate_entries()?;
 
         Ok(())
     }

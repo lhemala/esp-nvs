@@ -297,9 +297,10 @@ where
         Ok(true)
     }
 
-    /// Clean up duplicate primitive/string entries by marking older versions as erased.
+    /// Clean up duplicate entries by marking older versions as erased.
     /// This handles the write-before-delete scenario where deletion failed after successful write.
-    /// IMPORTANT: This does NOT touch blob entries - they have their own cleanup logic.
+    /// Runs after `cleanup_dirty_blobs`, which leaves at most one version of each blob; a blob
+    /// index is compared with the other items of its key here, and its chunks go with it.
     pub(crate) fn cleanup_duplicate_entries(&mut self) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("cleanup_duplicate_entries");
@@ -332,16 +333,28 @@ where
                 let page = &self.pages[page_idx.0];
                 let item = page.load_item(&mut self.hal, item_index.0)?;
 
-                // Skip namespace entries (namespace_index == 0) and blob entries
-                // Namespace entries are special and should not be cleaned up
-                // Blob entries have their own cleanup logic
-                if item.namespace_index == 0 || item.type_ == ItemType::BlobIndex || item.type_ == ItemType::BlobData {
+                // Skip namespace entries (namespace_index == 0) and blob data. Namespace entries
+                // are special and should not be cleaned up, and chunks go with
+                // their blob index.
+                //
+                // A blob index takes part, though. `cleanup_dirty_blobs` has already settled which
+                // version of a blob stays, but it only compares blobs with blobs, and a key
+                // changing type to or from a blob leaves a blob index next to a
+                // primitive or a string when the power goes before the old item is
+                // erased. Left alone, reads keep returning the old value, and a
+                // later write can resolve the key against the wrong one of the two.
+                if item.namespace_index == 0 || item.type_ == ItemType::BlobData {
                     continue;
                 }
 
+                let blob_version = if item.type_ == ItemType::BlobIndex {
+                    Some(VersionOffset::from(unsafe { item.data.blob_index.chunk_start }))
+                } else {
+                    None
+                };
                 items.push((
                     (NamespaceIndex(item.namespace_index), item.key),
-                    (page_idx, item_index, page_seq, item.span),
+                    (page_idx, item_index, page_seq, item.span, blob_version),
                 ));
             }
 
@@ -352,19 +365,24 @@ where
             }
 
             // Erase older duplicates
-            for (_key, mut group) in key_groups {
+            for ((namespace_index, key), mut group) in key_groups {
                 if group.len() <= 1 {
                     continue;
                 }
 
                 // Sort by page sequence and item index (ascending = oldest first)
-                group.sort_by_key(|(_, ItemIndex(idx), PageSequence(seq), _)| (*seq, *idx));
+                group.sort_by_key(|(_, ItemIndex(idx), PageSequence(seq), _, _)| (*seq, *idx));
 
                 // Keep the newest (last after sort), erase older ones
                 let keep_count = group.len() - 1;
-                for (PageIndex(page_index), ItemIndex(item_index), _, span) in group.into_iter().take(keep_count) {
+                for (PageIndex(page_index), ItemIndex(item_index), _, span, blob_version) in
+                    group.into_iter().take(keep_count)
+                {
                     let page = self.pages.get_mut(page_index).unwrap();
                     page.erase_item::<T>(&mut self.hal, item_index, span)?;
+                    if let Some(chunk_start) = blob_version {
+                        self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
+                    }
                 }
             }
         }
