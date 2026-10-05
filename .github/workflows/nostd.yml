@@ -8,9 +8,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 name: no-std
+# Pinned like in check.yml, see there.
+env:
+  STABLE: "1.93.1"
 jobs:
   riscv32imc:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: riscv32imc-unknown-none-elf
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
@@ -19,13 +22,13 @@ jobs:
       - name: Install stable
         uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e # branch=master
         with:
-          toolchain: stable
+          toolchain: ${{ env.STABLE }}
       - name: rustup target add riscv32imc-unknown-none-elf
         run: rustup target add riscv32imc-unknown-none-elf
       - name: cargo check
         run: cargo check --package esp-nvs --target riscv32imc-unknown-none-elf --no-default-features
   riscv32imac:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: riscv32imac-unknown-none-elf
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
@@ -34,13 +37,13 @@ jobs:
       - name: Install stable
         uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e # branch=master
         with:
-          toolchain: stable
+          toolchain: ${{ env.STABLE }}
       - name: rustup target add riscv32imac-unknown-none-elf
         run: rustup target add riscv32imac-unknown-none-elf
       - name: cargo check
         run: cargo check --package esp-nvs --target riscv32imac-unknown-none-elf --no-default-features
   xtensa:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: xtensa-esp32-none-elf
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -52,7 +55,9 @@ jobs:
         uses: esp-rs/xtensa-toolchain@67649b28a0139171102259d9982f93106aa2b54a # tag=v1.6.0
         with:
           default: true
-          version: "latest"
+          # What "latest" resolves to: the newest release that is not a pre-release. Pre-releases
+          # can lack the Linux build.
+          version: "1.97.0.0"
           buildtargets: "esp32"
       - name: cargo check
         run: cargo check --package esp-nvs --target xtensa-esp32-none-elf --no-default-features -Zbuild-std=core,alloc
