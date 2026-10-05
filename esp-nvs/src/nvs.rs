@@ -46,6 +46,9 @@ pub struct Nvs<T: Platform> {
     pub(crate) namespaces: BTreeMap<Key, u8>,
     pub(crate) free_pages: BinaryHeap<ThinPage>,
     pub(crate) pages: Vec<ThinPage>,
+    /// Legacy single-page blobs the scan came across, as (namespace index, key), for
+    /// `migrate_legacy_blobs`.
+    pub(crate) legacy_blobs: Vec<(u8, Key)>,
 }
 
 impl<T: Platform> Nvs<T> {
@@ -88,6 +91,7 @@ impl<T: Platform> Nvs<T> {
             namespaces: BTreeMap::new(),
             free_pages: Default::default(),
             pages: Default::default(),
+            legacy_blobs: Default::default(),
             faulted: false,
             purge: false,
         };

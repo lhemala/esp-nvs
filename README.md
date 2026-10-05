@@ -15,8 +15,8 @@ and inspired by the [actual C++ implementation](https://github.com/espressif/esp
 ## Compatibility
 
 Blobs are written in the multi-page format ESP-IDF uses since v4.0. Blobs in the older single-page format, as found on
-partitions written by earlier ESP-IDF versions, are read, listed and kept, and are replaced by the multi-page format
-when overwritten.
+partitions written by earlier ESP-IDF versions, are migrated to the multi-page format when the partition is opened. A
+blob there is no room for yet stays in the old format until there is, and is read, listed and kept all the same.
 
 ## Safety
 

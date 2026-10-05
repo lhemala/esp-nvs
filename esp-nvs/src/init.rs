@@ -43,6 +43,7 @@ use crate::raw::{
     sanitize_item_type,
 };
 use crate::types::{
+    ChunkIndex,
     NamespaceIndex,
     VersionOffset,
 };
@@ -74,6 +75,7 @@ where
             self.pages.clear();
             self.free_pages.clear();
             self.namespaces.clear();
+            self.legacy_blobs.clear();
             blob_index = self.scan_sectors()?;
         }
 
@@ -83,6 +85,51 @@ where
         self.cleanup_dirty_blobs(blob_index)?;
 
         self.cleanup_duplicate_entries()?;
+
+        self.migrate_legacy_blobs()?;
+
+        Ok(())
+    }
+
+    /// Rewrites every blob in the single-page format of ESP-IDF before v4.0 as a multi-page blob,
+    /// the only format this crate writes.
+    ///
+    /// That is an ordinary overwrite: the new blob is written first and the legacy item erased
+    /// after, so a power loss in between leaves both, which the next boot resolves in favour of the
+    /// newer one, and migrates again what is still legacy.
+    ///
+    /// It is best effort. A partition without room for the copy keeps the legacy blob, which is
+    /// still read, until there is room; so does one that does not read back, rather than being
+    /// turned into a blob with the wrong content.
+    fn migrate_legacy_blobs(&mut self) -> Result<(), Error> {
+        let legacy = core::mem::take(&mut self.legacy_blobs);
+        for (namespace_index, key) in legacy {
+            let Some(namespace) = self
+                .namespaces
+                .iter()
+                .find(|(_, index)| **index == namespace_index)
+                .map(|(namespace, _)| *namespace)
+            else {
+                continue;
+            };
+            // The scan may have found an item that the cleanups after it have since replaced.
+            match self.load_item(namespace_index, ChunkIndex::Any, &key) {
+                Ok((_, _, item)) if item.type_ == ItemType::Blob => {}
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                _ => continue,
+            }
+            let data = match self.get_blob(&namespace, &key) {
+                Ok(data) => data,
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                Err(_) => continue,
+            };
+            match self.set_blob(&namespace, key, &data) {
+                Ok(()) => {}
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                // No room for this one, and so for none of the others either.
+                Err(_) => return Ok(()),
+            }
+        }
 
         Ok(())
     }
@@ -445,6 +492,10 @@ where
                         ),
                     );
                 }
+            }
+
+            if item.type_ == ItemType::Blob {
+                self.legacy_blobs.push((item.namespace_index, item.key));
             }
 
             page.item_hash_list.push(ItemHashListEntry {
