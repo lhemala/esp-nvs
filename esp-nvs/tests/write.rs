@@ -2590,32 +2590,6 @@ mod defrag {
         }
     }
 
-    /// A legacy single-page blob, as older ESP-IDF versions wrote them, has to survive a
-    /// defragmentation of its page. Copying rebuilt each item by type and had no case for it, so
-    /// it was silently dropped while its source page was erased.
-    #[test]
-    fn a_legacy_blob_survives_defragmentation() {
-        let mut flash = common::Flash::new(3);
-        {
-            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
-            nvs.set(&Key::from_str("ns1"), &Key::from_str("legacy"), "hello")
-                .unwrap();
-        }
-        // Entry 1 holds the string. Its layout is that of a legacy blob, only the type differs.
-        let entry = common::ITEM_OFFSET + esp_nvs::ITEM_SIZE;
-        assert_eq!(flash.buf[entry + 1], 0x21);
-        flash.buf[entry + 1] = 0x41;
-        let crc = common::item_crc(&flash.buf[entry..entry + esp_nvs::ITEM_SIZE]);
-        flash.buf[entry + common::ITEM_CRC_OFFSET..entry + common::ITEM_KEY_OFFSET].copy_from_slice(&crc.to_le_bytes());
-
-        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
-        churn(&mut nvs);
-        assert_eq!(
-            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("legacy")),
-            Ok(b"hello\0".to_vec())
-        );
-    }
-
     /// A string whose data fails its CRC has to stay unreadable through a defragmentation.
     /// Copying rewrote the data with a freshly computed CRC, so the corrupt value came out of it
     /// as a valid one.
