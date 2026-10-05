@@ -192,7 +192,10 @@ impl NvsEntry {
     }
 }
 
-/// Validate that `key` is non-empty and within the NVS maximum key length.
+/// Validate that `key` is a non-empty ASCII string without NUL bytes, within the NVS maximum key
+/// length.
+///
+/// `esp_nvs::Key` panics on anything else, and would cut a key short at a NUL byte.
 pub(crate) fn validate_key(key: &str) -> Result<(), Error> {
     if key.is_empty() {
         return Err(Error::InvalidKey("key must not be empty".to_string()));
@@ -202,6 +205,12 @@ pub(crate) fn validate_key(key: &str) -> Result<(), Error> {
             "key '{}' is too long (max {} characters)",
             key, MAX_KEY_LENGTH
         )));
+    }
+    if !key.is_ascii() {
+        return Err(Error::InvalidKey(format!("key '{key}' must be ASCII")));
+    }
+    if key.contains('\0') {
+        return Err(Error::InvalidKey(format!("key {key:?} must not contain a NUL byte")));
     }
     Ok(())
 }

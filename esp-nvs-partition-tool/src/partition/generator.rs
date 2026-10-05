@@ -11,6 +11,7 @@ use super::{
     DataValue,
     EntryContent,
     FileEncoding,
+    validate_key,
 };
 use crate::NvsPartition;
 use crate::error::Error;
@@ -28,6 +29,12 @@ pub(crate) fn generate_partition_data(partition: &NvsPartition, size: usize) -> 
     let pages = size / esp_nvs::FLASH_SECTOR_SIZE;
     let flash = MemFlash::new(pages);
     let mut nvs = Nvs::new(0, size, flash)?;
+
+    // Entries built through the API have not been through the CSV parser's checks.
+    for entry in &partition.entries {
+        validate_key(&entry.namespace)?;
+        validate_key(&entry.key)?;
+    }
 
     for entry in &partition.entries {
         let namespace = Key::from_str(&entry.namespace);

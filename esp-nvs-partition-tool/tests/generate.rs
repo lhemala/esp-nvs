@@ -104,3 +104,42 @@ fn test_find_mut_and_generate() {
         EntryContent::Data(DataValue::U32(42))
     ));
 }
+
+/// Keys and namespaces built through the API are checked like those from a CSV file. A key that is
+/// too long or not ASCII made `generate_partition` panic, and one with a NUL byte was cut short.
+#[test]
+fn test_generate_rejects_invalid_keys() {
+    for (namespace, key) in [
+        ("config", "a_key_that_is_too_long"),
+        ("config", "ééééééé"),
+        ("config", "a\0b"),
+        ("config", ""),
+        ("", "key"),
+        ("a_namespace_too_long", "key"),
+    ] {
+        let partition = NvsPartition {
+            entries: vec![NvsEntry::new_data(
+                namespace.to_string(),
+                key.to_string(),
+                DataValue::U8(1),
+            )],
+        };
+        assert!(
+            matches!(
+                partition.generate_partition(0x3000),
+                Err(esp_nvs_partition_tool::Error::InvalidKey(_))
+            ),
+            "{namespace:?}/{key:?}"
+        );
+    }
+}
+
+/// The CSV parser rejects a key that is not ASCII instead of handing it on to panic later.
+#[test]
+fn test_csv_rejects_non_ascii_keys() {
+    let csv = "key,type,encoding,value\nns,namespace,,\nééééééa,data,u8,1\n";
+    assert!(matches!(
+        NvsPartition::try_from_str(csv),
+        Err(esp_nvs_partition_tool::Error::InvalidKey(_))
+    ));
+}
