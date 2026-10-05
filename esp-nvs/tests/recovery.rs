@@ -542,7 +542,8 @@ fn power_loss_while_changing_the_type_of_a_value() {
 /// paths returned without putting it back. Everything on it then read as missing until a reboot.
 #[test]
 fn a_failed_write_keeps_the_values_it_did_not_touch() {
-    let writes: [(&str, fn(&mut esp_nvs::Nvs<common::SharedFlash>) -> Result<(), Error>); 4] = [
+    type Write = fn(&mut esp_nvs::Nvs<common::SharedFlash>) -> Result<(), Error>;
+    let writes: [(&str, Write); 4] = [
         ("u8", |nvs| nvs.set(&namespace(), &Key::from_str("b"), 2u8)),
         ("blob", |nvs| {
             nvs.set(&namespace(), &Key::from_str("b"), [1u8; 10].as_slice())
