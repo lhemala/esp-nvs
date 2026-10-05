@@ -12,6 +12,7 @@
     actionlint
     cargo-edit
     git
+    git-cliff
     just
     nixfmt
   ];
