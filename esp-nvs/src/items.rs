@@ -264,6 +264,11 @@ where
         Ok(())
     }
 
+    /// Whether the blob `blob_item` indexes holds exactly `data`.
+    ///
+    /// A blob that cannot be read back in full is not equal to anything. That makes `set` overwrite
+    /// it, which is the way out of a corrupt blob; reporting the read error instead made `set` fail
+    /// with it, so the blob could not be replaced until a reboot cleaned it up.
     fn blob_is_equal(&mut self, namespace_index: u8, key: &Key, blob_item: &Item, data: &[u8]) -> Result<bool, Error> {
         #[cfg(feature = "defmt")]
         trace!("blob_is_equal");
@@ -279,10 +284,17 @@ where
         let mut to_be_compared = data;
         let chunks = blob_index_data.chunk_count;
         let chunk_start = blob_index_data.chunk_start;
+        let Some(chunk_end) = chunk_start.checked_add(chunks) else {
+            return Ok(false);
+        };
 
-        for chunk_index in (chunk_start..chunk_start + chunks).rev() {
-            let (_page_index, item_index, item) =
-                self.load_item(namespace_index, ChunkIndex::BlobData(chunk_index), key)?;
+        for chunk_index in (chunk_start..chunk_end).rev() {
+            let (page_index, item_index, item) =
+                match self.load_item(namespace_index, ChunkIndex::BlobData(chunk_index), key) {
+                    Ok(found) => found,
+                    Err(Error::FlashError) => return Err(Error::FlashError),
+                    Err(_) => return Ok(false),
+                };
 
             if item.type_ != ItemType::BlobData {
                 return Ok(false);
@@ -293,8 +305,12 @@ where
                 return Ok(false);
             }
 
-            let page = &self.pages[_page_index.0];
-            let chunk_data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+            let page = &self.pages[page_index.0];
+            let chunk_data = match page.load_referenced_data(&mut self.hal, item_index.0, &item) {
+                Ok(chunk_data) => chunk_data,
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                Err(_) => return Ok(false),
+            };
 
             if sized.crc != T::crc32(u32::MAX, &chunk_data) {
                 return Ok(false);
@@ -310,7 +326,8 @@ where
             to_be_compared = &to_be_compared[..offset];
         }
 
-        Ok(true)
+        // Chunks holding less than the index claims leave part of `data` unmatched.
+        Ok(to_be_compared.is_empty())
     }
 
     fn find_existing_blob_version(&mut self, namespace: &Key, key: &Key) -> Option<VersionOffset> {
@@ -940,7 +957,13 @@ where
         for (page_index, page) in self.pages.iter().enumerate() {
             for cache_entry in &page.item_hash_list {
                 if cache_entry.hash == hash {
-                    let item: Item = page.load_item(&mut self.hal, cache_entry.index)?;
+                    // An entry that no longer reads back is not the item, but a later one with the
+                    // same hash may well be, so keep looking.
+                    let item: Item = match page.load_item(&mut self.hal, cache_entry.index) {
+                        Ok(item) => item,
+                        Err(Error::FlashError) => return Err(Error::FlashError),
+                        Err(_) => continue,
+                    };
 
                     if item.namespace_index != namespace_index
                         || item.key != *key

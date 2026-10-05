@@ -3514,6 +3514,36 @@ mod blob_versions {
         );
     }
 
+    /// A blob whose chunk no longer reads back has to be replaceable by writing it again.
+    ///
+    /// The check for an unchanged value read the old blob first and passed the read error on, so
+    /// `set` failed with `KeyNotFound` and the blob stayed broken until a reboot.
+    #[test]
+    fn a_corrupt_blob_can_be_overwritten() {
+        let flash = common::SharedFlash::new(4);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), [1u8; 100].as_slice())
+            .unwrap();
+
+        // Entry 0 is the namespace, entry 1 the chunk header. Break its CRC via a key bit.
+        flash.with_buf(|buf| buf[common::ITEM_OFFSET + ITEM_SIZE + 8] ^= 0x01);
+        assert!(nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("b")).is_err());
+
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), [2u8; 100].as_slice())
+            .unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("b")),
+            Ok(vec![2u8; 100])
+        );
+        drop(nvs);
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("b")),
+            Ok(vec![2u8; 100])
+        );
+    }
+
     /// A blob written fresh after its predecessor was deleted starts over at the first base, since
     /// there is no live version left to differ from.
     #[test]
