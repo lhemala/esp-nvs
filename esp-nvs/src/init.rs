@@ -244,28 +244,29 @@ where
                     }
                 }
                 EntryMapState::Written => {
-                    // A span that cannot fit the page makes the item unusable: its data is not
-                    // where the header says it is, and no range covering it can be marked. Count
-                    // the header's own entry as unusable, the way an illegal entry is counted, and
-                    // leave the rest of the page to be scanned normally.
-                    if !span_fits_page {
-                        page.erased_entry_count += 1;
-                        continue 'item_iter;
-                    }
-
                     let calculated_crc = item.calculate_crc32(T::crc32);
-                    if item.crc != calculated_crc {
+                    if item.crc != calculated_crc || !span_fits_page {
                         #[cfg(feature = "debug-logs")]
                         println!(
                             "CRC mismatch for item '{}', marking as erased",
                             slice_with_nullbytes_to_str(&item.key.0)
                         );
-                        // The span was read from a header whose CRC just failed, so it says nothing
-                        // trustworthy about how many entries this item covers. Erasing a range on
-                        // its word takes out whatever happens to follow, valid items included.
-                        // Erase the header alone: the entries behind it are scanned like any other
-                        // and reach this same check one at a time, which ends in the same place for
-                        // a genuinely half written item without reaching past it.
+                        // The span was read from a header whose CRC just failed, or one that cannot
+                        // fit the page, so it says nothing trustworthy about how many entries this
+                        // item covers. Erasing a range on its word takes out whatever happens to
+                        // follow, valid items included. Erase the header alone: the entries behind
+                        // it are scanned like any other and reach this same
+                        // check one at a time, which ends in the same place
+                        // for a genuinely half written item without reaching
+                        // past it.
+                        //
+                        // The entry has to be marked erased in the entry map, not only counted as
+                        // such. Those entries behind it are payload, and their "span" byte is as
+                        // often as not out of range, so this branch is
+                        // where most of them end up. Left `Written`,
+                        // `copy_items` later loads each one, fails its CRC and aborts the
+                        // defragmentation with the source page stuck in `Freeing`; every `Nvs::new`
+                        // after that resumes the copy and fails the same way.
                         page.set_entry_state_range(&mut self.hal, item_index..(item_index + 1), EntryMapState::Erased)?;
                         page.erased_entry_count += 1;
                         continue 'item_iter;

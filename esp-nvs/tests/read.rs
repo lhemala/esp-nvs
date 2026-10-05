@@ -690,3 +690,42 @@ fn empty_string_roundtrips() {
         ""
     );
 }
+
+/// A header whose CRC fails with a span that cannot fit the page must not leave anything behind
+/// that a later defragmentation chokes on.
+///
+/// This is the power-loss case from the field: a corrupt `span` used to panic `Nvs::new` while the
+/// CRC-mismatch branch erased `item_index..item_index + span`. With only the header erased, the
+/// item's payload entries are scanned as headers in turn, and a payload of NUL bytes reads as a
+/// span of zero. Those entries were counted as erased but left `Written` in the entry map, so the
+/// first defragmentation of the page failed to load them, left it in `Freeing`, and every reopen
+/// failed the same way.
+#[test]
+fn item_with_a_corrupt_header_survives_defragmentation() {
+    let namespace = Key::from_str("ns1");
+    let key = Key::from_str("s");
+    let counter = Key::from_str("counter");
+
+    let flash = common::SharedFlash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        nvs.set(&namespace, &key, "\0".repeat(200).as_str()).unwrap();
+    }
+
+    flash.with_buf(|buf| {
+        let entry = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::Sized, &key).unwrap();
+        // Byte 2 of the header is `span`. The CRC is deliberately left stale.
+        buf[entry + 2] = 0xF0;
+    });
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    assert_eq!(nvs.get::<String>(&namespace, &key), Err(Error::KeyNotFound));
+
+    // Enough overwrites to cycle every page of the partition through defragmentation several times.
+    for value in 0..2_000u32 {
+        nvs.set(&namespace, &counter, value).unwrap();
+    }
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    assert_eq!(nvs.get::<u32>(&namespace, &counter).unwrap(), 1_999);
+}
