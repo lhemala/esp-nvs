@@ -20,9 +20,14 @@ use crate::error::Error;
 ///
 /// `size` must be a multiple of 4096 (the ESP-IDF flash sector size).
 pub(crate) fn generate_partition_data(partition: &NvsPartition, size: usize) -> Result<Vec<u8>, Error> {
-    if size < esp_nvs::FLASH_SECTOR_SIZE {
+    // Writing takes a page to write to and one kept in reserve; with a single page every write
+    // failed with `FlashFull`. ESP-IDF asks for at least three pages.
+    if size < 2 * esp_nvs::FLASH_SECTOR_SIZE {
         return Err(Error::PartitionTooSmall(size));
-    } else if !size.is_multiple_of(esp_nvs::FLASH_SECTOR_SIZE) {
+    }
+    // Checked before the in-memory flash is allocated: the library rejects more than u16::MAX
+    // pages, but a size far beyond that ran out of memory first.
+    if !size.is_multiple_of(esp_nvs::FLASH_SECTOR_SIZE) || size / esp_nvs::FLASH_SECTOR_SIZE > u16::MAX as usize {
         return Err(Error::InvalidPartitionSize(size));
     }
 

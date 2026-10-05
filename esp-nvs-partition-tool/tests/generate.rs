@@ -157,3 +157,28 @@ fn test_generate_rejects_a_255th_namespace() {
         Err(esp_nvs_partition_tool::Error::TooManyNamespaces)
     ));
 }
+
+/// A single page cannot be written to, as the library keeps one page in reserve. That used to fail
+/// with an opaque `FlashFull` from the library.
+#[test]
+fn test_generate_rejects_a_single_page() {
+    let partition = NvsPartition {
+        entries: vec![NvsEntry::new_data("ns".to_string(), "k".to_string(), DataValue::U8(1))],
+    };
+    assert!(matches!(
+        partition.generate_partition(0x1000),
+        Err(esp_nvs_partition_tool::Error::PartitionTooSmall(0x1000))
+    ));
+}
+
+/// A size beyond what the library accepts is rejected before memory for it is allocated, which
+/// ran out of memory for a large enough size.
+#[test]
+fn test_generate_rejects_a_huge_size() {
+    let partition = NvsPartition { entries: vec![] };
+    let size = 0x100_0000_0000;
+    assert!(matches!(
+        partition.generate_partition(size),
+        Err(esp_nvs_partition_tool::Error::InvalidPartitionSize(s)) if s == size
+    ));
+}
