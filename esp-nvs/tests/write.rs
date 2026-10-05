@@ -3477,6 +3477,43 @@ mod blob_versions {
         assert_eq!(seen, vec![0x00, 0x80, 0x00, 0x80, 0x00, 0x80]);
     }
 
+    /// A blob write that fails part way must not leave chunks behind at the indices the next
+    /// attempt uses.
+    ///
+    /// Both attempts take the same version base, and `load_item` finds the leftover chunk first, so
+    /// the next blob of the key read back as `CorruptedData`. At the following boot its chunks no
+    /// longer added up and it was deleted, so the key was gone.
+    #[test]
+    fn a_failed_blob_write_leaves_no_chunks_behind() {
+        let flash = common::SharedFlash::new(4);
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        nvs.set(
+            &Key::from_str("ns1"),
+            &Key::from_str("filler"),
+            [0xAAu8; 4000].as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), [0xBBu8; 9000].as_slice()),
+            Err(esp_nvs::error::Error::FlashFull)
+        );
+
+        nvs.delete(&Key::from_str("ns1"), &Key::from_str("filler")).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("b"), [0x11u8; 100].as_slice())
+            .unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("b")),
+            Ok(vec![0x11u8; 100])
+        );
+        drop(nvs);
+
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        assert_eq!(
+            nvs.get::<Vec<u8>>(&Key::from_str("ns1"), &Key::from_str("b")),
+            Ok(vec![0x11u8; 100])
+        );
+    }
+
     /// A blob written fresh after its predecessor was deleted starts over at the first base, since
     /// there is no live version left to differ from.
     #[test]

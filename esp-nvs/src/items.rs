@@ -610,7 +610,42 @@ where
             None => VersionOffset::V0,
         };
 
-        let version_base = new_version_offset.clone() as u8;
+        // A write that fails part way leaves the chunks it did write behind, at the very indices
+        // the next attempt for this key writes again: `load_item` finds the leftovers
+        // first, so the next blob reads back as `CorruptedData`, and at boot its chunks no
+        // longer add up and it is deleted. Removing them is best effort, since the reason
+        // for the failure may well stop it too; whatever is left is cleaned up as an orphan
+        // at the next boot.
+        if let Err(e) = self.write_blob_version(namespace_index, key, data, new_version_offset.clone()) {
+            let _ = self.delete_blob_data(namespace_index, &key, new_version_offset);
+            return Err(e);
+        }
+
+        // Now that the new blob version has been successfully written, delete whatever the key held
+        // before. That is gated on an item having been there at all rather than on a previous blob
+        // version: a key holding a string or a primitive has no blob version, and leaving that item
+        // in place used to shadow the blob just written, since `load_item` returns the older of the
+        // two. The write then reported success while the value could never be read back.
+        //
+        // Which item is deleted is not passed in, because it is bound to be the first one found
+        // anyway as newer pages appear later in self.pages. `ChunkIndex::Any` matches a blob index
+        // just as well as a foreign item.
+        if had_old_item {
+            self.delete_key(namespace_index, &key, ChunkIndex::Any)?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes the chunks of `data` and then the blob index of version `version`.
+    fn write_blob_version(
+        &mut self,
+        namespace_index: u8,
+        key: Key,
+        data: &[u8],
+        version: VersionOffset,
+    ) -> Result<(), Error> {
+        let version_base = version as u8;
         let mut chunk_count = 0u8;
         let mut offset = 0usize;
         // Retiring the active page is the only move this loop can make without writing a chunk, so
@@ -777,19 +812,6 @@ where
             item_data,
         )?;
         self.pages.push(page);
-
-        // Now that the new blob version has been successfully written, delete whatever the key held
-        // before. That is gated on an item having been there at all rather than on a previous blob
-        // version: a key holding a string or a primitive has no blob version, and leaving that item
-        // in place used to shadow the blob just written, since `load_item` returns the older of the
-        // two. The write then reported success while the value could never be read back.
-        //
-        // Which item is deleted is not passed in, because it is bound to be the first one found
-        // anyway as newer pages appear later in self.pages. `ChunkIndex::Any` matches a blob index
-        // just as well as a foreign item.
-        if had_old_item {
-            self.delete_key(namespace_index, &key, ChunkIndex::Any)?;
-        }
 
         Ok(())
     }
