@@ -294,3 +294,56 @@ fn a_resumed_defragmentation_copies_into_an_initialized_page() {
         }
     }
 }
+
+/// Power lost part way through programming an item header, before the entry map was updated.
+///
+/// The entry is EMPTY in the map but no longer blank, and the scan skipped it without counting it,
+/// so the next write was programmed on top of the leftovers. That write reported success but its
+/// CRC was broken: the new value could not be read, and the old value it replaced was erased.
+#[test]
+fn a_torn_entry_is_not_written_over() {
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace(), &Key::from_str("a"), 1u32).unwrap();
+    }
+
+    // Entry 0 holds the namespace, entry 1 `a`, so entry 2 is where the next item goes.
+    let entry = common::ITEM_OFFSET + 2 * esp_nvs::ITEM_SIZE;
+    for (i, byte) in flash.buf[entry..entry + 12].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(37);
+    }
+
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace(), &Key::from_str("a"), 2u32).unwrap();
+        nvs.set(&namespace(), &Key::from_str("b"), 3u32).unwrap();
+        assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str("a")), Ok(2));
+        assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str("b")), Ok(3));
+    }
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str("a")), Ok(2));
+    assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str("b")), Ok(3));
+}
+
+/// A sector whose header is blank but whose body is not, as an interrupted erase leaves it.
+///
+/// It was taken for a clean page and initialized without an erase, so the items written to it were
+/// programmed over the old bytes and could not be read back after the next boot.
+#[test]
+fn a_page_with_a_blank_header_and_leftover_data_is_erased_before_use() {
+    let mut flash = common::Flash::new(3);
+    for page in 0..3 {
+        let body = page * esp_nvs::FLASH_SECTOR_SIZE + common::ITEM_OFFSET;
+        flash.buf[body..body + 8].fill(0x5A);
+    }
+
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace(), &Key::from_str("a"), 42u32).unwrap();
+    }
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str("a")), Ok(42));
+}

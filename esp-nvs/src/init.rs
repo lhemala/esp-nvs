@@ -5,7 +5,10 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::mem::{
+    offset_of,
+    size_of,
+};
 use core::ops::Not;
 
 #[cfg(feature = "defmt")]
@@ -33,6 +36,7 @@ use crate::raw::{
     ENTRIES_PER_PAGE,
     EntryMapState,
     FLASH_SECTOR_SIZE,
+    Item,
     ItemType,
     PageHeader,
     RawPage,
@@ -131,7 +135,15 @@ where
             #[cfg(feature = "debug-logs")]
             println!("  raw: load page: 0x{sector_address:04X} -> uninitialized");
 
-            return Ok(LoadPageResult::Empty(ThinPage::uninitialized(sector_address)));
+            // A blank header does not make a blank page: an erase the power cut short, or a header
+            // write that never happened, leaves data behind it. Handed out as uninitialized, the
+            // page would be initialized without an erase and new items programmed over the old
+            // bytes. Corrupt pages are erased before they are used.
+            let mut page = ThinPage::uninitialized(sector_address);
+            if buf.iter().all(|it| *it == 0xFF).not() {
+                page.header.state = ThinPageState::Corrupt;
+            }
+            return Ok(LoadPageResult::Empty(page));
         }
 
         // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc
@@ -206,65 +218,80 @@ where
                     continue 'item_iter;
                 }
                 EntryMapState::Empty => {
-                    // maybe data was written but the map was not updated yet
+                    let entry_offset = offset_of!(RawPage, items) + item_index as usize * size_of::<Item>();
+                    if buf[entry_offset..entry_offset + size_of::<Item>()]
+                        .iter()
+                        .all(|it| *it == 0xFF)
+                    {
+                        continue 'item_iter;
+                    }
+
+                    // Not blank, so something was written here but the map was not updated yet.
+                    // Either it is a complete item and recovered below, or it
+                    // is what a torn write left behind. That has to be marked
+                    // erased and counted like one: left as it is, it
+                    // is where the next item would be written, programmed on top of the leftovers,
+                    // and both the new value and the old one it replaces would be lost.
                     let calculated_crc = item.calculate_crc32(T::crc32);
-                    if item.crc == calculated_crc && item.type_ != ItemType::Any && span_fits_page {
-                        match item.type_ {
-                            ItemType::U8
-                            | ItemType::I8
-                            | ItemType::U16
-                            | ItemType::I16
-                            | ItemType::U32
-                            | ItemType::I32
-                            | ItemType::U64
-                            | ItemType::I64
-                            | ItemType::BlobIndex => {
-                                #[cfg(feature = "debug-logs")]
-                                println!("encountered valid but empty scalar item at {item_index}");
-                                page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Written)?;
-                                page.used_entry_count += 1;
-                            }
-                            ItemType::Blob => {
-                                // TODO: should we just ignore this value or mark page corrupt?
-                                //  Alternatively, we could add support for BLOB_V1 and convert it
-                                // here
-                                page.used_entry_count += 1;
-                                continue 'item_iter;
-                            }
-                            ItemType::Sized | ItemType::BlobData => {
-                                #[cfg(feature = "debug-logs")]
-                                println!("encountered valid but EMPTY variable sized item at {item_index}");
-                                let data = page.load_referenced_data(&mut self.hal, item_index, item)?;
-                                let data_crc = T::crc32(u32::MAX, &data);
-                                if data_crc != unsafe { item.data.sized.crc } {
-                                    page.set_entry_state_range(
-                                        &mut self.hal,
-                                        item_index..item_index + item.span,
-                                        EntryMapState::Erased,
-                                    )?;
-                                    page.erased_entry_count += item.span;
-                                    // The whole span is counted above, so its payload entries must
-                                    // not be visited again: they now read as erased and would each
-                                    // be counted a second time, pushing the next free entry past
-                                    // the end of the page.
-                                    if item.span >= 2 {
-                                        item_iter.nth((item.span - 2) as usize);
-                                    }
-                                    continue 'item_iter;
-                                }
+                    if item.crc != calculated_crc || !span_fits_page {
+                        page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Erased)?;
+                        page.erased_entry_count += 1;
+                        continue 'item_iter;
+                    }
+
+                    match item.type_ {
+                        ItemType::U8
+                        | ItemType::I8
+                        | ItemType::U16
+                        | ItemType::I16
+                        | ItemType::U32
+                        | ItemType::I32
+                        | ItemType::U64
+                        | ItemType::I64
+                        | ItemType::BlobIndex
+                            if item.span == 1 =>
+                        {
+                            #[cfg(feature = "debug-logs")]
+                            println!("encountered valid but empty scalar item at {item_index}");
+                            page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Written)?;
+                            page.used_entry_count += 1;
+                        }
+                        ItemType::Sized | ItemType::BlobData | ItemType::Blob => {
+                            #[cfg(feature = "debug-logs")]
+                            println!("encountered valid but EMPTY variable sized item at {item_index}");
+                            let data_is_valid = match page.load_referenced_data(&mut self.hal, item_index, item) {
+                                Ok(data) => T::crc32(u32::MAX, &data) == unsafe { item.data.sized.crc },
+                                Err(Error::CorruptedData) => false,
+                                Err(e) => return Err(e),
+                            };
+                            if !data_is_valid {
                                 page.set_entry_state_range(
                                     &mut self.hal,
                                     item_index..item_index + item.span,
-                                    EntryMapState::Written,
+                                    EntryMapState::Erased,
                                 )?;
-                                page.used_entry_count += item.span;
-                            }
-                            ItemType::Any => {
+                                page.erased_entry_count += item.span;
+                                // The whole span is counted above, so its payload entries must
+                                // not be visited again: they now read as erased and would each
+                                // be counted a second time, pushing the next free entry past
+                                // the end of the page.
+                                if item.span >= 2 {
+                                    item_iter.nth((item.span - 2) as usize);
+                                }
                                 continue 'item_iter;
                             }
+                            page.set_entry_state_range(
+                                &mut self.hal,
+                                item_index..item_index + item.span,
+                                EntryMapState::Written,
+                            )?;
+                            page.used_entry_count += item.span;
                         }
-                    } else {
-                        continue 'item_iter;
+                        _ => {
+                            page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Erased)?;
+                            page.erased_entry_count += 1;
+                            continue 'item_iter;
+                        }
                     }
                 }
                 EntryMapState::Written => {
