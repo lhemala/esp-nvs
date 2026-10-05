@@ -339,6 +339,29 @@ where
                         page.erased_entry_count += 1;
                         continue 'item_iter;
                     }
+
+                    // ESP-IDF marks a header written before it writes the payload, so a header
+                    // whose payload entries are not all written is a write the
+                    // power cut short there - or here, if the single entry map
+                    // write of this crate was torn. ESP-IDF erases such an item
+                    // on load, and so does this: kept, it is a newer duplicate that reads as
+                    // corrupt, and the duplicate cleanup would erase the older, intact value for
+                    // it.
+                    let payload_is_written = (item_index + 1..item_index + item.span)
+                        .all(|index| page.get_entry_state(index) == EntryMapState::Written);
+                    if !payload_is_written {
+                        page.set_entry_state_range(
+                            &mut self.hal,
+                            item_index..item_index + item.span,
+                            EntryMapState::Erased,
+                        )?;
+                        page.erased_entry_count += item.span;
+                        if item.span >= 2 {
+                            item_iter.nth((item.span - 2) as usize);
+                        }
+                        continue 'item_iter;
+                    }
+
                     page.used_entry_count += item.span;
                 }
             }

@@ -696,3 +696,46 @@ fn several_freeing_pages_are_all_finished() {
         check_keys(&mut nvs, count);
     }
 }
+
+/// Sets the entry map state of entries `entries` of the page starting at `page` to `state`.
+fn set_entry_states(buf: &mut [u8], page: usize, entries: core::ops::Range<usize>, state: u8) {
+    for e in entries {
+        let byte = page + common::ENTRY_STATE_MAP_OFFSET + e / 4;
+        let shift = (e % 4) * 2;
+        buf[byte] = (buf[byte] & !(0b11 << shift)) | (state << shift);
+    }
+}
+
+/// A string overwritten by ESP-IDF, with the power gone after the new header was marked written but
+/// before its payload was: ESP-IDF marks a header written first and the payload after.
+///
+/// The new item was kept, so it shadowed the old value as a newer duplicate that reads as corrupt,
+/// and the boot cleanup erased the old, intact value in its favour. ESP-IDF erases the torn item.
+#[test]
+fn a_header_written_without_its_payload_does_not_replace_the_old_value() {
+    let key = Key::from_str("s");
+    let flash = common::SharedFlash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        nvs.set(&namespace(), &key, "the old value").unwrap();
+        nvs.set(&namespace(), &key, "the new value, a little longer").unwrap();
+    }
+
+    flash.with_buf(|buf| {
+        let headers = find_headers(buf, ItemType::Sized as u8, &key);
+        let (page, old) = headers[0];
+        let (_, new) = headers[1];
+        let span = |entry: usize| buf[page + common::ITEM_OFFSET + entry * esp_nvs::ITEM_SIZE + 2] as usize;
+        let (old_span, new_span) = (span(old), span(new));
+        // The old value was never erased, and the new one's payload never written.
+        set_entry_states(buf, page, old..old + old_span, common::ENTRY_STATE_WRITTEN);
+        set_entry_states(buf, page, new + 1..new + new_span, 0b11);
+        let payload = page + common::ITEM_OFFSET + (new + 1) * esp_nvs::ITEM_SIZE;
+        buf[payload..payload + (new_span - 1) * esp_nvs::ITEM_SIZE].fill(0xFF);
+    });
+
+    for _boot in 0..2 {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        assert_eq!(nvs.get::<String>(&namespace(), &key).as_deref(), Ok("the old value"));
+    }
+}
