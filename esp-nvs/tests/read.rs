@@ -820,3 +820,27 @@ fn keys_lists_empty_and_legacy_blobs() {
         ]
     );
 }
+
+/// ESP-IDF accepts any key byte but NUL, and flash can be corrupted, so a key read from flash need
+/// not be UTF-8. `as_str` built a `&str` from it unchecked, which is undefined behaviour in safe
+/// code.
+#[test]
+fn a_key_read_from_flash_that_is_not_utf8_is_handled_soundly() {
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("abc"), 1u8).unwrap();
+    }
+    let entry = find_item_entry(&flash.buf, NAMESPACE_ONE_INDEX, ItemType::U8, &Key::from_str("abc")).unwrap();
+    flash.buf[entry + ITEM_KEY_OFFSET + 1] = 0xC3;
+    flash.buf[entry + ITEM_KEY_OFFSET + 2] = 0x28;
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    let keys: Vec<_> = nvs.keys().collect::<Result<_, _>>().unwrap();
+    let key = keys[0].1;
+    assert_eq!(key.as_bytes()[..3], [b'a', 0xC3, 0x28]);
+    assert!(core::str::from_utf8(key.as_str().as_bytes()).is_ok());
+    assert_eq!(key.as_str(), "a");
+    assert_eq!(key.to_string(), "a\\xc3(");
+}
