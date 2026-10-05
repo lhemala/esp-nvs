@@ -24,10 +24,7 @@ use crate::raw::{
     ItemType,
 };
 use crate::set::Set;
-use crate::types::{
-    ChunkIndex,
-    VersionOffset,
-};
+use crate::types::ChunkIndex;
 use crate::{
     EntryStatistics,
     Key,
@@ -49,6 +46,9 @@ pub struct Nvs<T: Platform> {
     pub(crate) namespaces: BTreeMap<Key, u8>,
     pub(crate) free_pages: BinaryHeap<ThinPage>,
     pub(crate) pages: Vec<ThinPage>,
+    /// Legacy single-page blobs the scan came across, as (namespace index, key), for
+    /// `migrate_legacy_blobs`.
+    pub(crate) legacy_blobs: Vec<(u8, Key)>,
 }
 
 impl<T: Platform> Nvs<T> {
@@ -69,9 +69,19 @@ impl<T: Platform> Nvs<T> {
             return Err(Error::InvalidPartitionSize);
         }
 
+        // A single page still makes sense for reading a read-only image, but an empty partition
+        // does not. Writing needs two, one to write to and one in reserve for
+        // defragmentation; with fewer `set` reports `FlashFull`.
         let sectors = partition_size / FLASH_SECTOR_SIZE;
-        if sectors > u16::MAX as usize {
+        if !(1..=u16::MAX as usize).contains(&sectors) {
             return Err(Error::InvalidPartitionSize);
+        }
+
+        // Flash addresses are u32, and the partition has to lie inside the flash it is read from:
+        // past either, reads and writes would wrap or run into whatever `hal` does out of range.
+        match partition_offset.checked_add(partition_size) {
+            Some(end) if end <= hal.capacity() && end <= u32::MAX as usize + 1 => {}
+            _ => return Err(Error::InvalidPartitionSize),
         }
 
         let mut nvs: Nvs<T> = Self {
@@ -81,6 +91,7 @@ impl<T: Platform> Nvs<T> {
             namespaces: BTreeMap::new(),
             free_pages: Default::default(),
             pages: Default::default(),
+            legacy_blobs: Default::default(),
             faulted: false,
             purge: false,
         };
@@ -157,7 +168,7 @@ impl<T: Platform> Nvs<T> {
     ///
     /// Each item yields `(namespace_key, entry_key, item_type)`. Namespace
     /// definition entries are skipped. For multi-chunk blobs, only a single
-    /// representative entry is returned (with type [`ItemType::BlobData`]).
+    /// representative entry is returned (with type [`ItemType::BlobIndex`]).
     /// Legacy single-page blobs are returned with type [`ItemType::Blob`].
     ///
     /// # Errors
@@ -382,15 +393,13 @@ impl<'a, T: Platform> IterKeys<'a, T> {
         }
     }
 
-    fn item_to_keys(&self, item: Item) -> (Key, Key) {
-        let (namespace_key, _) = self
-            .namespaces
-            .iter()
-            .find(|(_, idx)| **idx == item.namespace_index)
-            // a key should always have a namespace
-            .unwrap();
+    /// `None` for an item whose namespace is unknown. That is not supposed to exist, but it does
+    /// once the namespace's own entry is lost to corruption: the scan drops that entry and keeps
+    /// the items, which no `get` can reach any more.
+    fn item_to_keys(&self, item: Item) -> Option<(Key, Key)> {
+        let (namespace_key, _) = self.namespaces.iter().find(|(_, idx)| **idx == item.namespace_index)?;
 
-        (*namespace_key, item.key)
+        Some((*namespace_key, item.key))
     }
 }
 
@@ -401,20 +410,18 @@ impl<'a, T: Platform> Iterator for IterKeys<'a, T> {
         loop {
             return match self.items.next()? {
                 Ok(item) => {
-                    // Skip namespace entries (namespace_index == 0), and blobs (they are
-                    // represented by their BlobData)
-                    if item.namespace_index == 0 || item.type_ == ItemType::Blob || item.type_ == ItemType::BlobIndex {
+                    // Skip namespace entries (namespace_index == 0) and blob chunks. A blob is
+                    // represented by its index, as in `typed_entries`: going by its first chunk
+                    // instead left out empty blobs, which have none, and legacy blobs, which are a
+                    // single item.
+                    if item.namespace_index == 0 || item.type_ == ItemType::BlobData {
                         continue;
                     }
 
-                    if item.type_ == ItemType::BlobData
-                        && item.chunk_index != VersionOffset::V0 as u8
-                        && item.chunk_index != VersionOffset::V1 as u8
-                    {
-                        continue;
+                    match self.item_to_keys(item) {
+                        Some(keys) => Some(Ok(keys)),
+                        None => continue,
                     }
-
-                    Some(Ok(self.item_to_keys(item)))
                 }
                 Err(err) => Some(Err(err)),
             };
@@ -436,14 +443,11 @@ impl<'a, T: Platform> IterTypedEntries<'a, T> {
         }
     }
 
-    fn item_to_entry(&self, item: Item) -> (Key, Key, ItemType) {
-        let (namespace_key, _) = self
-            .namespaces
-            .iter()
-            .find(|(_, idx)| **idx == item.namespace_index)
-            .unwrap();
+    /// `None` for an item whose namespace is unknown, see [`IterKeys::item_to_keys`].
+    fn item_to_entry(&self, item: Item) -> Option<(Key, Key, ItemType)> {
+        let (namespace_key, _) = self.namespaces.iter().find(|(_, idx)| **idx == item.namespace_index)?;
 
-        (*namespace_key, item.key, item.type_)
+        Some((*namespace_key, item.key, item.type_))
     }
 }
 
@@ -465,7 +469,10 @@ impl<'a, T: Platform> Iterator for IterTypedEntries<'a, T> {
                     }
 
                     // Include BlobIndex, legacy Blob (0x41), primitives, and Sized
-                    Some(Ok(self.item_to_entry(item)))
+                    match self.item_to_entry(item) {
+                        Some(entry) => Some(Ok(entry)),
+                        None => continue,
+                    }
                 }
                 Err(err) => Some(Err(err)),
             };

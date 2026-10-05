@@ -38,8 +38,8 @@ pub(crate) fn parse_binary_data(data: &[u8]) -> Result<NvsPartition, Error> {
     let typed: Vec<(Key, Key, ItemType)> = nvs.typed_entries().collect::<Result<Vec<_>, _>>()?;
 
     for (ns_key, entry_key, item_type) in typed {
-        let namespace = ns_key.as_str().to_string();
-        let key = entry_key.as_str().to_string();
+        let namespace = key_to_string(&ns_key)?;
+        let key = key_to_string(&entry_key)?;
 
         let value = match item_type {
             ItemType::U8 => DataValue::U8(nvs.get::<u8>(&ns_key, &entry_key)?),
@@ -66,4 +66,16 @@ pub(crate) fn parse_binary_data(data: &[u8]) -> Result<NvsPartition, Error> {
     }
 
     Ok(NvsPartition { entries })
+}
+
+/// The key as a string, or an error for one that is not UTF-8.
+///
+/// ESP-IDF accepts any byte but NUL in a key, and flash can be corrupted. `Key::as_str` stops at
+/// the first byte that is not valid UTF-8, which would put a different, shorter key into the CSV.
+fn key_to_string(key: &Key) -> Result<String, Error> {
+    let bytes = key.as_bytes();
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..len])
+        .map(str::to_string)
+        .map_err(|_| Error::InvalidKey(format!("key {:?} is not valid UTF-8", &bytes[..len])))
 }

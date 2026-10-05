@@ -34,7 +34,10 @@ pub const ENTRY_STATE_BITMAP_SIZE: usize = 32;
 pub const ENTRIES_PER_PAGE: usize = 126;
 // -1 is for the leading item of type BLOB_DATA or SZ (for str)
 pub const MAX_BLOB_DATA_PER_PAGE: usize = (ENTRIES_PER_PAGE - 1) * size_of::<Item>();
-pub const MAX_BLOB_SIZE: usize = MAX_BLOB_DATA_PER_PAGE * (u8::MAX as usize - VersionOffset::V1 as usize);
+/// A blob version owns the 128 wide chunk-index half that starts at its version base, and 0xFF is
+/// reserved as "no chunk index", so a blob version can address at most 127 chunks.
+pub(crate) const MAX_BLOB_CHUNK_COUNT: usize = u8::MAX as usize - VersionOffset::V1 as usize;
+pub const MAX_BLOB_SIZE: usize = MAX_BLOB_DATA_PER_PAGE * MAX_BLOB_CHUNK_COUNT;
 pub const PAGE_HEADER_SIZE: usize = size_of::<PageHeader>();
 pub const ITEM_SIZE: usize = size_of::<Item>();
 
@@ -43,6 +46,14 @@ const _: () = assert!(
     PAGE_HEADER_SIZE + ENTRY_STATE_BITMAP_SIZE + ENTRIES_PER_PAGE * ITEM_SIZE == FLASH_SECTOR_SIZE,
     "Page structure size must equal flash sector size"
 );
+
+/// Replaces a type byte that is not a known [`ItemType`] by `ItemType::Any`, see
+/// [`Item::from_raw`].
+pub(crate) fn sanitize_item_type(entry: &mut [u8; size_of::<Item>()]) {
+    if ItemType::from_repr(entry[1]).is_none() {
+        entry[1] = ItemType::Any as u8;
+    }
+}
 
 #[repr(C, packed)]
 pub(crate) struct RawPage {
@@ -235,6 +246,19 @@ pub(crate) union RawItem {
 }
 
 impl Item {
+    /// Reinterprets a raw entry read from flash as an item.
+    ///
+    /// `type_` is an enum, so a byte that is not one of its values must never end up in it: that is
+    /// undefined behaviour, and in practice a `match` on it executes an illegal instruction. Any
+    /// entry can hold such a byte - a payload entry, a torn write, a bit flip - so it is replaced
+    /// by `ItemType::Any` first. The CRC stored in the entry was computed over the original
+    /// byte, so the item fails its CRC check and is treated like any other corrupt entry.
+    pub(crate) fn from_raw(mut raw: [u8; size_of::<Item>()]) -> Item {
+        sanitize_item_type(&mut raw);
+        // Safety: every field is plain old data apart from `type_`, which was just made valid.
+        unsafe { transmute::<[u8; size_of::<Item>()], Item>(raw) }
+    }
+
     #[cfg(feature = "debug-logs")]
     fn get_primitive(&self) -> Result<u64, Error> {
         let width = match self.type_ {
@@ -299,6 +323,21 @@ pub(crate) struct ItemDataBlobIndex {
     pub(crate) size: u32,
     pub(crate) chunk_count: u8,
     pub(crate) chunk_start: u8,
+    // Fills the 8 byte data field. Without it, the last two bytes of the union were left
+    // uninitialized when an index was built, and whatever they held went to flash and into the CRC.
+    _reserved: u16,
+}
+
+impl ItemDataBlobIndex {
+    pub(crate) fn new(size: u32, chunk_count: u8, chunk_start: u8) -> Self {
+        Self {
+            size,
+            chunk_count,
+            chunk_start,
+            // As ESP-IDF writes it, unprogrammed.
+            _reserved: u16::MAX,
+        }
+    }
 }
 
 #[cfg(feature = "debug-logs")]

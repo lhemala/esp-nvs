@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 // filename according to https://doc.rust-lang.org/book/ch11-03-test-organization.html
 use embedded_storage::nor_flash::{
     ErrorType,
@@ -22,6 +25,39 @@ pub const ENTRY_STATE_MAP_ENTRY_SIZE: usize = 1;
 
 pub const ITEM_OFFSET: usize = PAGE_HEADER_SIZE + ENTRY_STATE_MAP_SIZE;
 // 1 byte is the minimum that can be written
+
+// Byte offsets within a 32 byte entry, mirroring `raw::Item`:
+// namespace_index(1) type_(1) span(1) chunk_index(1) crc(4) key(16) data(8).
+pub const ITEM_CRC_OFFSET: usize = 4;
+pub const ITEM_KEY_OFFSET: usize = 8;
+pub const ITEM_DATA_OFFSET: usize = 24;
+
+/// `EntryMapState::Written` as stored in the two-bit-per-entry entry state bitmap.
+pub const ENTRY_STATE_WRITTEN: u8 = 0b10;
+
+/// Reads an entry's two-bit state out of its page's entry state bitmap.
+pub fn entry_state(buf: &[u8], page_start: usize, entry: usize) -> u8 {
+    let byte = buf[page_start + ENTRY_STATE_MAP_OFFSET + entry / 4];
+    (byte >> ((entry % 4) * 2)) & 0b11
+}
+
+/// Recomputes the CRC an item header stores in bytes 4..8: it covers the first four header bytes,
+/// the 16 byte key and the 8 byte data union, but not the CRC itself.
+///
+/// This is also what tells an item header apart from a payload entry, which carries no CRC of its
+/// own and so is very unlikely to match: without it, a raw data byte that happens to look like an
+/// item type is picked up as an item.
+pub fn item_crc(entry: &[u8]) -> u32 {
+    let crc = esp_nvs::platform::software_crc32(u32::MAX, &entry[0..ITEM_CRC_OFFSET]);
+    let crc = esp_nvs::platform::software_crc32(crc, &entry[ITEM_KEY_OFFSET..ITEM_DATA_OFFSET]);
+    esp_nvs::platform::software_crc32(crc, &entry[ITEM_DATA_OFFSET..esp_nvs::ITEM_SIZE])
+}
+
+/// Whether the entry at `offset` is a real item header rather than a payload entry.
+pub fn is_item_header(buf: &[u8], offset: usize) -> bool {
+    let entry = &buf[offset..offset + esp_nvs::ITEM_SIZE];
+    u32::from_le_bytes(entry[ITEM_CRC_OFFSET..ITEM_KEY_OFFSET].try_into().unwrap()) == item_crc(entry)
+}
 
 #[derive(Default)]
 pub struct Flash {
@@ -67,8 +103,21 @@ impl Flash {
         self.buf.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
     pub fn disable_faults(&mut self) {
         self.fail_after_operation = usize::MAX;
+    }
+
+    /// Fails every operation past the next `budget` ones.
+    ///
+    /// Same mechanism as [`Flash::new_with_fault`], only counted from here rather than from the
+    /// first operation, so a test can set up a large partition and still hand the operation under
+    /// test a budget of its own.
+    pub fn arm_fault(&mut self, budget: usize) {
+        self.fail_after_operation = self.operations.len() + budget;
     }
 
     pub fn erases(&mut self) -> usize {
@@ -195,6 +244,99 @@ impl NorFlash for Flash {
 }
 
 impl esp_nvs::platform::Crc for Flash {
+    fn crc32(init: u32, data: &[u8]) -> u32 {
+        esp_nvs::platform::software_crc32(init, data)
+    }
+}
+
+/// A [`Flash`] behind a shared handle.
+///
+/// `Nvs::new` takes ownership of the HAL, so with a plain [`Flash`] the backing buffer is
+/// unreachable for as long as the `Nvs` instance lives. Cloning a `SharedFlash` hands the
+/// `Nvs` one handle while the test keeps another, which allows simulating corruption that
+/// appears *after* the partition has been scanned and cached.
+#[derive(Clone, Default)]
+pub struct SharedFlash(Rc<RefCell<Flash>>);
+
+impl SharedFlash {
+    pub fn new(pages: usize) -> Self {
+        Self(Rc::new(RefCell::new(Flash::new(pages))))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
+    /// Wraps an existing partition image.
+    pub fn from_buf(buf: Vec<u8>) -> Self {
+        Self(Rc::new(RefCell::new(Flash {
+            buf,
+            fail_after_operation: usize::MAX,
+            ..Default::default()
+        })))
+    }
+
+    /// A copy of the raw partition image.
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.0.borrow().buf.clone()
+    }
+
+    /// See [`Flash::arm_fault`].
+    pub fn arm_fault(&self, budget: usize) {
+        self.0.borrow_mut().arm_fault(budget)
+    }
+
+    /// See [`Flash::disable_faults`].
+    pub fn disable_faults(&self) {
+        self.0.borrow_mut().disable_faults()
+    }
+
+    /// See [`Flash::erases`].
+    pub fn erases(&self) -> usize {
+        self.0.borrow_mut().erases()
+    }
+
+    /// Gives temporary mutable access to the raw partition image.
+    pub fn with_buf<R>(&self, f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+        f(&mut self.0.borrow_mut().buf)
+    }
+}
+
+impl ErrorType for SharedFlash {
+    type Error = FlashError;
+}
+
+impl ReadNorFlash for SharedFlash {
+    const READ_SIZE: usize = WORD_SIZE;
+
+    fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().read(offset, bytes)
+    }
+
+    fn capacity(&self) -> usize {
+        self.0.borrow().buf.len()
+    }
+}
+
+impl NorFlash for SharedFlash {
+    const WRITE_SIZE: usize = WORD_SIZE;
+
+    const ERASE_SIZE: usize = FLASH_SECTOR_SIZE;
+
+    fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        self.0.borrow_mut().erase(from, to)
+    }
+
+    fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.borrow_mut().write(offset, bytes)
+    }
+}
+
+impl esp_nvs::platform::Crc for SharedFlash {
     fn crc32(init: u32, data: &[u8]) -> u32 {
         esp_nvs::platform::software_crc32(init, data)
     }

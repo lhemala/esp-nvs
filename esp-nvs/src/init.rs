@@ -5,7 +5,10 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::mem::{
+    offset_of,
+    size_of,
+};
 use core::ops::Not;
 
 #[cfg(feature = "defmt")]
@@ -30,13 +33,17 @@ use crate::platform::Platform;
 #[cfg(feature = "debug-logs")]
 use crate::raw::slice_with_nullbytes_to_str;
 use crate::raw::{
+    ENTRIES_PER_PAGE,
     EntryMapState,
     FLASH_SECTOR_SIZE,
+    Item,
     ItemType,
     PageHeader,
     RawPage,
+    sanitize_item_type,
 };
 use crate::types::{
+    ChunkIndex,
     NamespaceIndex,
     VersionOffset,
 };
@@ -52,6 +59,84 @@ where
         #[cfg(feature = "debug-logs")]
         println!("internal: load_sectors");
 
+        let mut blob_index = self.scan_sectors()?;
+
+        // Finishing an interrupted defragmentation erases pages the scan above has already
+        // accounted for. The blob index in particular would count each chunk on both the source
+        // and its partial copy, find twice the data its index claims, and delete a blob that is
+        // perfectly intact. So start over from what is on flash once the recovery is done.
+        // ESP-IDF never leaves more than one page `Freeing`, but nothing stops flash from saying
+        // otherwise, so all of them are finished.
+        let mut recovered = false;
+        while self.continue_free_page()? {
+            recovered = true;
+        }
+        if recovered {
+            self.pages.clear();
+            self.free_pages.clear();
+            self.namespaces.clear();
+            self.legacy_blobs.clear();
+            blob_index = self.scan_sectors()?;
+        }
+
+        // Settle the blobs first, so at most one version of each is left, then check for duplicate
+        // entries and mark older ones as erased. This handles cases where deletion failed after a
+        // successful write.
+        self.cleanup_dirty_blobs(blob_index)?;
+
+        self.cleanup_duplicate_entries()?;
+
+        self.migrate_legacy_blobs()?;
+
+        Ok(())
+    }
+
+    /// Rewrites every blob in the single-page format of ESP-IDF before v4.0 as a multi-page blob,
+    /// the only format this crate writes.
+    ///
+    /// That is an ordinary overwrite: the new blob is written first and the legacy item erased
+    /// after, so a power loss in between leaves both, which the next boot resolves in favour of the
+    /// newer one, and migrates again what is still legacy.
+    ///
+    /// It is best effort. A partition without room for the copy keeps the legacy blob, which is
+    /// still read, until there is room; so does one that does not read back, rather than being
+    /// turned into a blob with the wrong content.
+    fn migrate_legacy_blobs(&mut self) -> Result<(), Error> {
+        let legacy = core::mem::take(&mut self.legacy_blobs);
+        for (namespace_index, key) in legacy {
+            let Some(namespace) = self
+                .namespaces
+                .iter()
+                .find(|(_, index)| **index == namespace_index)
+                .map(|(namespace, _)| *namespace)
+            else {
+                continue;
+            };
+            // The scan may have found an item that the cleanups after it have since replaced.
+            match self.load_item(namespace_index, ChunkIndex::Any, &key) {
+                Ok((_, _, item)) if item.type_ == ItemType::Blob => {}
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                _ => continue,
+            }
+            let data = match self.get_blob(&namespace, &key) {
+                Ok(data) => data,
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                Err(_) => continue,
+            };
+            match self.set_blob(&namespace, key, &data) {
+                Ok(()) => {}
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                // No room for this one, and so for none of the others either.
+                Err(_) => return Ok(()),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Loads every sector into `self.pages` and `self.free_pages`, and the namespaces into
+    /// `self.namespaces`, returning what was found about blobs.
+    fn scan_sectors(&mut self) -> Result<BlobIndex, Error> {
         let mut blob_index = BlobIndex::new();
         let sectors = self.sectors as usize;
         for sector_idx in 0..sectors {
@@ -86,15 +171,7 @@ where
 
         self.ensure_active_page_order()?;
 
-        self.continue_free_page()?;
-
-        // After loading all pages, check for duplicate primitive/string entries and mark older ones
-        // as erased This handles cases where deletion failed after a successful write
-        self.cleanup_duplicate_entries()?;
-
-        self.cleanup_dirty_blobs(blob_index)?;
-
-        Ok(())
+        Ok(blob_index)
     }
 
     pub(crate) fn load_sector(&mut self, sector_address: usize) -> Result<LoadPageResult, Error> {
@@ -113,12 +190,29 @@ where
             #[cfg(feature = "debug-logs")]
             println!("  raw: load page: 0x{sector_address:04X} -> uninitialized");
 
-            return Ok(LoadPageResult::Empty(ThinPage::uninitialized(sector_address)));
+            // A blank header does not make a blank page: an erase the power cut short, or a header
+            // write that never happened, leaves data behind it. Handed out as uninitialized, the
+            // page would be initialized without an erase and new items programmed over the old
+            // bytes. Corrupt pages are erased before they are used.
+            let mut page = ThinPage::uninitialized(sector_address);
+            if buf.iter().all(|it| *it == 0xFF).not() {
+                page.header.state = ThinPageState::Corrupt;
+            }
+            return Ok(LoadPageResult::Empty(page));
         }
+
+        // The items are reinterpreted from raw flash, so their type bytes have to be valid first,
+        // see `Item::from_raw`. `buf` itself keeps the bytes as they are on flash.
+        let mut sanitized = buf;
+        sanitized[offset_of!(RawPage, items)..]
+            .as_chunks_mut::<{ size_of::<Item>() }>()
+            .0
+            .iter_mut()
+            .for_each(sanitize_item_type);
 
         // Safety: either we return directly CORRUPT/INVALID/EMPTY page or we check the crc
         // afterwards
-        let raw_page: RawPage = unsafe { core::mem::transmute(buf) };
+        let raw_page: RawPage = unsafe { core::mem::transmute(sanitized) };
 
         #[cfg(feature = "debug-logs")]
         {
@@ -167,6 +261,17 @@ where
         let mut item_iter = unsafe { items.entries.iter().zip(u8::MIN..u8::MAX) };
         'item_iter: while let Some((item, item_index)) = item_iter.next() {
             let state = page.get_entry_state(item_index);
+
+            // `span` is an unvalidated u8 straight from flash, and everything below uses it to walk
+            // entries, mark ranges of the entry map and add to the page's u8 entry counters. All of
+            // that assumes the span's entries are on this page. A span of zero, or one reaching
+            // past the last entry, is corrupt and has to be recognised before it is
+            // trusted: summing it into `used_entry_count` overflowed, which is a panic
+            // in debug and a wrong count in release, and it happens during `Nvs::new`,
+            // so a single bad byte took the partition down at startup before anything
+            // could be read.
+            let span_fits_page = item.span >= 1 && item_index as usize + item.span as usize <= ENTRIES_PER_PAGE;
+
             match state {
                 EntryMapState::Illegal => {
                     page.erased_entry_count += 1;
@@ -177,76 +282,133 @@ where
                     continue 'item_iter;
                 }
                 EntryMapState::Empty => {
-                    // maybe data was written but the map was not updated yet
+                    let entry_offset = offset_of!(RawPage, items) + item_index as usize * size_of::<Item>();
+                    if buf[entry_offset..entry_offset + size_of::<Item>()]
+                        .iter()
+                        .all(|it| *it == 0xFF)
+                    {
+                        continue 'item_iter;
+                    }
+
+                    // Not blank, so something was written here but the map was not updated yet.
+                    // Either it is a complete item and recovered below, or it
+                    // is what a torn write left behind. That has to be marked
+                    // erased and counted like one: left as it is, it
+                    // is where the next item would be written, programmed on top of the leftovers,
+                    // and both the new value and the old one it replaces would be lost.
                     let calculated_crc = item.calculate_crc32(T::crc32);
-                    if item.crc == calculated_crc && item.type_ != ItemType::Any && item.span != u8::MAX {
-                        match item.type_ {
-                            ItemType::U8
-                            | ItemType::I8
-                            | ItemType::U16
-                            | ItemType::I16
-                            | ItemType::U32
-                            | ItemType::I32
-                            | ItemType::U64
-                            | ItemType::I64
-                            | ItemType::BlobIndex => {
-                                #[cfg(feature = "debug-logs")]
-                                println!("encountered valid but empty scalar item at {item_index}");
-                                page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Written)?;
-                                page.used_entry_count += 1;
-                            }
-                            ItemType::Blob => {
-                                // TODO: should we just ignore this value or mark page corrupt?
-                                //  Alternatively, we could add support for BLOB_V1 and convert it
-                                // here
-                                page.used_entry_count += 1;
-                                continue 'item_iter;
-                            }
-                            ItemType::Sized | ItemType::BlobData => {
-                                #[cfg(feature = "debug-logs")]
-                                println!("encountered valid but EMPTY variable sized item at {item_index}");
-                                let data = page.load_referenced_data(&mut self.hal, item_index, item)?;
-                                let data_crc = T::crc32(u32::MAX, &data);
-                                if data_crc != unsafe { item.data.sized.crc } {
-                                    page.set_entry_state_range(
-                                        &mut self.hal,
-                                        item_index..item_index + item.span,
-                                        EntryMapState::Erased,
-                                    )?;
-                                    page.erased_entry_count += item.span;
-                                    continue 'item_iter;
-                                }
+                    if item.crc != calculated_crc || !span_fits_page {
+                        page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Erased)?;
+                        page.erased_entry_count += 1;
+                        continue 'item_iter;
+                    }
+
+                    match item.type_ {
+                        ItemType::U8
+                        | ItemType::I8
+                        | ItemType::U16
+                        | ItemType::I16
+                        | ItemType::U32
+                        | ItemType::I32
+                        | ItemType::U64
+                        | ItemType::I64
+                        | ItemType::BlobIndex
+                            if item.span == 1 =>
+                        {
+                            #[cfg(feature = "debug-logs")]
+                            println!("encountered valid but empty scalar item at {item_index}");
+                            page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Written)?;
+                            page.used_entry_count += 1;
+                        }
+                        ItemType::Sized | ItemType::BlobData | ItemType::Blob => {
+                            #[cfg(feature = "debug-logs")]
+                            println!("encountered valid but EMPTY variable sized item at {item_index}");
+                            let data_is_valid = match page.load_referenced_data(&mut self.hal, item_index, item) {
+                                Ok(data) => T::crc32(u32::MAX, &data) == unsafe { item.data.sized.crc },
+                                Err(Error::CorruptedData) => false,
+                                Err(e) => return Err(e),
+                            };
+                            if !data_is_valid {
                                 page.set_entry_state_range(
                                     &mut self.hal,
                                     item_index..item_index + item.span,
-                                    EntryMapState::Written,
+                                    EntryMapState::Erased,
                                 )?;
-                                page.used_entry_count += item.span;
-                            }
-                            ItemType::Any => {
+                                page.erased_entry_count += item.span;
+                                // The whole span is counted above, so its payload entries must
+                                // not be visited again: they now read as erased and would each
+                                // be counted a second time, pushing the next free entry past
+                                // the end of the page.
+                                if item.span >= 2 {
+                                    item_iter.nth((item.span - 2) as usize);
+                                }
                                 continue 'item_iter;
                             }
+                            page.set_entry_state_range(
+                                &mut self.hal,
+                                item_index..item_index + item.span,
+                                EntryMapState::Written,
+                            )?;
+                            page.used_entry_count += item.span;
                         }
-                    } else {
-                        continue 'item_iter;
+                        _ => {
+                            page.set_entry_state(&mut self.hal, item_index as _, EntryMapState::Erased)?;
+                            page.erased_entry_count += 1;
+                            continue 'item_iter;
+                        }
                     }
                 }
                 EntryMapState::Written => {
                     let calculated_crc = item.calculate_crc32(T::crc32);
-                    if item.crc != calculated_crc {
+                    if item.crc != calculated_crc || !span_fits_page {
                         #[cfg(feature = "debug-logs")]
                         println!(
                             "CRC mismatch for item '{}', marking as erased",
                             slice_with_nullbytes_to_str(&item.key.0)
                         );
+                        // The span was read from a header whose CRC just failed, or one that cannot
+                        // fit the page, so it says nothing trustworthy about how many entries this
+                        // item covers. Erasing a range on its word takes out whatever happens to
+                        // follow, valid items included. Erase the header alone: the entries behind
+                        // it are scanned like any other and reach this same
+                        // check one at a time, which ends in the same place
+                        // for a genuinely half written item without reaching
+                        // past it.
+                        //
+                        // The entry has to be marked erased in the entry map, not only counted as
+                        // such. Those entries behind it are payload, and their "span" byte is as
+                        // often as not out of range, so this branch is
+                        // where most of them end up. Left `Written`,
+                        // `copy_items` later loads each one, fails its CRC and aborts the
+                        // defragmentation with the source page stuck in `Freeing`; every `Nvs::new`
+                        // after that resumes the copy and fails the same way.
+                        page.set_entry_state_range(&mut self.hal, item_index..(item_index + 1), EntryMapState::Erased)?;
+                        page.erased_entry_count += 1;
+                        continue 'item_iter;
+                    }
+
+                    // ESP-IDF marks a header written before it writes the payload, so a header
+                    // whose payload entries are not all written is a write the
+                    // power cut short there - or here, if the single entry map
+                    // write of this crate was torn. ESP-IDF erases such an item
+                    // on load, and so does this: kept, it is a newer duplicate that reads as
+                    // corrupt, and the duplicate cleanup would erase the older, intact value for
+                    // it.
+                    let payload_is_written = (item_index + 1..item_index + item.span)
+                        .all(|index| page.get_entry_state(index) == EntryMapState::Written);
+                    if !payload_is_written {
                         page.set_entry_state_range(
                             &mut self.hal,
-                            item_index..(item_index + item.span),
+                            item_index..item_index + item.span,
                             EntryMapState::Erased,
                         )?;
                         page.erased_entry_count += item.span;
+                        if item.span >= 2 {
+                            item_iter.nth((item.span - 2) as usize);
+                        }
                         continue 'item_iter;
                     }
+
                     page.used_entry_count += item.span;
                 }
             }
@@ -330,6 +492,10 @@ where
                         ),
                     );
                 }
+            }
+
+            if item.type_ == ItemType::Blob {
+                self.legacy_blobs.push((item.namespace_index, item.key));
             }
 
             page.item_hash_list.push(ItemHashListEntry {

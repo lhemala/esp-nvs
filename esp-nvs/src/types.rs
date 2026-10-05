@@ -57,10 +57,25 @@ impl Key {
     }
 
     /// Returns the key as a string slice, excluding null padding.
+    ///
+    /// A key built by this crate is always ASCII, but one read from flash, as `Nvs::keys` returns
+    /// them, need not be: ESP-IDF accepts any byte but NUL, and flash can be corrupted. For such a
+    /// key this returns the part before the first byte that is not valid UTF-8; [`Key::as_bytes`]
+    /// has all of it, and `Display` escapes the rest.
     pub fn as_str(&self) -> &str {
-        let len = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
-        // Safety: NVS keys are always valid ASCII/UTF-8
-        unsafe { core::str::from_utf8_unchecked(&self.0[..len]) }
+        let bytes = &self.0[..self.len()];
+        match core::str::from_utf8(bytes) {
+            Ok(str) => str,
+            Err(e) => {
+                // Safety: `valid_up_to` is exactly the length of the valid UTF-8 prefix.
+                unsafe { core::str::from_utf8_unchecked(&bytes[..e.valid_up_to()]) }
+            }
+        }
+    }
+
+    /// The length of the key without its null padding.
+    fn len(&self) -> usize {
+        self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len())
     }
 
     const fn fill(&mut self, src: &[u8]) {
@@ -78,7 +93,16 @@ impl Key {
 
 impl fmt::Display for Key {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        // Bytes that are not ASCII can only come from flash, see `as_str`; they are escaped rather
+        // than left out, so that two different keys never display the same.
+        for &byte in &self.0[..self.len()] {
+            if byte.is_ascii() {
+                write!(f, "{}", byte as char)?;
+            } else {
+                write!(f, "\\x{byte:02x}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -162,7 +186,6 @@ impl From<PageIndex> for usize {
 #[cfg_attr(feature = "debug-logs", derive(Debug))]
 pub(crate) enum ChunkIndex {
     Any,
-    BlobIndex,
     BlobData(u8),
 }
 

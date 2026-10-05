@@ -68,7 +68,8 @@ pub trait AlignedOps: Platform {
 
 #[inline(always)]
 const fn align_ceil(size: usize, alignment: usize) -> usize {
-    if size.is_power_of_two() {
+    // The mask only works for an alignment that is a power of two, whatever `size` is.
+    if alignment.is_power_of_two() {
         size.saturating_add(alignment - 1) & !(alignment - 1)
     } else {
         size.saturating_add(alignment - 1) / alignment * alignment
@@ -77,7 +78,7 @@ const fn align_ceil(size: usize, alignment: usize) -> usize {
 
 #[inline(always)]
 const fn align_floor(size: usize, alignment: usize) -> usize {
-    if size.is_power_of_two() {
+    if alignment.is_power_of_two() {
         size & !(alignment - 1)
     } else {
         size / alignment * alignment
@@ -104,5 +105,32 @@ mod chip {
         fn crc32(init: u32, data: &[u8]) -> u32 {
             esp_hal::rom::crc::crc32_le(init, data)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        align_ceil,
+        align_floor,
+    };
+
+    /// The power of two shortcut was taken by looking at `size` instead of `alignment`, which
+    /// masks with `alignment - 1` and is wrong for any other alignment: 8 aligned up to 3 came
+    /// out as 8 and down to 3 as 8.
+    #[test]
+    fn aligns_to_an_alignment_that_is_not_a_power_of_two() {
+        assert_eq!(align_ceil(8, 3), 9);
+        assert_eq!(align_floor(8, 3), 6);
+        assert_eq!(align_ceil(7, 3), 9);
+        assert_eq!(align_floor(7, 3), 6);
+    }
+
+    #[test]
+    fn aligns_to_a_power_of_two() {
+        assert_eq!(align_ceil(5, 4), 8);
+        assert_eq!(align_floor(5, 4), 4);
+        assert_eq!(align_ceil(8, 4), 8);
+        assert_eq!(align_floor(8, 4), 8);
     }
 }

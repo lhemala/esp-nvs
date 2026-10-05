@@ -8,9 +8,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 name: test
+# Pinned like in check.yml, see there.
+env:
+  STABLE: "1.93.1"
+  BETA: "beta-2026-10-05"
 jobs:
   required:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: ubuntu / ${{ matrix.toolchain }}
     strategy:
       matrix:
@@ -24,7 +28,7 @@ jobs:
       - name: Install ${{ matrix.toolchain }}
         uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e # branch=master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: ${{ matrix.toolchain == 'stable' && env.STABLE || env.BETA }}
       - name: cargo generate-lockfile
         # enable this ci template to run regardless of whether the lockfile is checked in or not
         if: hashFiles('Cargo.lock') == ''
@@ -41,9 +45,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # enable windows-latest once esp-nvs has migrated away from libz-sys
-        # os: [macos-latest, windows-latest]
-        os: [macos-latest]
+        # enable windows once esp-nvs has migrated away from libz-sys
+        # os: [macos-26, windows-2025]
+        os: [macos-26]
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
         with:
@@ -51,7 +55,7 @@ jobs:
       - name: Install stable
         uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e # branch=master
         with:
-          toolchain: stable
+          toolchain: ${{ env.STABLE }}
       - name: cargo generate-lockfile
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile

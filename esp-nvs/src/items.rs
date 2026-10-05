@@ -30,6 +30,7 @@ use crate::raw::{
     ItemData,
     ItemDataBlobIndex,
     ItemType,
+    MAX_BLOB_CHUNK_COUNT,
     MAX_BLOB_DATA_PER_PAGE,
     MAX_BLOB_SIZE,
 };
@@ -104,6 +105,14 @@ where
             return Err(Error::KeyNotFound);
         }
 
+        // A stored string always carries its null terminator, so an empty payload means the size on
+        // flash is corrupt. Without this the slice below underflows: a panic in debug, and in
+        // release a wrapped `usize::MAX` length that panics on the slice instead. Neither is
+        // something a `get` should do to the caller.
+        if data.is_empty() {
+            return Err(Error::CorruptedData);
+        }
+
         let str = core::str::from_utf8(&data[..data.len() - 1]).map_err(|_| Error::CorruptedData)?; // we don't want the null terminator
         Ok(str.to_string())
     }
@@ -129,6 +138,7 @@ where
         if item.type_ == ItemType::BlobIndex {
             let size = unsafe { item.data.blob_index.size };
 
+            // Checked before allocating: a corrupt size would otherwise ask for up to 4 GiB below.
             if size as usize > MAX_BLOB_SIZE {
                 return Err(Error::CorruptedData);
             }
@@ -136,17 +146,20 @@ where
             let chunk_count = unsafe { item.data.blob_index.chunk_count };
             let chunk_start = unsafe { item.data.blob_index.chunk_start };
 
+            // Both come straight from flash, so their sum can overflow on a corrupt index.
+            let chunk_end = chunk_start.checked_add(chunk_count).ok_or(Error::CorruptedData)?;
+
             let mut buf = vec![0u8; size as usize];
             let mut offset = 0usize;
 
-            for chunk in chunk_start..chunk_start + chunk_count {
-                // Bounds check before slicing
-                if offset >= buf.len() {
-                    return Err(Error::CorruptedData);
-                }
-
+            for chunk in chunk_start..chunk_end {
                 let (page_index, item_index, item) =
-                    self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key)?;
+                    match self.load_item(namespace_index, ChunkIndex::BlobData(chunk), key) {
+                        // The index promises this chunk, so a missing one means the stored blob is
+                        // incomplete, not that the key was never written.
+                        Err(Error::KeyNotFound) => return Err(Error::CorruptedData),
+                        result => result?,
+                    };
 
                 if item.type_ != ItemType::BlobData {
                     return Err(ItemTypeMismatch(item.type_));
@@ -160,9 +173,20 @@ where
                     return Err(Error::CorruptedData);
                 }
 
-                let read_bytes = data.len().min(buf.len() - offset);
-                buf[offset..offset + read_bytes].copy_from_slice(&data[..read_bytes]);
-                offset += read_bytes;
+                // The chunks hold more data than the index claims, so index and chunks disagree.
+                // Copying only the part that still fits would silently return a truncated blob.
+                if offset + data.len() > buf.len() {
+                    return Err(Error::CorruptedData);
+                }
+
+                buf[offset..offset + data.len()].copy_from_slice(&data);
+                offset += data.len();
+            }
+
+            // The chunks hold less data than the index claims; the tail of `buf` would still be
+            // zero, which would silently return a zero padded blob.
+            if offset != buf.len() {
+                return Err(Error::CorruptedData);
             }
 
             Ok(buf)
@@ -240,6 +264,11 @@ where
         Ok(())
     }
 
+    /// Whether the blob `blob_item` indexes holds exactly `data`.
+    ///
+    /// A blob that cannot be read back in full is not equal to anything. That makes `set` overwrite
+    /// it, which is the way out of a corrupt blob; reporting the read error instead made `set` fail
+    /// with it, so the blob could not be replaced until a reboot cleaned it up.
     fn blob_is_equal(&mut self, namespace_index: u8, key: &Key, blob_item: &Item, data: &[u8]) -> Result<bool, Error> {
         #[cfg(feature = "defmt")]
         trace!("blob_is_equal");
@@ -255,10 +284,17 @@ where
         let mut to_be_compared = data;
         let chunks = blob_index_data.chunk_count;
         let chunk_start = blob_index_data.chunk_start;
+        let Some(chunk_end) = chunk_start.checked_add(chunks) else {
+            return Ok(false);
+        };
 
-        for chunk_index in (chunk_start..chunk_start + chunks).rev() {
-            let (_page_index, item_index, item) =
-                self.load_item(namespace_index, ChunkIndex::BlobData(chunk_index), key)?;
+        for chunk_index in (chunk_start..chunk_end).rev() {
+            let (page_index, item_index, item) =
+                match self.load_item(namespace_index, ChunkIndex::BlobData(chunk_index), key) {
+                    Ok(found) => found,
+                    Err(Error::FlashError) => return Err(Error::FlashError),
+                    Err(_) => return Ok(false),
+                };
 
             if item.type_ != ItemType::BlobData {
                 return Ok(false);
@@ -269,8 +305,12 @@ where
                 return Ok(false);
             }
 
-            let page = &self.pages[_page_index.0];
-            let chunk_data = page.load_referenced_data(&mut self.hal, item_index.0, &item)?;
+            let page = &self.pages[page_index.0];
+            let chunk_data = match page.load_referenced_data(&mut self.hal, item_index.0, &item) {
+                Ok(chunk_data) => chunk_data,
+                Err(Error::FlashError) => return Err(Error::FlashError),
+                Err(_) => return Ok(false),
+            };
 
             if sized.crc != T::crc32(u32::MAX, &chunk_data) {
                 return Ok(false);
@@ -286,7 +326,8 @@ where
             to_be_compared = &to_be_compared[..offset];
         }
 
-        Ok(true)
+        // Chunks holding less than the index claims leave part of `data` unmatched.
+        Ok(to_be_compared.is_empty())
     }
 
     fn find_existing_blob_version(&mut self, namespace: &Key, key: &Key) -> Option<VersionOffset> {
@@ -339,11 +380,23 @@ where
         raw_value[..width].copy_from_slice(&value.to_le_bytes()[..width]);
 
         let mut page = self.get_active_page()?;
-        let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
+        let namespace_index = match self.get_or_create_namespace(namespace, &mut page) {
+            Ok(namespace_index) => namespace_index,
+            Err(e) => {
+                // `get_active_page` popped the page out of `self.pages`, so returning without it
+                // would drop every live entry on it from this instance and leak its sector, where
+                // no defragmentation can reach it again.
+                self.pages.push(page);
+                return Err(e);
+            }
+        };
 
         // page might be full after creating a new namespace
         if page.is_full() {
-            page.mark_as_full(&mut self.hal)?;
+            let result = page.mark_as_full(&mut self.hal);
+            // Retired or not, the page belongs back in the list before another one is taken.
+            self.pages.push(page);
+            result?;
             page = self.get_active_page()?;
         }
 
@@ -352,7 +405,7 @@ where
 
         let old_entry_location =
             if let Ok((page_index, item_index, item)) = self.load_item(namespace_index, ChunkIndex::Any, &key) {
-                if unsafe { item.data.raw } == raw_value {
+                if item.type_ == type_ && unsafe { item.data.raw } == raw_value {
                     #[cfg(feature = "debug-logs")]
                     println!("internal: set_primitive: entry already exists and matches");
                     return Ok(());
@@ -361,7 +414,15 @@ where
                 #[cfg(feature = "debug-logs")]
                 println!("internal: set_primitive: entry already exists and needs to be removed");
 
-                Some((page_index, item_index))
+                // The span and the type are taken from the item found here rather than assumed: the
+                // key may hold a string spanning several entries, or a blob index whose chunks have
+                // to go as well.
+                let old_blob_start = if item.type_ == ItemType::BlobIndex {
+                    Some(unsafe { VersionOffset::from(item.data.blob_index.chunk_start) })
+                } else {
+                    None
+                };
+                Some((page_index, item_index, item.span, old_blob_start))
             } else {
                 None
             };
@@ -369,7 +430,7 @@ where
         // safe since we just pushed before
         page = self.pages.pop().unwrap();
 
-        page.write_item::<T>(
+        let written = page.write_item::<T>(
             &mut self.hal,
             namespace_index,
             key,
@@ -377,19 +438,28 @@ where
             None,
             1,
             ItemData { raw: raw_value },
-        )?;
+        );
 
         // the page index of the old page might point to this one, so we just push it here already
-        // just in case
+        // just in case. That goes for a failed write too: returning without the page would drop its
+        // live items from this instance.
         self.pages.push(page);
+        written?;
 
-        if let Some((page_index, item_index)) = old_entry_location {
+        // The old item is whatever the key held before, which is not necessarily another primitive.
+        // Erasing a single entry would leave the tail of a longer item behind, and erasing a blob
+        // index would orphan its chunks, so both the span and the chunks come from the item that
+        // was actually found.
+        if let Some((page_index, item_index, span, old_blob_start)) = old_entry_location {
             // page_index might only change on defragmentation when load_active_page()
             // is called after we got it
             let old_page = self.pages.get_mut(page_index.0).unwrap();
-            old_page.erase_item(&mut self.hal, item_index.0, 1)?;
+            old_page.erase_item(&mut self.hal, item_index.0, span)?;
             if self.purge {
-                old_page.purge_entries(&mut self.hal, item_index.0, 1)?;
+                old_page.purge_entries(&mut self.hal, item_index.0, span)?;
+            }
+            if let Some(chunk_start) = old_blob_start {
+                self.delete_blob_data(namespace_index, &key, chunk_start)?;
             }
         }
 
@@ -445,18 +515,52 @@ where
 
         // Load active page for writing using ThinPage
         let mut page = self.get_active_page()?;
-        let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
+        let namespace_index = match self.get_or_create_namespace(namespace, &mut page) {
+            Ok(namespace_index) => namespace_index,
+            Err(e) => {
+                self.pages.push(page);
+                return Err(e);
+            }
+        };
 
         match page.write_variable_sized_item::<T>(&mut self.hal, namespace_index, key, ItemType::Sized, None, &buf) {
             Ok(_) => {}
             Err(Error::PageFull) => {
-                page.mark_as_full::<T>(&mut self.hal)?;
+                let retired = page.mark_as_full::<T>(&mut self.hal);
                 self.pages.push(page);
+                retired?;
 
                 page = self.get_active_page()?;
-                page.write_variable_sized_item::<T>(&mut self.hal, namespace_index, key, ItemType::Sized, None, &buf)?;
+                let written = page.write_variable_sized_item::<T>(
+                    &mut self.hal,
+                    namespace_index,
+                    key,
+                    ItemType::Sized,
+                    None,
+                    &buf,
+                );
+                self.pages.push(page);
+                match written {
+                    Ok(_) => {}
+                    // The page after a retire is not guaranteed to be a fresh one: with the reserve
+                    // down to one, `get_active_page` goes through `defragment`, which hands back a
+                    // partially filled copy. `PageFull` is an internal signal for "try another
+                    // page", and there is no other page to try, so the partition has no room for
+                    // this value. Reporting it verbatim leaked an error documented as internal.
+                    Err(Error::PageFull) => return Err(Error::FlashFull),
+                    Err(e) => return Err(e),
+                }
+
+                // The page is already back in the list, so skip the push below.
+                if let Some((_page_index, _item_index)) = old_entry_location {
+                    self.delete_key(namespace_index, &key, ChunkIndex::Any)?;
+                }
+                return Ok(());
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.pages.push(page);
+                return Err(e);
+            }
         }
 
         self.pages.push(page);
@@ -491,9 +595,13 @@ where
         let old_blob_version = self.find_existing_blob_version(namespace, &key);
 
         // Check if the value already exists and matches (only if namespace exists)
+        // `had_old_item` also covers a key that currently holds something other than a blob, which
+        // still has to be deleted once the new blob is written.
+        let mut had_old_item = false;
         let should_write = if let Some(&namespace_index) = self.namespaces.get(namespace) {
             match self.load_item(namespace_index, ChunkIndex::Any, &key) {
                 Ok((_page_index, _item_index, item)) => {
+                    had_old_item = true;
                     if item.type_ != ItemType::BlobIndex {
                         true // Type differs, need to write
                     } else {
@@ -512,8 +620,9 @@ where
 
         // Get namespace index
         let mut page = self.get_active_page()?;
-        let namespace_index = self.get_or_create_namespace(namespace, &mut page)?;
+        let namespace_index = self.get_or_create_namespace(namespace, &mut page);
         self.pages.push(page);
+        let namespace_index = namespace_index?;
 
         // Determine the version offset for the new blob
         let new_version_offset = match &old_blob_version {
@@ -521,21 +630,156 @@ where
             None => VersionOffset::V0,
         };
 
-        let version_base = new_version_offset.clone() as u8;
+        // A write that fails part way leaves the chunks it did write behind, at the very indices
+        // the next attempt for this key writes again: `load_item` finds the leftovers
+        // first, so the next blob reads back as `CorruptedData`, and at boot its chunks no
+        // longer add up and it is deleted. Removing them is best effort, since the reason
+        // for the failure may well stop it too; whatever is left is cleaned up as an orphan
+        // at the next boot.
+        if let Err(e) = self.write_blob_version(namespace_index, key, data, new_version_offset.clone()) {
+            let _ = self.delete_blob_data(namespace_index, &key, new_version_offset);
+            return Err(e);
+        }
+
+        // Now that the new blob version has been successfully written, delete whatever the key held
+        // before. That is gated on an item having been there at all rather than on a previous blob
+        // version: a key holding a string or a primitive has no blob version, and leaving that item
+        // in place used to shadow the blob just written, since `load_item` returns the older of the
+        // two. The write then reported success while the value could never be read back.
+        //
+        // Which item is deleted is not passed in, because it is bound to be the first one found
+        // anyway as newer pages appear later in self.pages. `ChunkIndex::Any` matches a blob index
+        // just as well as a foreign item.
+        if had_old_item {
+            self.delete_key(namespace_index, &key, ChunkIndex::Any)?;
+        }
+
+        Ok(())
+    }
+
+    /// Writes the chunks of `data` and then the blob index of version `version`.
+    fn write_blob_version(
+        &mut self,
+        namespace_index: u8,
+        key: Key,
+        data: &[u8],
+        version: VersionOffset,
+    ) -> Result<(), Error> {
+        let version_base = version as u8;
         let mut chunk_count = 0u8;
         let mut offset = 0usize;
+        // Retiring the active page is the only move this loop can make without writing a chunk, so
+        // it is also the only one that can repeat forever. `get_active_page` does not only hand out
+        // fresh pages: once the reserve is down to one it goes through `defragment`, which copies a
+        // page's live entries into the reserve page and hands that back as the new active page,
+        // pushing the erased source back into the reserve. The free page count is invariant across
+        // that, and so is the copy's free entry count, so it can keep reproducing an unusable
+        // active page verbatim - each turn writing a `Full` marker, erasing a sector and copying up
+        // to 126 entries.
+        //
+        // Hence a budget of one retire per chunk. Every retire below is guarded by this flag and
+        // sets it; only a chunk that was actually written clears it again. Once the budget is
+        // spent, a branch that has a way to make progress takes it (the skip falls through to a
+        // partial write), and one that has none reports `FlashFull`.
+        //
+        // That bounds the loop. Every iteration either writes a chunk, retires a page, or returns;
+        // no two retires happen without a chunk written between them, so there are at most one more
+        // retire than there are chunks written. Each written chunk spends one of the
+        // `MAX_BLOB_CHUNK_COUNT` indices the guard below counts, which caps the chunks at 127, so
+        // the loop runs at most 2 * MAX_BLOB_CHUNK_COUNT + 1 times. The cap rests on `chunk_count`
+        // alone, not on a minimum `data_len` - the last chunk of a blob can be a single byte.
+        //
+        // Note what the bound does not rest on either: nothing about which page `get_active_page`
+        // hands back, how full it is, or what `defragment` does with the free page count. Reasoning
+        // about that is what produced this loop in the first place.
+        let mut retired_a_page = false;
 
         while offset < data.len() {
+            // Chunk indices are `version_base + chunk_count`, so a blob version only owns the 128
+            // wide half of the index space starting at its base, and 0xFF is reserved as "no chunk
+            // index". `delete_blob_data` therefore only ever cleans up `MAX_BLOB_CHUNK_COUNT`
+            // chunks. Writing one more would alias the reserved index (or leak the surplus chunk on
+            // the next overwrite), so refuse the blob instead of storing it in a shape we cannot
+            // read or delete again.
+            //
+            // Whenever the skip below can retire a partially filled page this is unreachable, since
+            // every chunk is then whole and 127 of them cover any blob that passed the byte guard.
+            // It is still the backstop that catches the case where the skip has to give up - a
+            // partition too small for the blob, where the next page is a defragmentation target
+            // rather than a fresh one.
+            if chunk_count >= MAX_BLOB_CHUNK_COUNT as u8 {
+                return Err(Error::ValueTooLong);
+            }
+
             let mut page = self.get_active_page()?;
 
             // Calculate how much data we can fit
             let free_entries = page.get_free_entry_count();
+
+            // A chunk needs at least two entries, one for its header and one for data, so a page
+            // with fewer has to be retired before anything can be written at all.
+            //
+            // With the retire budget already spent this is where the spin used to start: the page
+            // we get after retiring one is under no obligation to be a better one, and a
+            // defragmentation target reproduced verbatim never is. There is nothing left to try -
+            // the retire is this branch's only move and it has no partial write to fall back on -
+            // so report that the partition has no room for the chunk. The blob's own length is not
+            // at fault here, that is what the byte guard above and the chunk count guard below are
+            // for, which is why this is `FlashFull` rather than `ValueTooLong`. Nor does the
+            // condition look at the length: a one byte blob still needs a header entry and a data
+            // entry, so it spins on a page with one free entry exactly like the largest one does.
             if free_entries <= 1 {
-                page.mark_as_full::<T>(&mut self.hal)?;
+                if retired_a_page {
+                    // `get_active_page` popped this page out of `self.pages`, so bailing out
+                    // without handing it back would drop the live entries on it from this instance
+                    // and leak its sector out of both `pages` and `free_pages`, where `defragment`
+                    // can never reclaim it again. `FlashFull` is an error the caller is expected to
+                    // handle and carry on from, so the instance has to survive it intact. Pushing
+                    // an `Active` page back at the tail is the order `get_active_page` and
+                    // `ensure_active_page_order` expect.
+                    self.pages.push(page);
+                    return Err(Error::FlashFull);
+                }
+                retired_a_page = true;
+                let retired = page.mark_as_full::<T>(&mut self.hal);
                 self.pages.push(page);
+                retired?;
                 continue;
             }
-            let data_len = cmp::min((free_entries - 1) * size_of::<Item>(), data.len() - offset);
+
+            // A chunk only ever takes what the active page has left, so writing the rest of a blob
+            // onto a partially filled page costs the same chunk index as a whole one but stores
+            // less. That would make the largest storable blob depend on how full the active page
+            // happened to be. Retire such a page instead - before any chunk of this blob is
+            // written, so nothing is wasted on a write that then restarts - whenever the rest of
+            // the blob would no longer fit into the chunk indices that are left. The next page is
+            // then either a fresh one or, in the `FlashFull` region below, a defragmentation
+            // target, and a fresh one makes every following chunk whole, which pins the accepted
+            // size at `MAX_BLOB_SIZE - 1` for every layout.
+            //
+            // This branch spends the retire budget described at `retired_a_page`. Once it is spent
+            // the skip is off: falling through to the partial write always advances `offset`, so
+            // the write ends in the `ValueTooLong`/`FlashFull` it reported before this skip
+            // existed, rather than retiring a page per turn forever.
+            //
+            // The skip needs the remainder to exceed
+            // `(MAX_BLOB_CHUNK_COUNT - 1) * MAX_BLOB_DATA_PER_PAGE`, which in practice only blobs
+            // of that order reach, so ordinary writes do not lose a page to it. Note
+            // the bound is on the remainder at this point rather than on `data.len()`:
+            // a shorter blob whose earlier chunks came out partial could reach it
+            // algebraically, it has just never been possible to construct one.
+            let remaining = data.len() - offset;
+            let fits_here = (free_entries - 1) * size_of::<Item>();
+            let fits_in_remaining_chunks = (MAX_BLOB_CHUNK_COUNT - 1 - chunk_count as usize) * MAX_BLOB_DATA_PER_PAGE;
+            if !retired_a_page && remaining > fits_here + fits_in_remaining_chunks {
+                retired_a_page = true;
+                let retired = page.mark_as_full::<T>(&mut self.hal);
+                self.pages.push(page);
+                retired?;
+                continue;
+            }
+
+            let data_len = cmp::min(fits_here, remaining);
 
             match page.write_variable_sized_item::<T>(
                 &mut self.hal,
@@ -548,27 +792,39 @@ where
                 Ok(_) => {
                     offset += data_len;
                     chunk_count += 1;
+                    retired_a_page = false;
                     self.pages.push(page);
                 }
+                // Provably unreachable: `data_len <= (free_entries - 1) * size_of::<Item>()` gives
+                // `span <= free_entries`, which is exactly the check `write_variable_sized_item`
+                // reports `PageFull` from. The arm is kept as a backstop, and it spends the retire
+                // budget like every other retire so that the bound on the loop holds even if that
+                // stops being true.
                 Err(Error::PageFull) => {
-                    page.mark_as_full::<T>(&mut self.hal)?;
+                    if retired_a_page {
+                        // See the same bail-out above: the page has to go back into `self.pages`.
+                        self.pages.push(page);
+                        return Err(Error::FlashFull);
+                    }
+                    retired_a_page = true;
+                    let retired = page.mark_as_full::<T>(&mut self.hal);
                     self.pages.push(page);
+                    retired?;
                     continue;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.pages.push(page);
+                    return Err(e);
+                }
             }
         }
 
         // Write the blob index
         let mut page = self.get_active_page()?;
         let item_data = raw::ItemData {
-            blob_index: ItemDataBlobIndex {
-                size: data.len() as u32,
-                chunk_count,
-                chunk_start: version_base,
-            },
+            blob_index: ItemDataBlobIndex::new(data.len() as u32, chunk_count, version_base),
         };
-        page.write_item::<T>(
+        let written = page.write_item::<T>(
             &mut self.hal,
             namespace_index,
             key,
@@ -576,15 +832,9 @@ where
             None,
             1,
             item_data,
-        )?;
+        );
         self.pages.push(page);
-
-        // Now that the new blob version has been successfully written, delete the old version if it
-        // exists _old_version is unused since it will be the first one that is bound to be
-        // found anyway as newer pages appear later in self.pages
-        if let Some(_old_version) = old_blob_version {
-            self.delete_key(namespace_index, &key, ChunkIndex::BlobIndex)?;
-        }
+        written?;
 
         Ok(())
     }
@@ -596,6 +846,12 @@ where
         let page = self.pages.pop_if(|page| page.header.state == ThinPageState::Active);
         if let Some(page) = page {
             return Ok(page);
+        }
+
+        // Defragmentation copies into the reserve page, so without one there is nothing to try.
+        // This is reached by a partition loaded with every page in use.
+        if self.free_pages.is_empty() {
+            return Err(Error::FlashFull);
         }
 
         // Only try reclamation if we have no free pages left
@@ -614,23 +870,35 @@ where
         }
 
         // at this point we have at least 2 free pages
-        let mut page = self.free_pages.pop().unwrap();
+        let page = self.free_pages.pop().ok_or(Error::FlashFull)?;
 
-        if page.header.state != ThinPageState::Uninitialized {
-            self.hal
+        // On failure the page goes back to the free pages, which it has not left on flash.
+        if page.header.state != ThinPageState::Uninitialized
+            && self
+                .hal
                 .erase(page.address as _, (page.address + raw::FLASH_SECTOR_SIZE) as _)
-                .map_err(|_| Error::FlashError)?;
+                .is_err()
+        {
+            self.free_pages.push(page);
+            return Err(Error::FlashError);
         }
+        let mut page = ThinPage::uninitialized(page.address);
 
         let next_sequence = self.get_next_sequence();
-        page.initialize(&mut self.hal, next_sequence)?;
+        if let Err(e) = page.initialize(&mut self.hal, next_sequence) {
+            // A header may have been partly written, so it needs an erase before its next use.
+            page.header.state = ThinPageState::Corrupt;
+            self.free_pages.push(page);
+            return Err(e);
+        }
 
         Ok(page)
     }
 
     pub(crate) fn get_next_sequence(&self) -> u32 {
         match self.pages.iter().map(|page| page.header.sequence).max() {
-            Some(current) => current + 1,
+            // Saturating, so that a corrupt header claiming the largest sequence cannot overflow.
+            Some(current) => current.saturating_add(1),
             None => 0,
         }
     }
@@ -645,8 +913,13 @@ where
         let namespace_index = match self.namespaces.get(namespace) {
             Some(ns_idx) => *ns_idx,
             None => {
-                let namespace_index = match self.namespaces.iter().max_by_key(|(_, idx)| **idx) {
-                    Some((_, idx)) => idx.checked_add(1).ok_or(Error::FlashFull)?,
+                // 0 marks namespace entries and 255 is ESP-IDF's "any namespace": a namespace given
+                // 255 would match the keys of every other one there. Gaps are not filled, as the
+                // items of a namespace whose own entry was lost to corruption still carry its
+                // index, and a new namespace there would inherit them.
+                let namespace_index = match self.namespaces.values().max() {
+                    Some(&idx) if idx >= 254 => return Err(Error::TooManyNamespaces),
+                    Some(&idx) => idx + 1,
                     None => 1,
                 };
 
@@ -675,7 +948,6 @@ where
 
         let item_chunk_index = match chunk_index {
             ChunkIndex::Any => 0xFF,
-            ChunkIndex::BlobIndex => 0xFF,
             ChunkIndex::BlobData(idx) => idx,
         };
 
@@ -687,7 +959,13 @@ where
         for (page_index, page) in self.pages.iter().enumerate() {
             for cache_entry in &page.item_hash_list {
                 if cache_entry.hash == hash {
-                    let item: Item = page.load_item(&mut self.hal, cache_entry.index)?;
+                    // An entry that no longer reads back is not the item, but a later one with the
+                    // same hash may well be, so keep looking.
+                    let item: Item = match page.load_item(&mut self.hal, cache_entry.index) {
+                        Ok(item) => item,
+                        Err(Error::FlashError) => return Err(Error::FlashError),
+                        Err(_) => continue,
+                    };
 
                     if item.namespace_index != namespace_index
                         || item.key != *key

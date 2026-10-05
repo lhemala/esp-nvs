@@ -134,14 +134,28 @@ impl ThinPage {
             return Err(KeyNotFound);
         }
 
-        // Safety: we check the crc afterwards
-        let item = unsafe { core::mem::transmute::<[u8; 32], Item>(buf) };
+        let item = Item::from_raw(buf);
 
         if item.crc != item.calculate_crc32(T::crc32) {
             return Err(KeyNotFound);
         }
 
         Ok(item)
+    }
+
+    /// Reads the 32 raw bytes of the entry at `item_index`.
+    pub(crate) fn read_raw_entry<T: Platform>(
+        &self,
+        hal: &mut T,
+        item_index: u8,
+    ) -> Result<[u8; size_of::<Item>()], Error> {
+        let mut buf = [0u8; size_of::<Item>()];
+        hal.read(
+            (self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index as usize) as _,
+            &mut buf,
+        )
+        .map_err(|_| Error::FlashError)?;
+        Ok(buf)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -165,6 +179,13 @@ impl ThinPage {
             data: item_data,
         };
         item.crc = item.calculate_crc32(T::crc32);
+
+        // The entry counts come from scanning flash, and a page can be left `Active` with no room
+        // when the power goes between filling it and marking it full. Writing regardless would put
+        // the item into the next sector, on top of its header.
+        if span as usize > self.get_free_entry_count() {
+            return Err(PageFull);
+        }
 
         let item_index = self.get_next_free_entry();
         let target_addr = self.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index;
@@ -191,7 +212,7 @@ impl ThinPage {
         }
 
         // Check if page is now full by trying to find the next free entry
-        if self.get_next_free_entry() == ENTRIES_PER_PAGE {
+        if self.is_full() {
             self.mark_as_full::<T>(hal)?;
         }
 
@@ -226,6 +247,14 @@ impl ThinPage {
         };
         let span = data_entries + 1;
 
+        // No current caller can reach this: `set_str` caps its value at `MAX_BLOB_DATA_PER_PAGE`
+        // and a blob chunk is cut to what the active page has free, so both arrive with
+        // `span <= ENTRIES_PER_PAGE`.
+        //
+        // It is what catches them being wrong, though, rather than dead weight: relaxing
+        // `set_str`'s limit by a single byte lands here instead of writing an item whose
+        // span runs off the end of its page. That is also why it is not a `debug_assert!`,
+        // which would leave a release build doing exactly that.
         if span > ENTRIES_PER_PAGE {
             return Err(Error::ValueTooLong);
         }
@@ -287,6 +316,58 @@ impl ThinPage {
         Ok(())
     }
 
+    /// Copies `item`, found at `item_index` of `source`, byte for byte - its header and every
+    /// payload entry its span covers - to the next free entries of this page.
+    ///
+    /// Like `write_variable_sized_item`, the entries are written before the entry map marks them
+    /// written, so a copy the power cuts short is recognised as torn by the next scan.
+    pub(crate) fn copy_item_from<T: Platform>(
+        &mut self,
+        hal: &mut T,
+        source: &ThinPage,
+        item_index: u8,
+        item: &Item,
+    ) -> Result<(), Error> {
+        let span = item.span as usize;
+        if span == 0 || item_index as usize + span > ENTRIES_PER_PAGE {
+            return Err(Error::CorruptedData);
+        }
+        if span > self.get_free_entry_count() {
+            return Err(PageFull);
+        }
+
+        let mut raw = vec![0u8; span * size_of::<Item>()];
+        hal.read(
+            (source.address + offset_of!(RawPage, items) + size_of::<Item>() * item_index as usize) as _,
+            &mut raw,
+        )
+        .map_err(|_| Error::FlashError)?;
+
+        let start_index = self.get_next_free_entry();
+        let target_addr = self.address + offset_of!(RawPage, items) + size_of::<Item>() * start_index;
+        write_aligned(hal, target_addr as _, &raw).map_err(|_| Error::FlashError)?;
+
+        self.set_entry_state_range(
+            hal,
+            start_index as u8..(start_index + span) as u8,
+            EntryMapState::Written,
+        )?;
+        self.used_entry_count += span as u8;
+
+        if item.namespace_index != 0 {
+            self.item_hash_list.push(ItemHashListEntry {
+                hash: item.calculate_hash(T::crc32),
+                index: start_index as u8,
+            });
+        }
+
+        if self.is_full() {
+            self.mark_as_full::<T>(hal)?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn load_referenced_data<T: Platform>(
         &self,
         hal: &mut T,
@@ -310,7 +391,25 @@ impl ThinPage {
             _ => return Err(ItemTypeMismatch(item.type_)),
         }
 
+        // `span` and `size` both come from flash and the read below is relative to this page, so
+        // neither can be trusted to stay inside it. `size` is a u16, which reaches far past a
+        // 4k page on its own. Reading past the page would splice whatever follows it into the
+        // returned value - on the far side of the partition that is unrelated flash, and past its
+        // end it is out of bounds entirely.
+        //
+        // An item's data lives in the entries its span covers, minus the one holding the header, so
+        // that is the tightest bound available here. It is checked before the read rather than left
+        // to the data CRC afterwards, which cannot prevent a read that has already happened.
+        let data_entries = (item.span as usize).checked_sub(1).ok_or(Error::CorruptedData)?;
+        if item_index as usize + item.span as usize > ENTRIES_PER_PAGE {
+            return Err(Error::CorruptedData);
+        }
+
         let size = unsafe { item.data.sized.size } as usize;
+        if size > data_entries * size_of::<Item>() {
+            return Err(Error::CorruptedData);
+        }
+
         let aligned_size = T::align_read(size);
 
         let mut buf = Vec::with_capacity(aligned_size);
@@ -417,11 +516,11 @@ impl ThinPage {
     }
 
     pub(crate) fn get_free_entry_count(&self) -> usize {
-        ENTRIES_PER_PAGE - self.get_next_free_entry()
+        ENTRIES_PER_PAGE.saturating_sub(self.get_next_free_entry())
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.get_next_free_entry() == ENTRIES_PER_PAGE
+        self.get_next_free_entry() >= ENTRIES_PER_PAGE
     }
 
     pub(crate) fn get_state(&self) -> &ThinPageState {
@@ -460,8 +559,8 @@ impl ThinPage {
 
         self.set_entry_state_range(hal, item_index..(item_index + span), EntryMapState::Erased)?;
 
-        self.erased_entry_count += span;
-        self.used_entry_count -= span;
+        self.erased_entry_count = self.erased_entry_count.saturating_add(span);
+        self.used_entry_count = self.used_entry_count.saturating_sub(span);
         self.item_hash_list.retain(|entry| entry.index != item_index);
 
         Ok(())

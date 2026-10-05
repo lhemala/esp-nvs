@@ -11,8 +11,10 @@ use defmt::{
     warn,
 };
 
-use crate::Nvs;
-use crate::blob::BlobIndex;
+use crate::blob::{
+    BlobIndex,
+    BlobIndexEntryBlobIndexData,
+};
 use crate::error::Error;
 use crate::page::{
     ThinPage,
@@ -30,68 +32,32 @@ use crate::raw::{
     write_aligned,
 };
 use crate::types::{
-    ChunkIndex,
     ItemIndex,
     NamespaceIndex,
     PageIndex,
     PageSequence,
+    VersionOffset,
 };
 use crate::u24::u24;
+use crate::{
+    Key,
+    Nvs,
+};
 
 impl<T> Nvs<T>
 where
     T: Platform,
 {
-    pub(crate) fn cleanup_dirty_blobs(&mut self, mut blob_index: BlobIndex) -> Result<(), Error> {
+    pub(crate) fn cleanup_dirty_blobs(&mut self, blob_index: BlobIndex) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("cleanup_dirty_blobs");
 
-        while let Some(((namespace_index, chunk_start, key), (index, observed))) = blob_index.pop_first() {
-            if let Some(index) = index {
-                // Calculate total chunks and data size from all observed chunks
-                let (chunk_count, data_size) = observed
-                    .chunks_by_page
-                    .iter()
-                    .fold((0u8, 0u32), |(count, size), chunk_data| {
-                        (count + chunk_data.chunk_count, size + chunk_data.data_size)
-                    });
+        // Blob indices whose chunks add up, by (namespace, key), with the version they belong to.
+        let mut consistent =
+            BTreeMap::<(NamespaceIndex, Key), Vec<(VersionOffset, BlobIndexEntryBlobIndexData)>>::new();
 
-                if index.chunk_count != chunk_count || index.size != data_size {
-                    #[cfg(feature = "debug-logs")]
-                    println!(
-                        "internal: load_sectors: blob index data doesn't match observed data {index:?} (expected: chunk_count={}, data_size={}, got: chunk_count={}, data_size={})",
-                        index.chunk_count, index.size, chunk_count, data_size
-                    );
-                    self.delete_key(namespace_index.0, &key, ChunkIndex::BlobIndex)?;
-                    // Also delete the orphaned data chunks for this version
-                    self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
-                    continue;
-                } else if let Some(other) = blob_index.get(&(namespace_index, chunk_start.invert(), key))
-                    && let Some(other_index) = &other.0
-                {
-                    // We have both versions - keep the newer one, delete the older one
-                    // Compare by page_sequence first, then by item_index if on same page
-                    let other_is_newer = other_index.page_sequence > index.page_sequence
-                        || (index.page_sequence == other_index.page_sequence
-                            && other_index.item_index > index.item_index);
-
-                    if other_is_newer {
-                        #[cfg(feature = "debug-logs")]
-                        println!(
-                            "internal: load_sectors: found two blob indices for the same key, deleting the older current one (seq: {} vs {})",
-                            index.page_sequence, other_index.page_sequence
-                        );
-                        self.delete_key(namespace_index.0, &key, ChunkIndex::BlobIndex)?;
-                    } else {
-                        #[cfg(feature = "debug-logs")]
-                        println!(
-                            "internal: load_sectors: found two blob indices for the same key, deleting the older other one (seq: {} vs {})",
-                            other_index.page_sequence, index.page_sequence
-                        );
-                        self.delete_key(namespace_index.0, &key, ChunkIndex::BlobIndex)?;
-                    }
-                }
-            } else {
+        for ((namespace_index, chunk_start, key), (index, observed)) in blob_index {
+            let Some(index) = index else {
                 // Orphaned blob data (chunks without an index) can occur when:
                 // 1. Writing the blob index failed after data chunks were written
                 // 2. The index was deleted but data deletion failed
@@ -102,9 +68,79 @@ where
                     chunk_start.clone() as u8
                 );
                 self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
+                continue;
+            };
+
+            // Calculate total chunks and data size from all observed chunks. Summed wide, so that a
+            // corrupt count cannot overflow.
+            let (chunk_count, data_size) =
+                observed
+                    .chunks_by_page
+                    .iter()
+                    .fold((0u32, 0u64), |(count, size), chunk_data| {
+                        (
+                            count + chunk_data.chunk_count as u32,
+                            size + chunk_data.data_size as u64,
+                        )
+                    });
+
+            if index.chunk_count as u32 != chunk_count || index.size as u64 != data_size {
+                #[cfg(feature = "debug-logs")]
+                println!(
+                    "internal: load_sectors: blob index data doesn't match observed data {index:?} (expected: chunk_count={}, data_size={}, got: chunk_count={}, data_size={})",
+                    index.chunk_count, index.size, chunk_count, data_size
+                );
+                self.erase_blob_version(namespace_index, &key, chunk_start, &index)?;
+                continue;
+            }
+
+            consistent
+                .entry((namespace_index, key))
+                .or_default()
+                .push((chunk_start, index));
+        }
+
+        // Both versions of a blob survive a power loss between writing the new one and erasing the
+        // old one. Keep the newer, by page sequence first, then by position on the same page.
+        //
+        // The one to go is erased where it was found. Deleting "the" blob index of the key instead
+        // takes whichever one `load_item` comes across first, which follows the order of the pages
+        // in flash rather than their age, and so could just as well throw away the newer version.
+        for ((namespace_index, key), mut versions) in consistent {
+            if versions.len() < 2 {
+                continue;
+            }
+            versions.sort_by_key(|(_, index)| (index.page_sequence, index.item_index));
+            let newest = versions.len() - 1;
+            for (chunk_start, index) in versions.into_iter().take(newest) {
+                #[cfg(feature = "debug-logs")]
+                println!(
+                    "internal: load_sectors: found two blob indices for the same key, deleting the older one (seq: {})",
+                    index.page_sequence
+                );
+                self.erase_blob_version(namespace_index, &key, chunk_start, &index)?;
             }
         }
+
         Ok(())
+    }
+
+    /// Erases the blob index at the location given by `index`, and the chunks of its version.
+    fn erase_blob_version(
+        &mut self,
+        namespace_index: NamespaceIndex,
+        key: &Key,
+        chunk_start: VersionOffset,
+        index: &BlobIndexEntryBlobIndexData,
+    ) -> Result<(), Error> {
+        if let Some(page) = self
+            .pages
+            .iter_mut()
+            .find(|page| page.header.sequence == index.page_sequence)
+        {
+            page.erase_item::<T>(&mut self.hal, index.item_index, 1)?;
+        }
+        self.delete_blob_data(namespace_index.0, key, chunk_start)
     }
 
     /// The active page has to be the last page in `self.pages` as we use `pop_if` to fetch it.
@@ -152,12 +188,35 @@ where
                     }
                 }
             }
+
+            // Power lost between the write that filled the active page and the one marking it full
+            // leaves it `Active` with no free entry. Retire it now, so the next write takes a fresh
+            // page instead of finding no room on this one.
+            let active_page = &mut self.pages[last_page_idx];
+            if active_page.is_full() {
+                active_page.mark_as_full(&mut self.hal)?;
+            }
         }
 
         Ok(())
     }
 
-    pub(crate) fn continue_free_page(&mut self) -> Result<(), Error> {
+    /// Finishes a defragmentation that was interrupted, returning whether there was one.
+    ///
+    /// A defragmentation only starts once no page is `Active`: it marks the source `Freeing`,
+    /// copies its live items into a freshly initialized reserve page, which is `Active` from
+    /// then on, and erases the source. So a `Freeing` page found here has to be finished, and
+    /// an `Active` page next to it holds nothing but a partial copy of it.
+    ///
+    /// That partial copy is thrown away and the copy restarted into a clean page, the way ESP-IDF
+    /// does it. Resuming it in place instead cannot be relied on: a write torn by the power loss
+    /// leaves erased entries in the target, and with those the rest of the source may no longer
+    /// fit, failing the same way on every boot.
+    ///
+    /// The one target worth keeping is a complete one. A copy that fills its target leaves it
+    /// `Full` rather than `Active`, and when the reserve was the only free page there is none left
+    /// to restart into, so that state would also fail on every boot.
+    pub(crate) fn continue_free_page(&mut self) -> Result<bool, Error> {
         #[cfg(feature = "defmt")]
         trace!("continue_free_page");
 
@@ -166,39 +225,123 @@ where
             .iter()
             .position(|it| it.header.state == ThinPageState::Freeing)
         {
-            None => return Ok(()),
+            None => return Ok(false),
             Some(idx) => self.pages.swap_remove(idx),
         };
 
-        let target_page = match self
+        // The `Active` page is only taken for a partial copy once it is shown to be one, every item
+        // on it identical to one on the source. Should it ever be anything else, erasing it would
+        // throw away values written after the defragmentation; the source is then copied into a
+        // free page instead.
+        let active = self
             .pages
             .iter()
-            .position(|it| it.header.state == ThinPageState::Active)
+            .position(|it| it.header.state == ThinPageState::Active);
+        if let Some(idx) = active
+            && Self::page_is_copy_of(&mut self.hal, &self.pages[idx], &source_page)?
         {
-            Some(idx) => self.pages.swap_remove(idx),
-            None => {
-                let mut page = self.free_pages.pop().ok_or(Error::FlashFull)?;
-                if page.header.state != ThinPageState::Uninitialized {
-                    self.erase_page(page)?;
-                    self.free_pages.pop().unwrap() // there is always a page after erasing
-                } else {
-                    let next_sequence = self.get_next_sequence();
-                    page.initialize(&mut self.hal, next_sequence)?;
-                    page
-                }
-            }
-        };
+            let partial_copy = self.pages.swap_remove(idx);
+            self.erase_page(partial_copy)?;
+        } else if active.is_none() && self.newest_page_holds_all_items_of(&source_page)? {
+            self.erase_page(source_page)?;
+            return Ok(true);
+        }
 
-        self.copy_items(&source_page, target_page)?;
+        let Some(mut target) = self.free_pages.pop() else {
+            // Nowhere to copy to. The source still holds all of its items, so it simply stays, as
+            // the full page it was before the defragmentation started; the next one reclaims it.
+            let mut source_page = source_page;
+            source_page.header.state = ThinPageState::Full;
+            self.pages.insert(0, source_page);
+            return Ok(true);
+        };
+        if target.header.state != ThinPageState::Uninitialized {
+            self.hal
+                .erase(target.address as _, (target.address + FLASH_SECTOR_SIZE) as _)
+                .map_err(|_| Error::FlashError)?;
+            target = ThinPage::uninitialized(target.address);
+        }
+        // The source is out of `self.pages` but its sequence counts all the same.
+        let next_sequence = self
+            .get_next_sequence()
+            .max(source_page.header.sequence.saturating_add(1));
+        target.initialize(&mut self.hal, next_sequence)?;
+
+        self.copy_items(&source_page, target)?;
 
         self.erase_page(source_page)?;
 
-        Ok(())
+        Ok(true)
     }
 
-    /// Clean up duplicate primitive/string entries by marking older versions as erased.
+    /// Whether every item on `candidate` is a byte for byte copy of an item on `source`, as
+    /// `copy_items` makes them.
+    ///
+    /// The headers are compared whole, CRC included, and for strings and chunks the CRC of the
+    /// data is part of the header, so a newer value of the same key never passes for a copy.
+    fn page_is_copy_of(hal: &mut T, candidate: &ThinPage, source: &ThinPage) -> Result<bool, Error> {
+        for candidate_entry in &candidate.item_hash_list {
+            let header = candidate.read_raw_entry(hal, candidate_entry.index)?;
+            let mut found = false;
+            for source_entry in source
+                .item_hash_list
+                .iter()
+                .filter(|it| it.hash == candidate_entry.hash)
+            {
+                if source.read_raw_entry(hal, source_entry.index)? == header {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the newest page holds an item for every live item of `source`, meaning a copy of
+    /// `source` into it completed.
+    ///
+    /// Should that page instead be an ordinary one that happens to hold newer values for each of
+    /// those keys, the items on `source` are outdated duplicates, so dropping `source` is just as
+    /// right.
+    fn newest_page_holds_all_items_of(&mut self, source: &ThinPage) -> Result<bool, Error> {
+        let Some(newest) = self.pages.iter().max_by_key(|page| page.header.sequence) else {
+            return Ok(false);
+        };
+        if newest.header.sequence <= source.header.sequence {
+            return Ok(false);
+        }
+
+        for source_entry in &source.item_hash_list {
+            let Ok(item) = source.load_item(&mut self.hal, source_entry.index) else {
+                continue;
+            };
+
+            let mut found = false;
+            for entry in newest.item_hash_list.iter().filter(|it| it.hash == source_entry.hash) {
+                if let Ok(candidate) = newest.load_item(&mut self.hal, entry.index)
+                    && candidate.namespace_index == item.namespace_index
+                    && candidate.key == item.key
+                    && candidate.chunk_index == item.chunk_index
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Clean up duplicate entries by marking older versions as erased.
     /// This handles the write-before-delete scenario where deletion failed after successful write.
-    /// IMPORTANT: This does NOT touch blob entries - they have their own cleanup logic.
+    /// Runs after `cleanup_dirty_blobs`, which leaves at most one version of each blob; a blob
+    /// index is compared with the other items of its key here, and its chunks go with it.
     pub(crate) fn cleanup_duplicate_entries(&mut self) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("cleanup_duplicate_entries");
@@ -231,16 +374,28 @@ where
                 let page = &self.pages[page_idx.0];
                 let item = page.load_item(&mut self.hal, item_index.0)?;
 
-                // Skip namespace entries (namespace_index == 0) and blob entries
-                // Namespace entries are special and should not be cleaned up
-                // Blob entries have their own cleanup logic
-                if item.namespace_index == 0 || item.type_ == ItemType::BlobIndex || item.type_ == ItemType::BlobData {
+                // Skip namespace entries (namespace_index == 0) and blob data. Namespace entries
+                // are special and should not be cleaned up, and chunks go with
+                // their blob index.
+                //
+                // A blob index takes part, though. `cleanup_dirty_blobs` has already settled which
+                // version of a blob stays, but it only compares blobs with blobs, and a key
+                // changing type to or from a blob leaves a blob index next to a
+                // primitive or a string when the power goes before the old item is
+                // erased. Left alone, reads keep returning the old value, and a
+                // later write can resolve the key against the wrong one of the two.
+                if item.namespace_index == 0 || item.type_ == ItemType::BlobData {
                     continue;
                 }
 
+                let blob_version = if item.type_ == ItemType::BlobIndex {
+                    Some(VersionOffset::from(unsafe { item.data.blob_index.chunk_start }))
+                } else {
+                    None
+                };
                 items.push((
                     (NamespaceIndex(item.namespace_index), item.key),
-                    (page_idx, item_index, page_seq, item.span),
+                    (page_idx, item_index, page_seq, item.span, blob_version),
                 ));
             }
 
@@ -251,19 +406,24 @@ where
             }
 
             // Erase older duplicates
-            for (_key, mut group) in key_groups {
+            for ((namespace_index, key), mut group) in key_groups {
                 if group.len() <= 1 {
                     continue;
                 }
 
                 // Sort by page sequence and item index (ascending = oldest first)
-                group.sort_by_key(|(_, ItemIndex(idx), PageSequence(seq), _)| (*seq, *idx));
+                group.sort_by_key(|(_, ItemIndex(idx), PageSequence(seq), _, _)| (*seq, *idx));
 
                 // Keep the newest (last after sort), erase older ones
                 let keep_count = group.len() - 1;
-                for (PageIndex(page_index), ItemIndex(item_index), _, span) in group.into_iter().take(keep_count) {
+                for (PageIndex(page_index), ItemIndex(item_index), _, span, blob_version) in
+                    group.into_iter().take(keep_count)
+                {
                     let page = self.pages.get_mut(page_index).unwrap();
                     page.erase_item::<T>(&mut self.hal, item_index, span)?;
+                    if let Some(chunk_start) = blob_version {
+                        self.delete_blob_data(namespace_index.0, &key, chunk_start)?;
+                    }
                 }
             }
         }
@@ -272,6 +432,23 @@ where
     }
 
     /// Try to find and reclaim pages that can be recycled
+    /// Reclaims one page, chosen by erased entries weighted against age so that old pages are
+    /// recycled too and the wear spreads.
+    ///
+    /// `Ok(())` does not mean the caller is better off than before, and no caller may assume it
+    /// does. Reclaiming a page moves its live entries into the reserve page and pushes the erased
+    /// source back, so the free page count is the same afterwards, and the copy has exactly as many
+    /// free entries as the source had. Handed a page with a single erased entry, this reproduces an
+    /// equally unusable page indefinitely, one sector erase per call.
+    ///
+    /// Two loops in `set_blob` were written on the assumption that a successful call means
+    /// progress, and both spun forever, wearing a sector out in under a minute. A caller that
+    /// retries after this has to carry its own proof of progress - `set_blob` counts retires
+    /// against the chunks it has written. Making the progress observable here instead would
+    /// suit callers better, but note that simply refusing to reclaim a page with no erased
+    /// entries is not the answer: that copy is the only way the unused tail of a prematurely
+    /// retired page ever becomes reachable again, and removing it costs writes that currently
+    /// succeed.
     pub(crate) fn defragment(&mut self) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("defragment");
@@ -284,10 +461,15 @@ where
         // Find the next page to reclaim
         // By incorporating the sequence number, we will also reclaim older pages even if they are
         // pretty full. This helps with more even wear leveling.
+        //
+        // A page whose every entry is in use is left out: copying it reproduces it exactly, so all
+        // that would come of it is a sector erase. With only such pages left the partition is full,
+        // and a caller retrying a write on it would otherwise wear out a sector per attempt.
         let next_page = self
             .pages
             .iter()
             .enumerate()
+            .filter(|(_, page)| (page.used_entry_count as usize) < ENTRIES_PER_PAGE)
             .map(|(idx, page)| {
                 let points = if page.erased_entry_count == 0 {
                     0
@@ -308,14 +490,20 @@ where
         match page.header.state {
             ThinPageState::Uninitialized => unreachable!(),
             ThinPageState::Active => unreachable!(),
-            ThinPageState::Full => {
-                if page.erased_entry_count != ENTRIES_PER_PAGE as _ {
-                    self.free_page(&page, next_sequence)?;
+            ThinPageState::Full | ThinPageState::Freeing => {
+                if page.erased_entry_count != ENTRIES_PER_PAGE as _
+                    && let Err(e) = self.free_page(&page, next_sequence)
+                {
+                    // The source still holds its items, so it stays in the instance. At the front,
+                    // where the oldest pages are, and away from the tail an active page belongs at.
+                    self.pages.insert(0, page);
+                    return Err(e);
                 }
 
                 self.erase_page(page)?;
             }
-            ThinPageState::Freeing => unreachable!(), // TODO cleanup freeing pages on init
+            // `continue_free_page` leaves a `Freeing` page it had nowhere to copy from as `Full`, so
+            // none is expected here; it would be reclaimed like a full page all the same.
             ThinPageState::Corrupt => {
                 self.erase_page(page)?;
             }
@@ -352,13 +540,11 @@ where
         #[cfg(feature = "debug-logs")]
         println!("internal: copy_entries_to_reserve_page");
 
-        // Mark source page as FREEING
+        // Mark source page as FREEING before the reserve page is touched. The other way round, a
+        // power loss in between would leave the initialized reserve as an ordinary active page and
+        // the partition without a reserve. `continue_free_page` picks up from either point.
         let raw = (PageState::Freeing as u32).to_le_bytes();
         write_aligned(&mut self.hal, source.address as u32, &raw).map_err(|_| Error::FlashError)?;
-
-        // TODO: Check if the active page has still some space left, e.g. this might happen if we
-        //  wanted to write a string that can't be split over multiple pages or a chunk of blob_data
-        //  which requires at least 2 empty entries
 
         // When free_page is called, we should always we have on page in reserve.
         let mut target = self.free_pages.pop().ok_or(Error::FlashFull)?;
@@ -377,89 +563,50 @@ where
         Ok(())
     }
 
+    /// Copies the live items of `source` into `target`, which then goes into `self.pages`.
+    ///
+    /// Items are copied byte for byte, header and payload, the way ESP-IDF does it. Rebuilding them
+    /// from what was read instead dropped every item type it had no case for, the legacy
+    /// single-page blob among them, and recomputed the data CRC of strings and chunks, so data that
+    /// had already failed its CRC came out of a defragmentation as a valid value.
+    ///
+    /// An entry that does not read back as an item, or whose span does not fit the page, is not
+    /// copied. It is not anything a read could return, and failing the copy over it would fail
+    /// every defragmentation of this page from now on.
     pub(crate) fn copy_items(&mut self, source: &ThinPage, mut target: ThinPage) -> Result<(), Error> {
         #[cfg(feature = "defmt")]
         trace!("copy_items");
 
-        // in case the operation was disturbed in the middle, target might already contain some
-        // parts of the source page, so we first get the last copied item so we can ignor it
-        // and everything before in our copy loop
-        let mut last_copied_entry = match target.item_hash_list.iter().max_by_key(|it| it.index) {
-            Some(hash_entry) => Some(target.load_item(&mut self.hal, hash_entry.index)?),
-            None => None,
-        };
-
-        let mut item_index = 0u8;
-        while item_index < ENTRIES_PER_PAGE as u8 {
-            if source.get_entry_state(item_index) != EntryMapState::Written {
+        let mut item_index = 0usize;
+        while item_index < ENTRIES_PER_PAGE {
+            if source.get_entry_state(item_index as u8) != EntryMapState::Written {
                 item_index += 1;
                 continue;
             }
 
-            let item = source.load_item(&mut self.hal, item_index)?;
-
-            // in case we were disrupted while copying, we want to ignore all entries that before we
-            // reached the last copied one
-            if let Some(last) = last_copied_entry {
-                if item == last {
-                    // We found our match, everything after this still needs to be copied
-                    last_copied_entry = None;
-                } else {
-                    // No match yet, keep searching
+            let item = match source.load_item(&mut self.hal, item_index as u8) {
+                Ok(item) => item,
+                Err(Error::FlashError) => {
+                    self.pages.push(target);
+                    return Err(Error::FlashError);
                 }
-
-                item_index += item.span;
+                Err(_) => {
+                    item_index += 1;
+                    continue;
+                }
+            };
+            let span = item.span as usize;
+            if span == 0 || item_index + span > ENTRIES_PER_PAGE {
+                item_index += 1;
                 continue;
             }
 
-            match item.type_ {
-                ItemType::U8
-                | ItemType::I8
-                | ItemType::U16
-                | ItemType::I16
-                | ItemType::U32
-                | ItemType::I32
-                | ItemType::U64
-                | ItemType::I64
-                | ItemType::BlobIndex => {
-                    target.write_item::<T>(
-                        &mut self.hal,
-                        item.namespace_index,
-                        item.key,
-                        item.type_,
-                        if item.chunk_index == u8::MAX {
-                            None
-                        } else {
-                            Some(item.chunk_index)
-                        },
-                        item.span,
-                        item.data,
-                    )?;
-                }
-                ItemType::Sized | ItemType::BlobData => {
-                    let data = source.load_referenced_data(&mut self.hal, item_index, &item)?;
-                    target.write_variable_sized_item::<T>(
-                        &mut self.hal,
-                        item.namespace_index,
-                        item.key,
-                        item.type_,
-                        if item.chunk_index == u8::MAX {
-                            None
-                        } else {
-                            Some(item.chunk_index)
-                        },
-                        &data,
-                    )?;
-                }
-                ItemType::Blob => {
-                    // Old BLOB type - not supported, skip
-                }
-                ItemType::Any => {
-                    // Should not happen
-                }
+            if let Err(e) = target.copy_item_from::<T>(&mut self.hal, source, item_index as u8, &item) {
+                self.pages.push(target);
+                return Err(e);
             }
 
-            item_index += item.span;
+            item_index += span;
         }
 
         self.pages.push(target);

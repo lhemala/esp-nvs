@@ -15,7 +15,8 @@ pub enum Error {
     #[error("invalid partition offset")]
     InvalidPartitionOffset,
 
-    /// The partition size has to be a multiple of the flash sector size (4k)
+    /// The partition size has to be a non-zero multiple of the flash sector size (4k), and the
+    /// partition has to fit the flash it is on
     #[error("invalid partition size")]
     InvalidPartitionSize,
 
@@ -36,8 +37,23 @@ pub enum Error {
     #[error("namespace malformed")]
     NamespaceMalformed,
 
-    /// Strings are limited to `MAX_BLOB_DATA_PER_PAGE` while blobs can be up to `MAX_BLOB_SIZE`
-    /// bytes
+    /// Strings are limited to `MAX_BLOB_DATA_PER_PAGE` bytes.
+    ///
+    /// Blobs are limited to `MAX_BLOB_SIZE - 1` bytes, that is 507,999. The limit follows from the
+    /// 127 chunk indices a blob version can address, each holding at most
+    /// `MAX_BLOB_DATA_PER_PAGE` (4,000) bytes. Anything from `MAX_BLOB_SIZE` upwards is rejected on
+    /// sight, before a single byte is written.
+    ///
+    /// The limit does not depend on how full the *active page* is, as long as the partition can
+    /// hand out a fresh page: a blob large enough to need every chunk index retires a partially
+    /// filled active page first, so all of its chunks are whole.
+    ///
+    /// On a partition that cannot do that, a blob within the byte limit may still fail. Usually
+    /// that is [`Error::FlashFull`], but a partition too small to give the blob whole chunks
+    /// runs out of chunk indices and reports `ValueTooLong` for a blob a roomier partition
+    /// would accept. That bail-out happens mid-write, after some chunks were written; they are
+    /// removed again before the error is returned, and should that fail too, the next `Nvs::new`
+    /// cleans them up.
     #[error("value too long")]
     ValueTooLong,
 
@@ -65,6 +81,11 @@ pub enum Error {
     /// Flash is full and defragmentation doesn't help.
     #[error("flash full")]
     FlashFull,
+
+    /// All 254 namespaces are in use. Index 0 is taken by namespace entries themselves, and 255 is
+    /// what ESP-IDF looks up to match any namespace.
+    #[error("too many namespaces")]
+    TooManyNamespaces,
 
     /// Used internally to indicate that we have to allocate a new page.
     #[error("page full")]

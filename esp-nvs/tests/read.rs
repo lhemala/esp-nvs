@@ -3,8 +3,13 @@ use esp_nvs::error::{
     ItemType,
 };
 use esp_nvs::{
+    ENTRIES_PER_PAGE,
     EntryStatistics,
+    FLASH_SECTOR_SIZE,
+    ITEM_SIZE,
     Key,
+    MAX_BLOB_DATA_PER_PAGE,
+    MAX_BLOB_SIZE,
     NvsStatistics,
     PageStatistics,
 };
@@ -253,9 +258,566 @@ fn corrupt_entry() {
     );
 }
 
-// TODO: when reading a multi-page-blob and the bounds don't match, mark the entry as corrupt
+// TODO: when a data CRC is invalid, mark the entry as corrupt instead of only reporting it.
+// The blob paths below do report `CorruptedData`, but the entry stays WRITTEN on flash, so every
+// later read fails again. The Sized/string path (`items.rs`, `get_string`) additionally reports
+// `KeyNotFound` rather than `CorruptedData` on a payload CRC mismatch, see `corrupt_entry` above.
 
-// TODO: when reading a single-page-blob and the bounds don't match, mark the entry as corrupt
-// (covers str as well)
+// `namespace_one` is the first namespace both in the generated asset and in the partitions this
+// file builds at runtime, so it always gets namespace index 1.
+const NAMESPACE_ONE_INDEX: u8 = 1;
 
-// TODO: when the CRC is invalid, mark the entry as corrupt
+// The item layout constants, the entry state helper and the item CRC live in `common` so the write
+// tests can use them too.
+use common::{
+    ENTRY_STATE_WRITTEN,
+    ITEM_CRC_OFFSET,
+    ITEM_DATA_OFFSET,
+    ITEM_KEY_OFFSET,
+    entry_state,
+    item_crc,
+};
+/// `ItemDataBlobIndex.size` is the first field of the 8 byte data union: a u32 little endian.
+const BLOB_INDEX_SIZE_OFFSET: usize = ITEM_DATA_OFFSET;
+/// `ItemDataBlobIndex.chunk_count` is a single byte following `size`.
+const BLOB_INDEX_CHUNK_COUNT_OFFSET: usize = ITEM_DATA_OFFSET + 4;
+/// `ItemDataBlobIndex.chunk_start` is a single byte following `chunk_count`.
+const BLOB_INDEX_CHUNK_START_OFFSET: usize = ITEM_DATA_OFFSET + 5;
+
+/// `ItemDataSized` is `{ size: u16, _reserved: u16, crc: u32 }`, laid out over the 8 byte data
+/// union.
+const SIZED_SIZE_OFFSET: usize = ITEM_DATA_OFFSET;
+const SIZED_CRC_OFFSET: usize = ITEM_DATA_OFFSET + 4;
+
+/// Repairs the entry CRC after a field of the item header was modified. Without this the item
+/// would be rejected as a bad entry before the code under test ever sees it.
+fn fix_item_crc(buf: &mut [u8], offset: usize) {
+    let crc = item_crc(&buf[offset..offset + ITEM_SIZE]);
+    buf[offset + ITEM_CRC_OFFSET..offset + ITEM_KEY_OFFSET].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Finds the byte offset of the item header identified by namespace index, item type and key.
+/// Payload entries are excluded by also requiring a valid entry CRC, and entries that are not
+/// `WRITTEN` are skipped so a stale duplicate can never be selected over the live item.
+fn find_item_entry(buf: &[u8], namespace_index: u8, type_: ItemType, key: &Key) -> Option<usize> {
+    for page_start in (0..buf.len()).step_by(FLASH_SECTOR_SIZE) {
+        for entry in 0..ENTRIES_PER_PAGE {
+            if entry_state(buf, page_start, entry) != ENTRY_STATE_WRITTEN {
+                continue;
+            }
+
+            let offset = page_start + common::ITEM_OFFSET + entry * ITEM_SIZE;
+            let candidate = &buf[offset..offset + ITEM_SIZE];
+
+            if candidate[0] == namespace_index
+                && candidate[1] == type_ as u8
+                && candidate[ITEM_KEY_OFFSET..ITEM_DATA_OFFSET] == key.as_bytes()[..]
+                && u32::from_le_bytes(candidate[ITEM_CRC_OFFSET..ITEM_KEY_OFFSET].try_into().unwrap())
+                    == item_crc(candidate)
+            {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+/// Writes a blob of `len` bytes into a fresh partition and returns the still-open NVS instance
+/// together with a handle on the raw partition image.
+fn blob_partition(namespace: &Key, key: &Key, len: usize) -> (esp_nvs::Nvs<common::SharedFlash>, common::SharedFlash) {
+    let flash = common::SharedFlash::new(6);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+
+    // 0xAB never collides with an item type byte, which keeps `find_item_entry` unambiguous.
+    let blob = vec![0xABu8; len];
+    nvs.set(namespace, key, blob.as_slice()).unwrap();
+
+    (nvs, flash)
+}
+
+/// Writes a blob that spans more than one page, so its BLOB_IDX references several BLOB_DATA
+/// chunks.
+fn multi_chunk_blob_partition(namespace: &Key, key: &Key) -> (esp_nvs::Nvs<common::SharedFlash>, common::SharedFlash) {
+    blob_partition(namespace, key, MAX_BLOB_DATA_PER_PAGE + 1000)
+}
+
+/// Rewrites the `size` field of a live BLOB_IDX and repairs the entry CRC.
+fn patch_blob_index_size(flash: &common::SharedFlash, key: &Key, size: u32) {
+    flash.with_buf(|buf| {
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::BlobIndex, key).unwrap();
+        let offset = index + BLOB_INDEX_SIZE_OFFSET;
+        buf[offset..offset + 4].copy_from_slice(&size.to_le_bytes());
+        fix_item_crc(buf, index);
+    });
+}
+
+#[test]
+fn multi_page_blob_with_corrupt_chunk_data_is_reported_as_corrupted() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    // `example_b_long` is stored as several BLOB_DATA chunks. Flip a byte inside the payload
+    // of the first chunk: the chunk header keeps its own valid CRC so the item still loads,
+    // but the data CRC recorded in that header no longer matches the payload.
+    let chunk = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        ItemType::BlobData,
+        &Key::from_str("example_b_long"),
+    )
+    .unwrap();
+    flash.buf[chunk + ITEM_SIZE] ^= 0xFF;
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.get::<Vec<u8>>(&Key::from_str("namespace_one"), &Key::from_str("example_b_long")),
+        Err(Error::CorruptedData)
+    );
+}
+
+#[test]
+fn blob_index_with_oversized_length_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Claim a blob larger than the partition format can ever hold. The corruption is applied
+    // to a live instance on purpose: a rescan would notice that the BLOB_IDX no longer agrees
+    // with the chunks on flash and drop the blob before it can be read.
+    patch_blob_index_size(&flash, &key, (MAX_BLOB_SIZE + 1) as u32);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn blob_index_shorter_than_its_chunks_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Shrink the recorded size so drastically that the first chunk alone already overshoots the
+    // output buffer, which has to be rejected instead of silently returning a truncated blob.
+    patch_blob_index_size(&flash, &key, 100);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_index_slightly_shorter_than_its_chunks_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let blob_len = MAX_BLOB_DATA_PER_PAGE + 1000;
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Shrink the recorded size by less than one chunk: the first chunk still fits, only the
+    // last one overshoots the buffer by a few bytes. Truncating that chunk to fit would return
+    // a blob that is neither what was written nor flagged as broken. Corrupting a live instance
+    // is required because a rescan would drop the blob for disagreeing with its chunks.
+    patch_blob_index_size(&flash, &key, (blob_len - 10) as u32);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_index_longer_than_its_chunks_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let blob_len = MAX_BLOB_DATA_PER_PAGE + 1000;
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Grow the recorded size beyond what the chunks hold. All chunks are read successfully but
+    // leave the tail of the output buffer untouched, which must not be returned as a blob that
+    // is silently zero padded. Again only reachable on a live instance.
+    patch_blob_index_size(&flash, &key, (blob_len + 100) as u32);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn single_page_blob_index_shorter_than_its_chunk_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    // Written by this test, not read from the asset partition.
+    let key = Key::from_str("local_b_single");
+    let (mut nvs, flash) = blob_partition(&namespace, &key, 1000);
+
+    // Same disagreement for a blob that fits into a single chunk: the one chunk holds more data
+    // than the index claims.
+    patch_blob_index_size(&flash, &key, 900);
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_with_missing_chunk_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let blob_len = MAX_BLOB_DATA_PER_PAGE + 1000;
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // Claim one chunk (holding the extra 100 bytes the grown size accounts for) more than was
+    // ever written. The chunks that do exist leave room in the buffer, so the missing one is
+    // actually looked up, which must not be reported as `KeyNotFound` because the key clearly
+    // exists. Only reachable on a live instance: at init the chunk count is compared against
+    // the chunks found on flash and a blob that disagrees is deleted outright.
+    flash.with_buf(|buf| {
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::BlobIndex, &key).unwrap();
+        let size = index + BLOB_INDEX_SIZE_OFFSET;
+        buf[size..size + 4].copy_from_slice(&((blob_len + 100) as u32).to_le_bytes());
+        buf[index + BLOB_INDEX_CHUNK_COUNT_OFFSET] += 1;
+        fix_item_crc(buf, index);
+    });
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn multi_page_blob_index_with_overflowing_chunk_range_is_reported_as_corrupted() {
+    let namespace = Key::from_str("namespace_one");
+    let key = Key::from_str("example_b_long");
+    let (mut nvs, flash) = multi_chunk_blob_partition(&namespace, &key);
+
+    // `chunk_start + chunk_count` are two raw flash bytes: 200 + 100 does not fit into the u8
+    // they are read back as. `size` is left alone so the blob passes the `MAX_BLOB_SIZE` guard
+    // and the overflowing range is really evaluated. Live instance again, since an index this
+    // far off its chunks would not survive a rescan.
+    flash.with_buf(|buf| {
+        let index = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::BlobIndex, &key).unwrap();
+        buf[index + BLOB_INDEX_CHUNK_START_OFFSET] = 200;
+        buf[index + BLOB_INDEX_CHUNK_COUNT_OFFSET] = 100;
+        fix_item_crc(buf, index);
+    });
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+#[test]
+fn legacy_single_page_blob_with_corrupt_data_is_reported_as_corrupted() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    // This library only ever writes version 2 blobs (BLOB_IDX + BLOB_DATA), so a legacy
+    // version 1 BLOB (0x41) has to be retyped by hand from a SZ item, whose header layout is
+    // identical. Corrupting its payload afterwards invalidates the data CRC in the header.
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        ItemType::Sized,
+        &Key::from_str("example_s_short"),
+    )
+    .unwrap();
+    flash.buf[entry + 1] = ItemType::Blob as u8;
+    fix_item_crc(&mut flash.buf, entry);
+    flash.buf[entry + ITEM_SIZE] ^= 0xFF;
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.get::<Vec<u8>>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
+        Err(Error::CorruptedData)
+    );
+}
+
+/// A stored string always carries a null terminator, so a `size` of zero is corrupt. Reading one
+/// used to panic rather than report it: `data.len() - 1` underflows, which traps in debug and wraps
+/// to `usize::MAX` in release, where the slice panics instead. There is no build profile where it
+/// degrades gracefully, and for a `no_std` library on a device a panic is a reboot.
+///
+/// The data CRC is repaired alongside the size so the check above it passes and the read actually
+/// reaches the slice, rather than bailing out early and passing for the wrong reason.
+#[test]
+fn string_with_a_zero_size_is_reported_as_corrupted() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        ItemType::Sized,
+        &Key::from_str("example_s_short"),
+    )
+    .unwrap();
+
+    let size_at = entry + SIZED_SIZE_OFFSET;
+    flash.buf[size_at..size_at + 2].copy_from_slice(&0u16.to_le_bytes());
+
+    // The CRC of the now empty payload, so `get_string`'s data check passes.
+    let crc_at = entry + SIZED_CRC_OFFSET;
+    let empty_crc = esp_nvs::platform::software_crc32(u32::MAX, &[]);
+    flash.buf[crc_at..crc_at + 4].copy_from_slice(&empty_crc.to_le_bytes());
+
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
+        Err(Error::CorruptedData)
+    );
+}
+
+/// A `size` larger than the entries the item's span reserves is corrupt, and must be caught before
+/// the read rather than by the data CRC afterwards.
+///
+/// `size` is a u16, so it reaches far beyond a 4k page. The read is relative to the page, so it
+/// used to run off the end of it: on hardware that splices unrelated flash into the returned value,
+/// and past the end of the partition it is out of bounds entirely - in the test double, a slice
+/// panic. The data CRC cannot help, since it is only checked once the read has already happened.
+#[test]
+fn string_with_a_size_past_its_span_is_reported_as_corrupted() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        ItemType::Sized,
+        &Key::from_str("example_s_short"),
+    )
+    .unwrap();
+
+    // Far past the page, and past the end of the four page partition as well.
+    let size_at = entry + SIZED_SIZE_OFFSET;
+    flash.buf[size_at..size_at + 2].copy_from_slice(&60_000u16.to_le_bytes());
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
+        Err(Error::CorruptedData)
+    );
+}
+
+/// The same for a span reaching past the last entry of the page. `span` is a u8 taken from flash,
+/// so it can claim more entries than a page has.
+///
+/// The corruption is applied to a live `Nvs` rather than to the image, because a span this large
+/// panics `Nvs::new` itself: it is summed into a u8 entry count during the initial scan. That is a
+/// separate defect on the init path and is tracked separately; here the read path is what is under
+/// test, and it re-reads the item from flash on every call.
+#[test]
+fn item_with_a_span_past_the_page_end_is_reported_as_corrupted() {
+    let namespace = Key::from_str("ns1");
+    let key = Key::from_str("s");
+
+    let flash = common::SharedFlash::new(4);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    nvs.set(&namespace, &key, "a string long enough to span a few entries")
+        .unwrap();
+
+    flash.with_buf(|buf| {
+        let entry = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::Sized, &key).unwrap();
+        // Byte 2 of the header is `span`; 255 entries cannot fit in a 126 entry page.
+        buf[entry + 2] = u8::MAX;
+        let size_at = entry + SIZED_SIZE_OFFSET;
+        buf[size_at..size_at + 2].copy_from_slice(&8_000u16.to_le_bytes());
+        fix_item_crc(buf, entry);
+    });
+
+    assert_eq!(nvs.get::<String>(&namespace, &key), Err(Error::CorruptedData));
+}
+
+/// A span that cannot fit the page must not take the partition down while it is being scanned.
+///
+/// `span` is an unvalidated u8 from flash and the scan adds it to the page's `used_entry_count`,
+/// which is a u8: 255 overflowed it, panicking in debug and leaving a wrong count in release. It
+/// happened inside `Nvs::new`, so one corrupt byte was enough to make opening the partition fail
+/// before anything could be read - and on a device that is a panic at boot.
+///
+/// The rest of the partition has to survive, which is the point of scanning defensively at all.
+#[test]
+fn item_with_an_impossible_span_does_not_break_startup() {
+    let mut flash = common::Flash::new_from_file("tests/assets/test_nvs_data.bin");
+
+    let entry = find_item_entry(
+        &flash.buf,
+        NAMESPACE_ONE_INDEX,
+        ItemType::Sized,
+        &Key::from_str("example_s_short"),
+    )
+    .unwrap();
+
+    // Byte 2 of the header is `span`. The CRC is repaired so the item is not simply rejected as a
+    // bad entry before its span is ever looked at.
+    flash.buf[entry + 2] = u8::MAX;
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    // The item itself is unusable, but everything else on the partition still reads.
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_short")),
+        Err(Error::KeyNotFound)
+    );
+    assert_eq!(
+        nvs.get::<u8>(&Key::from_str("namespace_one"), &Key::from_str("example_u8"))
+            .unwrap(),
+        100
+    );
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("namespace_one"), &Key::from_str("example_s_long"))
+            .unwrap(),
+        "long string spanning multiple entries whereas each entry is 32 bytes in total"
+    );
+    assert_eq!(
+        nvs.get::<Vec<u8>>(&Key::from_str("namespace_one"), &Key::from_str("example_b_long"))
+            .unwrap(),
+        std::fs::read("tests/assets/multi_page_blob.bin").unwrap()
+    );
+    assert_eq!(
+        nvs.get::<u8>(&Key::from_str("namespace_two"), &Key::from_str("only_in_two"))
+            .unwrap(),
+        1
+    );
+}
+
+/// The guard above must not reject a legitimately empty string, which is stored as its lone null
+/// terminator and so has a `size` of one rather than zero.
+#[test]
+fn empty_string_roundtrips() {
+    let mut flash = common::Flash::new(2);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+
+    nvs.set(&Key::from_str("ns1"), &Key::from_str("empty"), "").unwrap();
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("empty"))
+            .unwrap(),
+        ""
+    );
+
+    drop(nvs);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(
+        nvs.get::<String>(&Key::from_str("ns1"), &Key::from_str("empty"))
+            .unwrap(),
+        ""
+    );
+}
+
+/// A header whose CRC fails with a span that cannot fit the page must not leave anything behind
+/// that a later defragmentation chokes on.
+///
+/// This is the power-loss case from the field: a corrupt `span` used to panic `Nvs::new` while the
+/// CRC-mismatch branch erased `item_index..item_index + span`. With only the header erased, the
+/// item's payload entries are scanned as headers in turn, and a payload of NUL bytes reads as a
+/// span of zero. Those entries were counted as erased but left `Written` in the entry map, so the
+/// first defragmentation of the page failed to load them, left it in `Freeing`, and every reopen
+/// failed the same way.
+#[test]
+fn item_with_a_corrupt_header_survives_defragmentation() {
+    let namespace = Key::from_str("ns1");
+    let key = Key::from_str("s");
+    let counter = Key::from_str("counter");
+
+    let flash = common::SharedFlash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+        nvs.set(&namespace, &key, "\0".repeat(200).as_str()).unwrap();
+    }
+
+    flash.with_buf(|buf| {
+        let entry = find_item_entry(buf, NAMESPACE_ONE_INDEX, ItemType::Sized, &key).unwrap();
+        // Byte 2 of the header is `span`. The CRC is deliberately left stale.
+        buf[entry + 2] = 0xF0;
+    });
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    assert_eq!(nvs.get::<String>(&namespace, &key), Err(Error::KeyNotFound));
+
+    // Enough overwrites to cycle every page of the partition through defragmentation several times.
+    for value in 0..2_000u32 {
+        nvs.set(&namespace, &counter, value).unwrap();
+    }
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), flash.clone()).unwrap();
+    assert_eq!(nvs.get::<u32>(&namespace, &counter).unwrap(), 1_999);
+}
+
+/// An item whose namespace entry was lost to corruption must not take the iterators down.
+///
+/// The scan erases a namespace entry that fails its CRC but keeps the items in that namespace,
+/// and both iterators unwrapped the namespace lookup for every item they yielded.
+#[test]
+fn iterators_skip_items_whose_namespace_entry_is_lost() {
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("lost"), &Key::from_str("k"), 7u8).unwrap();
+        nvs.set(&Key::from_str("kept"), &Key::from_str("k"), 8u8).unwrap();
+    }
+
+    // Entry 0 of the first page defines the namespace `lost`. Flip a key bit so its CRC fails.
+    let entry = common::ITEM_OFFSET;
+    assert_eq!(flash.buf[entry], 0, "expected a namespace entry");
+    flash.buf[entry + ITEM_KEY_OFFSET] &= 0x0F;
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    let keys: Vec<_> = nvs.keys().collect::<Result<_, _>>().unwrap();
+    assert_eq!(keys, vec![(Key::from_str("kept"), Key::from_str("k"))]);
+    let entries: Vec<_> = nvs.typed_entries().collect::<Result<_, _>>().unwrap();
+    assert_eq!(entries, vec![(Key::from_str("kept"), Key::from_str("k"), ItemType::U8)]);
+}
+
+/// An entry whose type byte is not a known item type, with a CRC that matches it.
+///
+/// Raw flash was reinterpreted as an item with an enum field for the type, so an unknown byte was
+/// undefined behaviour, and the scan's `match` on it executed an illegal instruction. Such an item
+/// cannot be anything this crate knows how to read, so it is treated as corrupt.
+#[test]
+fn an_item_with_an_unknown_type_is_treated_as_corrupt() {
+    let namespace = Key::from_str("ns1");
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace, &Key::from_str("odd"), 1u8).unwrap();
+        nvs.set(&namespace, &Key::from_str("kept"), 2u8).unwrap();
+    }
+
+    let entry = find_item_entry(&flash.buf, NAMESPACE_ONE_INDEX, ItemType::U8, &Key::from_str("odd")).unwrap();
+    flash.buf[entry + 1] = 0x99;
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    assert_eq!(
+        nvs.get::<u8>(&namespace, &Key::from_str("odd")),
+        Err(Error::KeyNotFound)
+    );
+    assert_eq!(nvs.get::<u8>(&namespace, &Key::from_str("kept")), Ok(2));
+    nvs.set(&namespace, &Key::from_str("odd"), 3u8).unwrap();
+    assert_eq!(nvs.get::<u8>(&namespace, &Key::from_str("odd")), Ok(3));
+}
+
+/// `keys()` has to list every blob `get` can read. It went by a blob's first chunk, which an empty
+/// blob does not have, and a legacy blob is not made of (see `legacy_blob.rs`).
+#[test]
+fn keys_lists_empty_blobs() {
+    let namespace = Key::from_str("ns1");
+    let mut flash = common::Flash::new(3);
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    nvs.set(&namespace, &Key::from_str("empty"), &[][..]).unwrap();
+
+    assert_eq!(nvs.get::<Vec<u8>>(&namespace, &Key::from_str("empty")), Ok(vec![]));
+    let keys: Vec<_> = nvs.keys().collect::<Result<_, _>>().unwrap();
+    assert_eq!(keys, vec![(namespace, Key::from_str("empty"))]);
+}
+
+/// ESP-IDF accepts any key byte but NUL, and flash can be corrupted, so a key read from flash need
+/// not be UTF-8. `as_str` built a `&str` from it unchecked, which is undefined behaviour in safe
+/// code.
+#[test]
+fn a_key_read_from_flash_that_is_not_utf8_is_handled_soundly() {
+    let mut flash = common::Flash::new(3);
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&Key::from_str("ns1"), &Key::from_str("abc"), 1u8).unwrap();
+    }
+    let entry = find_item_entry(&flash.buf, NAMESPACE_ONE_INDEX, ItemType::U8, &Key::from_str("abc")).unwrap();
+    flash.buf[entry + ITEM_KEY_OFFSET + 1] = 0xC3;
+    flash.buf[entry + ITEM_KEY_OFFSET + 2] = 0x28;
+    fix_item_crc(&mut flash.buf, entry);
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    let keys: Vec<_> = nvs.keys().collect::<Result<_, _>>().unwrap();
+    let key = keys[0].1;
+    assert_eq!(key.as_bytes()[..3], [b'a', 0xC3, 0x28]);
+    assert!(core::str::from_utf8(key.as_str().as_bytes()).is_ok());
+    assert_eq!(key.as_str(), "a");
+    assert_eq!(key.to_string(), "a\\xc3(");
+}
