@@ -51,8 +51,9 @@ pub enum Error {
     /// On a partition that cannot do that, a blob within the byte limit may still fail. Usually
     /// that is [`Error::FlashFull`], but a partition too small to give the blob whole chunks
     /// runs out of chunk indices and reports `ValueTooLong` for a blob a roomier partition
-    /// would accept. That bail-out happens mid-write, so unlike the byte limit it leaves the
-    /// written chunks behind as orphans, which the next `Nvs::new` cleans up.
+    /// would accept. That bail-out happens mid-write, after some chunks were written; they are
+    /// removed again before the error is returned, and should that fail too, the next `Nvs::new`
+    /// cleans them up.
     #[error("value too long")]
     ValueTooLong,
 
