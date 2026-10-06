@@ -27,7 +27,7 @@ cli = ["dep:clap"]
 base64 = "0.22.1"
 clap = { version = "4.5.60", features = ["derive"], optional = true }
 csv = "1.4.0"
-esp-nvs = { version = "0.6.1", path = "../esp-nvs" }
+esp-nvs = { version = "0.6.2", path = "../esp-nvs" }
 hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
