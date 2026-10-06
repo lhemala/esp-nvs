@@ -509,6 +509,34 @@ where
             }
         }
 
+        // The next free entry is taken to be the number of used and erased entries, which assumes
+        // every entry before it is in use. A blank entry left EMPTY in the middle of the page
+        // breaks that: the next free entry is then one already programmed, and every write
+        // after is programmed on top of it, reporting success but readable neither itself
+        // nor the item it landed on. Writes only ever append, so nothing will be written
+        // into such a gap; mark it erased like the leftovers of a torn write, so the counts
+        // match the entries' positions again. ESP-IDF takes the first EMPTY entry as the
+        // next free one instead, and would write into the gap and then over what follows
+        // it, so this keeps the page safe for it too.
+        //
+        // Non-blank EMPTY entries were settled by the scan above, so only blank ones are left, and
+        // the scan did not count those. A power loss in here leaves the rest of the gap EMPTY, to
+        // be marked on the next boot, or an entry torn between the two states, which the scan
+        // erases and counts as it does any other.
+        let last_used = (0..ENTRIES_PER_PAGE as u8)
+            .rev()
+            .find(|&index| page.get_entry_state(index) != EntryMapState::Empty);
+        if let Some(last_used) = last_used {
+            for index in 0..last_used {
+                if page.get_entry_state(index) == EntryMapState::Empty {
+                    #[cfg(feature = "debug-logs")]
+                    println!("empty gap at {index} before used entry {last_used}, marking as erased");
+                    page.set_entry_state(&mut self.hal, index as _, EntryMapState::Erased)?;
+                    page.erased_entry_count += 1;
+                }
+            }
+        }
+
         #[cfg(feature = "debug-logs")]
         println!("PGE {page:?}");
 
