@@ -79,8 +79,10 @@ impl<T: Platform> Nvs<T> {
 
         // Flash addresses are u32, and the partition has to lie inside the flash it is read from:
         // past either, reads and writes would wrap or run into whatever `hal` does out of range.
+        // The last byte is compared rather than the end, which is 2^32 at most and does not fit a
+        // 32-bit usize. `end` is at least one sector here.
         match partition_offset.checked_add(partition_size) {
-            Some(end) if end <= hal.capacity() && end <= u32::MAX as usize + 1 => {}
+            Some(end) if end <= hal.capacity() && end - 1 <= u32::MAX as usize => {}
             _ => return Err(Error::InvalidPartitionSize),
         }
 

@@ -127,6 +127,72 @@ fn a_partition_larger_than_the_flash_is_rejected() {
     assert!(matches!(result, Err(esp_nvs::error::Error::InvalidPartitionSize)));
 }
 
+/// An erased flash of `capacity` bytes that holds nothing, so that a partition can be placed at the
+/// top of the 32-bit address space without allocating 4 GiB.
+#[cfg(target_pointer_width = "64")]
+struct ErasedFlash {
+    capacity: usize,
+}
+
+#[cfg(target_pointer_width = "64")]
+impl embedded_storage::nor_flash::ErrorType for ErasedFlash {
+    type Error = common::FlashError;
+}
+
+#[cfg(target_pointer_width = "64")]
+impl embedded_storage::nor_flash::ReadNorFlash for ErasedFlash {
+    const READ_SIZE: usize = common::WORD_SIZE;
+
+    fn read(&mut self, _offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        bytes.fill(0xff);
+        Ok(())
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl embedded_storage::nor_flash::NorFlash for ErasedFlash {
+    const WRITE_SIZE: usize = common::WORD_SIZE;
+    const ERASE_SIZE: usize = esp_nvs::FLASH_SECTOR_SIZE;
+
+    fn erase(&mut self, _from: u32, _to: u32) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn write(&mut self, _offset: u32, _bytes: &[u8]) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[cfg(target_pointer_width = "64")]
+impl esp_nvs::platform::Crc for ErasedFlash {
+    fn crc32(init: u32, data: &[u8]) -> u32 {
+        esp_nvs::platform::software_crc32(init, data)
+    }
+}
+
+/// A partition may end exactly at 2^32, the end of the u32 flash address space, but not past it.
+///
+/// On a 32-bit target the bound itself was computed as `u32::MAX as usize + 1`, which wrapped to 0
+/// and rejected every partition. That only shows on 32-bit targets, which CI builds in release;
+/// this pins the bound on the host.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn a_partition_may_end_at_but_not_past_the_u32_address_space() {
+    const TOP: usize = 1 << 32;
+    let sector = esp_nvs::FLASH_SECTOR_SIZE;
+    let capacity = TOP + sector;
+
+    let result = esp_nvs::Nvs::new(TOP - 2 * sector, 2 * sector, ErasedFlash { capacity });
+    assert!(result.is_ok());
+
+    let result = esp_nvs::Nvs::new(TOP - sector, 2 * sector, ErasedFlash { capacity });
+    assert!(matches!(result, Err(Error::InvalidPartitionSize)));
+}
+
 /// A partition with every page in use has no reserve page. `set` panicked unwrapping a free page
 /// instead of reporting that the partition is full.
 #[test]
