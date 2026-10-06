@@ -21,18 +21,24 @@ test:
 
 update-changelog: nvs::update-changelog partition_tool::update-changelog
 
-# Bump the esp-nvs library: prepend changelog, set version, point the tool at it, refresh lock.
+# Bump the esp-nvs library: prepend changelog, set version, point the tool at it, refresh lock, then
+# commit the release and tag it lib/v<version>.
 bump-lib version:
     git-cliff --unreleased --tag {{version}} --include-path "esp-nvs/**" --prepend esp-nvs/CHANGELOG.md
     sed -i '0,/^version = ".*"/s//version = "{{version}}"/' esp-nvs/Cargo.toml
     sed -i 's/^esp-nvs = { version = "[^"]*"/esp-nvs = { version = "{{version}}"/' esp-nvs-partition-tool/Cargo.toml
     cargo check -p esp-nvs -p esp-nvs-partition-tool
+    git commit -m "^ v{{version}} - lib" -- esp-nvs/CHANGELOG.md esp-nvs/Cargo.toml esp-nvs-partition-tool/Cargo.toml Cargo.lock
+    git tag lib/v{{version}}
 
-# Bump the esp-nvs-partition-tool: prepend changelog, set version, refresh lock.
+# Bump the esp-nvs-partition-tool: prepend changelog, set version, refresh lock, then commit the
+# release and tag it tool/v<version>.
 bump-tool version:
     git-cliff --unreleased --tag {{version}} --include-path "esp-nvs-partition-tool/**" --prepend esp-nvs-partition-tool/CHANGELOG.md
     sed -i '0,/^version = ".*"/s//version = "{{version}}"/' esp-nvs-partition-tool/Cargo.toml
     cargo check -p esp-nvs-partition-tool
+    git commit -m "^ v{{version}} - tool" -- esp-nvs-partition-tool/CHANGELOG.md esp-nvs-partition-tool/Cargo.toml Cargo.lock
+    git tag tool/v{{version}}
 
 _nightly-fmt:
     devenv shell \
