@@ -806,3 +806,74 @@ fn a_header_written_without_its_payload_does_not_replace_the_old_value() {
         assert_eq!(nvs.get::<String>(&namespace(), &key).as_deref(), Ok("the old value"));
     }
 }
+
+/// Ten u8 keys `k0..` with the entries of the keys in `gap` blanked and EMPTY again, leaving a gap
+/// in the middle of the page with written entries after it.
+fn partition_with_gap(gap: core::ops::Range<u8>) -> common::Flash {
+    let mut flash = partition_with_keys(3, 10);
+    for i in gap {
+        let (page, entry) = find_headers(&flash.buf, ItemType::U8 as u8, &Key::from_str(&format!("k{i}")))[0];
+        let offset = page + common::ITEM_OFFSET + entry * esp_nvs::ITEM_SIZE;
+        flash.buf[offset..offset + esp_nvs::ITEM_SIZE].fill(0xFF);
+        set_entry_states(&mut flash.buf, page, entry..entry + 1, 0b11);
+    }
+    flash
+}
+
+/// Checks the keys `k0..k9` outside of `gap`, and `after` if it was written.
+fn check_around_gap(nvs: &mut esp_nvs::Nvs<&mut common::Flash>, gap: &core::ops::Range<u8>, after: Option<u32>) {
+    for i in (0..10u8).filter(|i| !gap.contains(i)) {
+        assert_eq!(nvs.get::<u8>(&namespace(), &Key::from_str(&format!("k{i}"))), Ok(i));
+    }
+    if let Some(after) = after {
+        assert_eq!(nvs.get::<u32>(&namespace(), &Key::from_str("after")), Ok(after));
+    }
+}
+
+/// A blank entry left EMPTY in the middle of a page, with written entries after it, as the field
+/// image of OF-24790 has on its active page.
+///
+/// The next free entry was taken to be the number of used and erased entries, which assumes every
+/// entry before it is in use. The gap made that an entry already programmed, so every later write
+/// was programmed on top of it: `set` reported success, the value could not be read, not even in
+/// the same session, and the item it landed on was lost as well.
+#[test]
+fn an_empty_gap_between_written_entries_is_not_written_over() {
+    let gap = 2..3;
+    let mut flash = partition_with_gap(gap.clone());
+
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&namespace(), &Key::from_str("after"), 0xA5A5_1234u32).unwrap();
+        check_around_gap(&mut nvs, &gap, Some(0xA5A5_1234));
+    }
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    check_around_gap(&mut nvs, &gap, Some(0xA5A5_1234));
+    assert_eq!(
+        nvs.get::<u8>(&namespace(), &Key::from_str("k2")),
+        Err(Error::KeyNotFound)
+    );
+}
+
+/// The power cut at every flash operation of the boot that marks a gap of several entries erased.
+/// Whatever part of the gap is left is marked on the next boot, which then writes after it.
+#[test]
+fn power_loss_while_marking_an_empty_gap_erased() {
+    let gap = 2..5;
+    for budget in 0..20u32 {
+        let mut flash = partition_with_gap(gap.clone());
+        flash.arm_fault(budget as usize);
+        let _ = esp_nvs::Nvs::new(0, flash.len(), &mut flash);
+
+        flash.disable_faults();
+        {
+            let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+            check_around_gap(&mut nvs, &gap, None);
+            nvs.set(&namespace(), &Key::from_str("after"), budget).unwrap();
+            check_around_gap(&mut nvs, &gap, Some(budget));
+        }
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        check_around_gap(&mut nvs, &gap, Some(budget));
+    }
+}
