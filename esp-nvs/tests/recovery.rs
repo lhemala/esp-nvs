@@ -877,3 +877,37 @@ fn power_loss_while_marking_an_empty_gap_erased() {
         check_around_gap(&mut nvs, &gap, Some(budget));
     }
 }
+
+/// `tests/assets/empty_gap.bin`, written by esp-nvs 0.5.0: a blob whose data write the power cut
+/// short, then sixteen more values written by the next boot.
+/// 0.5.0 counted the torn item's payload twice while scanning, so those values went in behind a gap
+/// of twelve blank EMPTY entries, as on the field image of OF-24790. Its values are generated.
+///
+/// The next free entry, taken as the number of used and erased entries, fell short of the end by
+/// the gap, on one of the values behind it. The new value was programmed on top, and neither could
+/// be read.
+#[test]
+fn an_image_with_an_empty_gap_left_by_0_5_0_can_be_written() {
+    let mut flash = common::Flash::new_from_file("tests/assets/empty_gap.bin");
+    let ns = Key::from_str("gap");
+    let check = |nvs: &mut esp_nvs::Nvs<&mut common::Flash>| {
+        for key in (0..8)
+            .map(|i| format!("before{i}"))
+            .chain((0..16).map(|i| format!("after{i}")))
+        {
+            assert!(nvs.get::<u32>(&ns, &Key::from_str(&key)).is_ok(), "{key}");
+        }
+        assert_eq!(nvs.get::<u32>(&ns, &Key::from_str("new")), Ok(0xA5A5_1234));
+        assert_eq!(nvs.get::<Vec<u8>>(&ns, &Key::from_str("new_blob")), Ok(vec![7u8; 40]));
+    };
+
+    {
+        let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+        nvs.set(&ns, &Key::from_str("new"), 0xA5A5_1234u32).unwrap();
+        nvs.set(&ns, &Key::from_str("new_blob"), [7u8; 40].as_slice()).unwrap();
+        check(&mut nvs);
+    }
+
+    let mut nvs = esp_nvs::Nvs::new(0, flash.len(), &mut flash).unwrap();
+    check(&mut nvs);
+}
