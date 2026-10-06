@@ -69,6 +69,27 @@ jobs:
           toolchain: ${{ env.STABLE }}
       - name: cargo check
         run: cargo check --workspace --all-targets
+  build-32-bit:
+    # Overflow in constant arithmetic (`arithmetic_overflow`) is only reported by a real build, not by
+    # check or clippy, and a dependent crate never sees it because cargo caps lints of dependencies.
+    # The tests run on 64-bit hosts, so build for the 32-bit targets the crate is used on.
+    runs-on: ubuntu-24.04
+    name: stable / build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [riscv32imc-unknown-none-elf, riscv32imac-unknown-none-elf]
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # tag=v6.0.0
+        with:
+          submodules: true
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@0b1efabc08b657293548b77fb76cc02d26091c7e # branch=master
+        with:
+          toolchain: ${{ env.STABLE }}
+          target: ${{ matrix.target }}
+      - name: cargo build --release
+        run: cargo build --release --package esp-nvs --target ${{ matrix.target }}
   doc:
     # run docs generation on nightly rather than stable. This enables features like
     # https://doc.rust-lang.org/beta/unstable-book/language-features/doc-cfg.html which allows an
